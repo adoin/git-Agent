@@ -1,0 +1,10 @@
+[package]
+name = "git-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+eframe = "0.31"
+egui_extras = "0.31"
+rfd = "0.15"
