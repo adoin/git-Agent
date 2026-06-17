@@ -48,6 +48,18 @@ pub struct GitAgentApp {
     pending_stash_action: Option<StashActionDialog>,
     pending_branch_action: Option<BranchActionDialog>,
     pending_tag_action: Option<TagActionDialog>,
+    active_view: MainView,
+    branches_open: bool,
+    tags_open: bool,
+    remotes_open: bool,
+    stashes_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MainView {
+    Workspace,
+    History,
+    Search,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +172,11 @@ impl GitAgentApp {
             pending_stash_action: None,
             pending_branch_action: None,
             pending_tag_action: None,
+            active_view: MainView::Workspace,
+            branches_open: true,
+            tags_open: true,
+            remotes_open: true,
+            stashes_open: true,
         };
 
         if let Ok(cwd) = env::current_dir() {
@@ -450,13 +467,13 @@ impl App for GitAgentApp {
         self.poll_tasks(ctx);
 
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(64.0)
+            .exact_height(82.0)
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ctx, |ui| self.top_bar(ui));
 
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(270.0)
+            .exact_width(210.0)
             .frame(egui::Frame::new().fill(theme::PANEL))
             .show(ctx, |ui| self.sidebar(ui));
 
@@ -469,7 +486,10 @@ impl App for GitAgentApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
-            .show(ctx, |ui| self.commit_graph(ui));
+            .show(ctx, |ui| match self.active_view {
+                MainView::Workspace => self.workspace_view(ui),
+                MainView::History | MainView::Search => self.commit_graph(ui),
+            });
 
         self.commit_action_modal(ctx);
         self.worktree_action_modal(ctx);
@@ -482,70 +502,75 @@ impl App for GitAgentApp {
 impl GitAgentApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            ui.add_space(14.0);
-            ui.label(
-                RichText::new(self.tr("app.title"))
-                    .heading()
-                    .color(theme::TEXT),
-            );
-            ui.label(RichText::new(self.tr("app.subtitle")).color(theme::MUTED));
+            ui.add_space(10.0);
+            if toolbar_button(ui, "+", self.tr("commit.panel"), true).clicked() {
+                self.active_view = MainView::Workspace;
+            }
+            let has_repo = self.snapshot.is_some();
+            let has_remote = self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.remotes.is_empty());
+            if toolbar_button(
+                ui,
+                "↓",
+                self.tr("action.pull"),
+                !self.loading_repo && has_repo && has_remote,
+            )
+            .clicked()
+            {
+                self.pull_current();
+            }
+            if toolbar_button(
+                ui,
+                "↑",
+                self.tr("action.push"),
+                !self.loading_repo && has_repo && has_remote,
+            )
+            .clicked()
+            {
+                self.push_current();
+            }
+            if toolbar_button(
+                ui,
+                "↻",
+                self.tr("action.fetch"),
+                !self.loading_repo && has_repo && has_remote,
+            )
+            .clicked()
+            {
+                self.fetch_all();
+            }
+            ui.separator();
+            if toolbar_button(ui, "⑂", self.tr("branch.local"), has_repo).clicked() {
+                self.active_view = MainView::History;
+            }
+            if toolbar_button(ui, "◇", self.tr("tag.title"), has_repo).clicked() {
+                self.tags_open = true;
+            }
+            if toolbar_button(ui, "▦", self.tr("stash.title"), has_repo).clicked() {
+                self.stashes_open = true;
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(14.0);
-                if ui
-                    .add_enabled(
-                        !self.loading_repo,
-                        egui::Button::new(self.tr("action.open")),
-                    )
-                    .clicked()
-                {
+                ui.add_space(12.0);
+                if toolbar_button(ui, "…", self.tr("action.open"), !self.loading_repo).clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.load_repository(path);
                     }
                 }
-                if ui
-                    .add_enabled(
-                        !self.loading_repo && self.snapshot.is_some(),
-                        egui::Button::new(self.tr("action.refresh")),
-                    )
-                    .clicked()
+                if toolbar_button(
+                    ui,
+                    "⟳",
+                    self.tr("action.refresh"),
+                    !self.loading_repo && self.snapshot.is_some(),
+                )
+                .clicked()
                 {
                     self.refresh();
                 }
                 if ui.button(self.language.code()).clicked() {
                     self.language = self.language.next();
-                }
-                let has_repo = self.snapshot.is_some();
-                let has_remote = self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.remotes.is_empty());
-                if ui
-                    .add_enabled(
-                        !self.loading_repo && has_repo && has_remote,
-                        egui::Button::new(self.tr("action.push")),
-                    )
-                    .clicked()
-                {
-                    self.push_current();
-                }
-                if ui
-                    .add_enabled(
-                        !self.loading_repo && has_repo && has_remote,
-                        egui::Button::new(self.tr("action.pull")),
-                    )
-                    .clicked()
-                {
-                    self.pull_current();
-                }
-                if ui
-                    .add_enabled(
-                        !self.loading_repo && has_repo && has_remote,
-                        egui::Button::new(self.tr("action.fetch")),
-                    )
-                    .clicked()
-                {
-                    self.fetch_all();
                 }
                 if self.loading_repo {
                     ui.spinner();
@@ -565,35 +590,73 @@ impl GitAgentApp {
     }
 
     fn sidebar_content(&mut self, ui: &mut Ui) {
-        ui.add_space(16.0);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            ui.vertical(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(self.tr("repo.title"))
+                    .strong()
+                    .color(theme::TEXT),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            if let Some(snapshot) = &self.snapshot {
                 ui.label(
-                    RichText::new(self.tr("repo.title"))
-                        .strong()
-                        .color(theme::TEXT),
+                    RichText::new(snapshot.root.display().to_string())
+                        .small()
+                        .color(theme::MUTED),
                 );
-                if let Some(snapshot) = &self.snapshot {
-                    ui.label(
-                        RichText::new(snapshot.root.display().to_string())
-                            .small()
-                            .color(theme::MUTED),
-                    );
-                } else {
-                    ui.label(RichText::new(self.tr("repo.none")).color(theme::MUTED));
-                }
-            });
+            } else {
+                ui.label(RichText::new(self.tr("repo.none")).color(theme::MUTED));
+            }
         });
 
-        ui.add_space(24.0);
-        panel_heading(ui, self.tr("branch.current"));
+        ui.add_space(10.0);
+        if sidebar_nav_item(
+            ui,
+            self.active_view == MainView::Workspace,
+            "▣",
+            self.tr("worktree.title"),
+        )
+        .clicked()
+        {
+            self.active_view = MainView::Workspace;
+        }
+        if sidebar_nav_item(
+            ui,
+            self.active_view == MainView::History,
+            "≋",
+            self.tr("nav.history"),
+        )
+        .clicked()
+        {
+            self.active_view = MainView::History;
+        }
+        if sidebar_nav_item(
+            ui,
+            self.active_view == MainView::Search,
+            "⌕",
+            self.tr("commit.search"),
+        )
+        .clicked()
+        {
+            self.active_view = MainView::Search;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+
         if let Some(snapshot) = &self.snapshot {
-            let mut selected_worktree_after_draw = None;
-            sidebar_pill(ui, &snapshot.branch, theme::ACCENT);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new("*").color(theme::ACCENT));
+                ui.label(RichText::new(&snapshot.branch).strong().color(theme::TEXT));
+            });
             if let Some(upstream) = &snapshot.upstream {
                 ui.horizontal(|ui| {
-                    ui.add_space(16.0);
+                    ui.add_space(30.0);
                     ui.label(
                         RichText::new(format!(
                             "{}  ahead {}  behind {}",
@@ -604,78 +667,30 @@ impl GitAgentApp {
                     );
                 });
             }
-            ui.add_space(18.0);
-            panel_heading(ui, self.tr("remote.title"));
-            if snapshot.remotes.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(self.tr("remote.none")).color(theme::MUTED));
-                });
-            } else {
-                for remote in snapshot.remotes.iter().take(4) {
-                    remote_row(ui, &remote.name, &remote.fetch_url);
-                }
-            }
-            ui.add_space(18.0);
-            panel_heading(ui, self.tr("stash.title"));
-            let mut stash_action = None;
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                if ui
-                    .add_enabled(
-                        !snapshot.status.is_empty(),
-                        egui::Button::new(self.tr("stash.create")),
-                    )
-                    .clicked()
-                {
-                    stash_action = Some(StashMenuAction::Create);
-                }
-            });
-            if snapshot.stashes.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(self.tr("stash.none")).color(theme::MUTED));
-                });
-            } else {
-                for stash in snapshot.stashes.iter().take(8) {
-                    stash_row(ui, stash, self.language, &mut stash_action);
-                }
-            }
-            ui.add_space(18.0);
-            panel_heading(ui, self.tr("tag.title"));
-            let mut tag_action = None;
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                if ui.button(self.tr("tag.create")).clicked() {
-                    tag_action = Some(TagMenuAction::Create);
-                }
-            });
-            if snapshot.tags.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(self.tr("tag.none")).color(theme::MUTED));
-                });
-            } else {
-                for tag in snapshot.tags.iter().take(10) {
-                    tag_row(ui, tag, self.language, &mut tag_action);
-                }
-            }
-            ui.add_space(18.0);
-            panel_heading(ui, self.tr("branch.local"));
+            ui.add_space(8.0);
+
             let mut branch_action = None;
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                if ui.button(self.tr("branch.create")).clicked() {
-                    branch_action = Some(BranchMenuAction::Create);
-                }
-            });
-            ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                let local_branches = snapshot
+            let mut tag_action = None;
+            let mut stash_action = None;
+
+            if tree_header(
+                ui,
+                &mut self.branches_open,
+                "⑂",
+                i18n::t(self.language, "branch.local"),
+            ) {
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    if ui.small_button(self.tr("branch.create")).clicked() {
+                        branch_action = Some(BranchMenuAction::Create);
+                    }
+                });
+                for branch in snapshot
                     .branches
                     .iter()
                     .filter(|branch| !branch.remote)
-                    .collect::<Vec<_>>();
-                for branch in local_branches.iter().take(24) {
+                    .take(18)
+                {
                     branch_row(
                         ui,
                         branch.current,
@@ -685,126 +700,71 @@ impl GitAgentApp {
                         &mut branch_action,
                     );
                 }
-                if local_branches.len() > 24 {
-                    ui.horizontal(|ui| {
-                        ui.add_space(16.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "+{} {}",
-                                local_branches.len() - 24,
-                                self.tr("common.more")
-                            ))
-                            .color(theme::MUTED),
-                        );
-                    });
-                }
-            });
-            let remote_count = snapshot
-                .branches
-                .iter()
-                .filter(|branch| branch.remote)
-                .count();
-            if remote_count > 0 {
-                ui.add_space(14.0);
-                panel_heading(ui, self.tr("branch.remote"));
-                ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                    for branch in snapshot
-                        .branches
-                        .iter()
-                        .filter(|branch| branch.remote)
-                        .take(16)
-                    {
-                        branch_row(
-                            ui,
-                            branch.current,
-                            branch.remote,
-                            &branch.name,
-                            self.language,
-                            &mut branch_action,
-                        );
-                    }
-                    if remote_count > 16 {
-                        ui.horizontal(|ui| {
-                            ui.add_space(16.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "+{} {}",
-                                    remote_count - 16,
-                                    self.tr("common.more")
-                                ))
-                                .color(theme::MUTED),
-                            );
-                        });
-                    }
-                });
             }
-            ui.add_space(18.0);
-            panel_heading(ui, self.tr("worktree.title"));
-            if snapshot.status.is_empty() {
-                ui.label(RichText::new(self.tr("worktree.clean")).color(theme::MUTED));
-            } else {
-                let mut worktree_action = None;
+
+            if tree_header(
+                ui,
+                &mut self.tags_open,
+                "◇",
+                i18n::t(self.language, "tag.title"),
+            ) {
                 ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    if ui.small_button(self.tr("worktree.stage_all")).clicked() {
-                        worktree_action = Some(WorktreeMenuAction::StageAll);
-                    }
-                    if ui.small_button(self.tr("worktree.unstage_all")).clicked() {
-                        worktree_action = Some(WorktreeMenuAction::UnstageAll);
+                    ui.add_space(26.0);
+                    if ui.small_button(self.tr("tag.create")).clicked() {
+                        tag_action = Some(TagMenuAction::Create);
                     }
                 });
-                if !snapshot.staged.is_empty() {
-                    ui.add_space(8.0);
-                    panel_heading(ui, self.tr("worktree.staged"));
-                    let mut clicked_worktree_file = None;
-                    for file in snapshot.staged.iter().take(10) {
-                        if worktree_file_row(ui, file, true, self.language, &mut worktree_action)
-                            .clicked()
-                        {
-                            clicked_worktree_file = Some(SelectedWorktreeFile {
-                                path: file.path.clone(),
-                                display_path: file.display_path.clone(),
-                                staged: true,
-                            });
-                        }
+                if snapshot.tags.is_empty() {
+                    tree_empty(ui, self.tr("tag.none"));
+                } else {
+                    for tag in snapshot.tags.iter().take(12) {
+                        tag_row(ui, tag, self.language, &mut tag_action);
                     }
-                    if let Some(selected) = clicked_worktree_file {
-                        selected_worktree_after_draw = Some(selected);
-                    }
-                }
-                if !snapshot.unstaged.is_empty() {
-                    ui.add_space(8.0);
-                    panel_heading(ui, self.tr("worktree.unstaged"));
-                    let mut clicked_worktree_file = None;
-                    for file in snapshot.unstaged.iter().take(10) {
-                        if worktree_file_row(ui, file, false, self.language, &mut worktree_action)
-                            .clicked()
-                        {
-                            clicked_worktree_file = Some(SelectedWorktreeFile {
-                                path: file.path.clone(),
-                                display_path: file.display_path.clone(),
-                                staged: false,
-                            });
-                        }
-                    }
-                    if let Some(selected) = clicked_worktree_file {
-                        selected_worktree_after_draw = Some(selected);
-                    }
-                }
-                if snapshot.status.len() > 12 {
-                    ui.label(
-                        RichText::new(format!(
-                            "+{} {}",
-                            snapshot.status.len() - 12,
-                            self.tr("common.more")
-                        ))
-                        .color(theme::MUTED),
-                    );
-                }
-                if let Some(action) = worktree_action {
-                    self.handle_worktree_action(action);
                 }
             }
+
+            if tree_header(
+                ui,
+                &mut self.remotes_open,
+                "☁",
+                i18n::t(self.language, "remote.title"),
+            ) {
+                if snapshot.remotes.is_empty() {
+                    tree_empty(ui, self.tr("remote.none"));
+                } else {
+                    for remote in snapshot.remotes.iter().take(8) {
+                        remote_row(ui, &remote.name, &remote.fetch_url);
+                    }
+                }
+            }
+
+            if tree_header(
+                ui,
+                &mut self.stashes_open,
+                "▦",
+                i18n::t(self.language, "stash.title"),
+            ) {
+                ui.horizontal(|ui| {
+                    ui.add_space(26.0);
+                    if ui
+                        .add_enabled(
+                            !snapshot.status.is_empty(),
+                            egui::Button::new(self.tr("stash.create")),
+                        )
+                        .clicked()
+                    {
+                        stash_action = Some(StashMenuAction::Create);
+                    }
+                });
+                if snapshot.stashes.is_empty() {
+                    tree_empty(ui, self.tr("stash.none"));
+                } else {
+                    for stash in snapshot.stashes.iter().take(8) {
+                        stash_row(ui, stash, self.language, &mut stash_action);
+                    }
+                }
+            }
+
             if let Some(action) = stash_action {
                 self.handle_stash_action(action);
             }
@@ -814,16 +774,104 @@ impl GitAgentApp {
             if let Some(action) = tag_action {
                 self.handle_tag_action(action);
             }
-            if let Some(selected) = selected_worktree_after_draw {
-                self.selected_worktree_file = Some(selected);
-                self.selected_file_path = None;
-                self.request_selected_worktree_diff();
-            }
         }
 
         if let Some(error) = &self.error {
             ui.add_space(18.0);
             ui.colored_label(theme::WARNING, error);
+        }
+    }
+
+    fn workspace_view(&mut self, ui: &mut Ui) {
+        ui.add_space(8.0);
+        let Some(snapshot) = &self.snapshot else {
+            empty_state(ui, self.loading_repo, self.language);
+            return;
+        };
+
+        let staged = snapshot.staged.clone();
+        let unstaged = snapshot.unstaged.clone();
+        let status_count = snapshot.status.len();
+        let mut worktree_action = None;
+        let mut selected_worktree_after_draw = None;
+
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(self.tr("worktree.title"))
+                    .heading()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                RichText::new(format!("{status_count}"))
+                    .small()
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(12.0);
+                if ui
+                    .add_enabled(
+                        !unstaged.is_empty(),
+                        egui::Button::new(self.tr("worktree.stage_all")),
+                    )
+                    .clicked()
+                {
+                    worktree_action = Some(WorktreeMenuAction::StageAll);
+                }
+                if ui
+                    .add_enabled(
+                        !staged.is_empty(),
+                        egui::Button::new(self.tr("worktree.unstage_all")),
+                    )
+                    .clicked()
+                {
+                    worktree_action = Some(WorktreeMenuAction::UnstageAll);
+                }
+            });
+        });
+        ui.separator();
+
+        let list_height = (ui.available_height() - 130.0).max(220.0);
+        ui.allocate_ui(Vec2::new(ui.available_width(), list_height), |ui| {
+            if status_count == 0 {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(self.tr("worktree.clean")).color(theme::MUTED));
+                });
+            } else {
+                let table_height = ((ui.available_height() - 12.0) / 2.0).max(120.0);
+                worktree_table(
+                    ui,
+                    self.tr("worktree.staged"),
+                    &staged,
+                    true,
+                    table_height,
+                    self.language,
+                    &mut worktree_action,
+                    &mut selected_worktree_after_draw,
+                );
+                ui.add_space(10.0);
+                worktree_table(
+                    ui,
+                    self.tr("worktree.unstaged"),
+                    &unstaged,
+                    false,
+                    table_height,
+                    self.language,
+                    &mut worktree_action,
+                    &mut selected_worktree_after_draw,
+                );
+            }
+        });
+
+        self.commit_panel(ui, staged.len());
+
+        if let Some(action) = worktree_action {
+            self.handle_worktree_action(action);
+        }
+        if let Some(selected) = selected_worktree_after_draw {
+            self.selected_worktree_file = Some(selected);
+            self.selected_file_path = None;
+            self.request_selected_worktree_diff();
         }
     }
 
@@ -1163,16 +1211,10 @@ impl GitAgentApp {
         }
 
         ui.add_space(18.0);
-        self.commit_panel(ui);
-        ui.add_space(14.0);
         self.worktree_diff_viewer(ui);
     }
 
-    fn commit_panel(&mut self, ui: &mut Ui) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let staged_count = snapshot.staged.len();
+    fn commit_panel(&mut self, ui: &mut Ui, staged_count: usize) {
         ui.separator();
         ui.add_space(10.0);
         panel_heading_inline(ui, self.tr("commit.panel"));
@@ -1970,6 +2012,117 @@ fn panel_heading_inline(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).strong().color(theme::TEXT));
 }
 
+fn toolbar_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> egui::Response {
+    let text = RichText::new(format!("{icon}\n{label}")).color(theme::TEXT);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(text).min_size(Vec2::new(58.0, 58.0)),
+    )
+}
+
+fn sidebar_nav_item(ui: &mut Ui, selected: bool, icon: &str, label: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let fill = if selected {
+        Color32::from_rgb(42, 112, 185)
+    } else if response.hovered() {
+        Color32::from_rgb(33, 38, 50)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(
+            rect.shrink2(Vec2::new(6.0, 1.0)),
+            CornerRadius::same(2),
+            fill,
+        );
+    }
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(RichText::new(icon).color(if selected {
+                Color32::WHITE
+            } else {
+                theme::ACCENT
+            }));
+            ui.label(RichText::new(label).color(if selected {
+                Color32::WHITE
+            } else {
+                theme::TEXT
+            }));
+        });
+    });
+    response
+}
+
+fn tree_header(ui: &mut Ui, open: &mut bool, icon: &str, label: &str) -> bool {
+    let arrow = if *open { "⌄" } else { "›" };
+    if ui
+        .horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(RichText::new(arrow).color(theme::MUTED));
+            ui.label(RichText::new(icon).color(theme::ACCENT));
+            ui.label(RichText::new(label).strong().color(theme::TEXT));
+        })
+        .response
+        .clicked()
+    {
+        *open = !*open;
+    }
+    *open
+}
+
+fn tree_empty(ui: &mut Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(30.0);
+        ui.label(RichText::new(text).color(theme::MUTED));
+    });
+}
+
+fn worktree_table(
+    ui: &mut Ui,
+    title: &str,
+    files: &[WorktreeFile],
+    staged: bool,
+    height: f32,
+    language: Language,
+    action: &mut Option<WorktreeMenuAction>,
+    selected: &mut Option<SelectedWorktreeFile>,
+) {
+    egui::Frame::new()
+        .fill(theme::PANEL)
+        .stroke(Stroke::new(1.0, Color32::from_rgb(48, 54, 68)))
+        .corner_radius(CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_height(height);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).strong().color(theme::TEXT));
+                ui.label(RichText::new(format!("({})", files.len())).color(theme::MUTED));
+            });
+            ui.separator();
+            if files.is_empty() {
+                ui.add_space(20.0);
+                ui.label(RichText::new("—").color(theme::MUTED));
+            } else {
+                ScrollArea::vertical()
+                    .max_height((height - 44.0).max(60.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for file in files {
+                            if worktree_file_row(ui, file, staged, language, action).clicked() {
+                                *selected = Some(SelectedWorktreeFile {
+                                    path: file.path.clone(),
+                                    display_path: file.display_path.clone(),
+                                    staged,
+                                });
+                            }
+                        }
+                    });
+            }
+        });
+}
+
 fn branch_row(
     ui: &mut Ui,
     current: bool,
@@ -2360,20 +2513,6 @@ fn commit_context_menu(
     action
 }
 
-fn sidebar_pill(ui: &mut Ui, text: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.add_space(16.0);
-        egui::Frame::new()
-            .fill(Color32::from_rgb(31, 42, 45))
-            .stroke(Stroke::new(1.0, color))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                ui.label(RichText::new(text).color(theme::TEXT));
-            });
-    });
-}
-
 fn detail_line(ui: &mut Ui, label: &str, value: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(label).small().color(theme::MUTED));
@@ -2502,21 +2641,33 @@ fn draw_file_status_icon(ui: &mut Ui, rect: Rect, status: &str) {
             );
         }
         _ => {
+            painter.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(center.x - 7.0, center.y + 3.5),
+                    Pos2::new(center.x + 1.5, center.y - 5.0),
+                    Pos2::new(center.x + 5.0, center.y - 1.5),
+                    Pos2::new(center.x - 3.5, center.y + 7.0),
+                ],
+                color,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 70)),
+            ));
             painter.line_segment(
                 [
-                    Pos2::new(center.x - 5.0, center.y + 4.0),
-                    Pos2::new(center.x + 3.0, center.y - 4.0),
+                    Pos2::new(center.x - 5.0, center.y + 5.0),
+                    Pos2::new(center.x + 3.0, center.y - 3.0),
                 ],
-                stroke,
+                Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
             );
-            painter.line_segment(
-                [
-                    Pos2::new(center.x + 3.0, center.y - 4.0),
-                    Pos2::new(center.x + 6.0, center.y - 1.0),
+            painter.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(center.x + 1.5, center.y - 5.0),
+                    Pos2::new(center.x + 7.0, center.y - 7.0),
+                    Pos2::new(center.x + 5.0, center.y - 1.5),
                 ],
-                stroke,
-            );
-            painter.circle_filled(Pos2::new(center.x - 6.0, center.y + 5.0), 1.6, color);
+                Color32::from_rgb(245, 210, 150),
+                Stroke::new(1.0, color),
+            ));
+            painter.circle_filled(Pos2::new(center.x + 7.0, center.y - 7.0), 1.5, theme::TEXT);
         }
     }
 }
