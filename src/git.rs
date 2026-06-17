@@ -3,7 +3,13 @@ use std::{
     process::Command,
 };
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use anyhow::{Context, Result, anyhow};
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, Default)]
 pub struct Commit {
@@ -68,7 +74,14 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         .map(str::to_owned)
         .collect();
 
-    let branches = load_branches(&root).unwrap_or_default();
+    let mut branches = load_branches(&root).unwrap_or_default();
+    if branches.is_empty() && branch != "HEAD" {
+        branches.push(Branch {
+            name: branch.clone(),
+            current: true,
+            remote: false,
+        });
+    }
     let commits = load_commits(&root, 2_500)?;
 
     Ok(RepositorySnapshot {
@@ -161,7 +174,7 @@ fn load_branches(root: &Path) -> Result<Vec<Branch>> {
 }
 
 fn discover_root(path: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])
@@ -223,7 +236,7 @@ fn load_commits(root: &Path, limit: usize) -> Result<Vec<Commit>> {
 }
 
 fn has_head(root: &Path) -> bool {
-    Command::new("git")
+    git_command()
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--verify", "HEAD"])
@@ -233,7 +246,7 @@ fn has_head(root: &Path) -> bool {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -249,6 +262,13 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 #[cfg(test)]

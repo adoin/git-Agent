@@ -448,6 +448,11 @@ impl GitAgentApp {
 
         ui.add_space(8.0);
 
+        if commit_count == 0 {
+            no_commits_state(ui);
+            return;
+        }
+
         if visible_rows.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("No matching commits").color(theme::MUTED));
@@ -713,7 +718,6 @@ fn panel_heading_inline(ui: &mut Ui, text: &str) {
 fn branch_row(ui: &mut Ui, current: bool, remote: bool, name: &str) {
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        let marker = if current { "*" } else { " " };
         let color = if current {
             theme::ACCENT
         } else if remote {
@@ -721,8 +725,13 @@ fn branch_row(ui: &mut Ui, current: bool, remote: bool, name: &str) {
         } else {
             theme::MUTED
         };
-        ui.label(RichText::new(marker).color(color));
+        let label = if remote { "remote" } else { "local" };
+        ui.label(RichText::new(if current { "*" } else { " " }).color(color));
         ui.label(RichText::new(name).color(if current { theme::TEXT } else { theme::MUTED }));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(12.0);
+            ui.label(RichText::new(label).small().color(color));
+        });
     });
 }
 
@@ -816,6 +825,22 @@ fn empty_state(ui: &mut Ui, loading: bool) {
             );
             ui.label(
                 RichText::new("Git Agent will render the commit graph with virtualized rows.")
+                    .color(theme::MUTED),
+            );
+        });
+    });
+}
+
+fn no_commits_state(ui: &mut Ui) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("No commits yet")
+                    .heading()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                RichText::new("Create the first commit, then the graph will render here.")
                     .color(theme::MUTED),
             );
         });
