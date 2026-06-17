@@ -3,6 +3,7 @@
 mod app;
 mod git;
 mod graph;
+mod i18n;
 mod theme;
 
 fn main() -> eframe::Result<()> {
