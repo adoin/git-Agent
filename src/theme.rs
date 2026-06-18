@@ -1,6 +1,31 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, TextStyle, Visuals,
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
+
+static THEME_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub bg: Color32,
+    pub panel: Color32,
+    pub panel_soft: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    pub accent: Color32,
+    pub accent_deep: Color32,
+    pub accent_soft: Color32,
+    pub accent_shadow: Color32,
+    pub info: Color32,
+    pub warning: Color32,
+}
 
 pub const BG: Color32 = Color32::from_rgb(16, 18, 24);
 pub const PANEL: Color32 = Color32::from_rgb(24, 27, 36);
@@ -23,27 +48,56 @@ pub const LANES: [Color32; 8] = [
 
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
-    apply(ctx);
+    apply(ctx, ThemeMode::Dark);
 }
 
-pub fn apply(ctx: &egui::Context) {
-    let mut visuals = Visuals::dark();
-    visuals.panel_fill = BG;
-    visuals.window_fill = PANEL;
-    visuals.extreme_bg_color = BG;
-    visuals.faint_bg_color = PANEL_SOFT;
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.inactive.bg_fill = PANEL_SOFT;
-    visuals.widgets.inactive.weak_bg_fill = PANEL_SOFT;
-    visuals.widgets.inactive.fg_stroke.color = TEXT;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(43, 49, 64);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(43, 49, 64);
-    visuals.widgets.hovered.fg_stroke.color = TEXT;
-    visuals.widgets.active.bg_fill = Color32::from_rgb(50, 59, 75);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(50, 59, 75);
-    visuals.widgets.active.fg_stroke.color = TEXT;
-    visuals.selection.bg_fill = Color32::from_rgb(41, 108, 100);
-    visuals.hyperlink_color = ACCENT;
+pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
+    THEME_MODE.store(
+        match mode {
+            ThemeMode::Dark => 0,
+            ThemeMode::Light => 1,
+        },
+        Ordering::Relaxed,
+    );
+    let palette = palette(mode);
+    let mut visuals = match mode {
+        ThemeMode::Dark => Visuals::dark(),
+        ThemeMode::Light => Visuals::light(),
+    };
+    visuals.panel_fill = palette.bg;
+    visuals.window_fill = palette.panel;
+    visuals.window_stroke = Stroke::NONE;
+    visuals.extreme_bg_color = palette.bg;
+    visuals.faint_bg_color = palette.panel_soft;
+    visuals.widgets.noninteractive.bg_fill = palette.panel;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_fill = palette.panel_soft;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.weak_bg_fill = palette.panel_soft;
+    visuals.widgets.inactive.fg_stroke.color = palette.text;
+    visuals.widgets.hovered.bg_fill = if mode == ThemeMode::Dark {
+        Color32::from_rgb(43, 49, 64)
+    } else {
+        palette.accent_soft
+    };
+    visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+    visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
+    visuals.widgets.hovered.fg_stroke.color = palette.text;
+    visuals.widgets.active.bg_fill = if mode == ThemeMode::Dark {
+        palette.accent_deep
+    } else {
+        palette.accent_deep
+    };
+    visuals.widgets.active.bg_stroke = Stroke::NONE;
+    visuals.widgets.active.weak_bg_fill = visuals.widgets.active.bg_fill;
+    visuals.widgets.active.fg_stroke.color = Color32::WHITE;
+    visuals.widgets.open.bg_stroke = Stroke::NONE;
+    visuals.selection.bg_fill = if mode == ThemeMode::Dark {
+        palette.accent_deep
+    } else {
+        palette.accent_deep
+    };
+    visuals.hyperlink_color = palette.accent;
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -69,6 +123,89 @@ pub fn apply(ctx: &egui::Context) {
     ]
     .into();
     ctx.set_style(style);
+}
+
+pub fn current_mode() -> ThemeMode {
+    if THEME_MODE.load(Ordering::Relaxed) == 1 {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    }
+}
+
+pub fn palette(mode: ThemeMode) -> Palette {
+    match mode {
+        ThemeMode::Dark => Palette {
+            bg: BG,
+            panel: PANEL,
+            panel_soft: PANEL_SOFT,
+            text: TEXT,
+            muted: MUTED,
+            accent: ACCENT,
+            accent_deep: Color32::from_rgb(34, 75, 82),
+            accent_soft: Color32::from_rgb(27, 43, 46),
+            accent_shadow: Color32::from_rgba_unmultiplied(69, 238, 216, 28),
+            info: Color32::from_rgb(120, 164, 255),
+            warning: WARNING,
+        },
+        ThemeMode::Light => Palette {
+            bg: Color32::from_rgb(238, 241, 245),
+            panel: Color32::from_rgb(250, 251, 253),
+            panel_soft: Color32::from_rgb(229, 236, 242),
+            text: Color32::from_rgb(32, 39, 50),
+            muted: Color32::from_rgb(101, 112, 130),
+            accent: Color32::from_rgb(0, 118, 137),
+            accent_deep: Color32::from_rgb(23, 94, 102),
+            accent_soft: Color32::from_rgb(225, 240, 239),
+            accent_shadow: Color32::from_rgba_unmultiplied(69, 238, 216, 38),
+            info: Color32::from_rgb(59, 107, 185),
+            warning: Color32::from_rgb(181, 98, 28),
+        },
+    }
+}
+
+pub fn bg() -> Color32 {
+    palette(current_mode()).bg
+}
+
+pub fn panel() -> Color32 {
+    palette(current_mode()).panel
+}
+
+pub fn panel_soft() -> Color32 {
+    palette(current_mode()).panel_soft
+}
+
+pub fn text() -> Color32 {
+    palette(current_mode()).text
+}
+
+pub fn muted() -> Color32 {
+    palette(current_mode()).muted
+}
+
+pub fn accent() -> Color32 {
+    palette(current_mode()).accent
+}
+
+pub fn accent_deep() -> Color32 {
+    palette(current_mode()).accent_deep
+}
+
+pub fn accent_soft() -> Color32 {
+    palette(current_mode()).accent_soft
+}
+
+pub fn accent_shadow() -> Color32 {
+    palette(current_mode()).accent_shadow
+}
+
+pub fn info() -> Color32 {
+    palette(current_mode()).info
+}
+
+pub fn warning() -> Color32 {
+    palette(current_mode()).warning
 }
 
 fn install_fonts(ctx: &egui::Context) {

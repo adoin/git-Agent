@@ -4,6 +4,7 @@ pub enum Language {
     Chinese,
 }
 
+#[allow(dead_code)]
 impl Language {
     pub fn code(self) -> &'static str {
         match self {
@@ -40,6 +41,11 @@ const EN: &[(&str, &str)] = &[
     ("action.fetch", "Fetch"),
     ("action.pull", "Pull"),
     ("action.push", "Push"),
+    ("settings.title", "Settings"),
+    ("options.title", "Options"),
+    ("repo.settings", "Repository Settings"),
+    ("repo.settings.title", "Repository Settings"),
+    ("settings.language", "Language"),
     ("status.loading_repo", "Loading repository"),
     ("status.action_completed", "Action completed"),
     ("common.more", "more"),
@@ -54,6 +60,7 @@ const EN: &[(&str, &str)] = &[
     ("branch.current", "Branch"),
     ("branch.local", "Local Branches"),
     ("branch.remote", "Remote Branches"),
+    ("branch.none", "No branches"),
     ("branch.create", "Create branch"),
     ("branch.name", "Branch name"),
     ("branch.checkout", "Checkout branch"),
@@ -65,6 +72,7 @@ const EN: &[(&str, &str)] = &[
     ("remote.none", "No remotes"),
     ("worktree.title", "Working Tree"),
     ("worktree.clean", "Clean"),
+    ("worktree.clean_detail", "No pending file changes."),
     ("nav.history", "History"),
     ("worktree.stage_all", "Stage all"),
     ("worktree.unstage_all", "Unstage all"),
@@ -118,6 +126,7 @@ const EN: &[(&str, &str)] = &[
         "Create the first commit, then the graph will render here.",
     ),
     ("dialog.cancel", "Cancel"),
+    ("dialog.ok", "OK"),
     ("dialog.create", "Create"),
     ("dialog.checkout", "Checkout"),
     ("dialog.discard", "Discard"),
@@ -157,6 +166,11 @@ const ZH: &[(&str, &str)] = &[
     ("action.fetch", "获取"),
     ("action.pull", "拉取"),
     ("action.push", "推送"),
+    ("settings.title", "设置"),
+    ("options.title", "\u{9009}\u{9879}"),
+    ("repo.settings", "\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}"),
+    ("repo.settings.title", "\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}"),
+    ("settings.language", "语言"),
     ("status.loading_repo", "正在加载仓库"),
     ("status.action_completed", "操作已完成"),
     ("common.more", "更多"),
@@ -171,6 +185,7 @@ const ZH: &[(&str, &str)] = &[
     ("branch.current", "当前分支"),
     ("branch.local", "本地分支"),
     ("branch.remote", "远程分支"),
+    ("branch.none", "没有分支"),
     ("branch.create", "创建分支"),
     ("branch.name", "分支名称"),
     ("branch.checkout", "检出分支"),
@@ -182,6 +197,7 @@ const ZH: &[(&str, &str)] = &[
     ("remote.none", "没有远程仓库"),
     ("worktree.title", "工作区"),
     ("worktree.clean", "干净"),
+    ("worktree.clean_detail", "没有待处理的文件变更。"),
     ("nav.history", "历史"),
     ("worktree.stage_all", "全部暂存"),
     ("worktree.unstage_all", "全部取消暂存"),
@@ -232,6 +248,7 @@ const ZH: &[(&str, &str)] = &[
         "创建第一次提交后，图谱会显示在这里。",
     ),
     ("dialog.cancel", "取消"),
+    ("dialog.ok", "确定"),
     ("dialog.create", "创建"),
     ("dialog.checkout", "检出"),
     ("dialog.discard", "丢弃"),
@@ -256,3 +273,19 @@ const ZH: &[(&str, &str)] = &[
     ("reset.mixed", "混合重置"),
     ("reset.hard", "硬重置"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chinese_labels_are_not_mojibake() {
+        assert_eq!(Language::Chinese.code(), "\u{4e2d}\u{6587}");
+        assert_eq!(t(Language::Chinese, "action.push"), "\u{63a8}\u{9001}");
+        assert_eq!(
+            t(Language::Chinese, "commit.details"),
+            "\u{63d0}\u{4ea4}\u{8be6}\u{60c5}"
+        );
+        assert_eq!(t(Language::Chinese, "dialog.ok"), "\u{786e}\u{5b9a}");
+    }
+}
