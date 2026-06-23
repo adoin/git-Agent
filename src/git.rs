@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -7,6 +8,8 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow};
+
+const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -17,8 +20,10 @@ pub struct Commit {
     pub short_hash: String,
     pub parents: Vec<String>,
     pub author: String,
+    pub date: String,
     pub relative_time: String,
     pub subject: String,
+    pub refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,6 +89,22 @@ pub struct RepositorySnapshot {
     pub staged: Vec<WorktreeFile>,
     pub unstaged: Vec<WorktreeFile>,
     pub commits: Vec<Commit>,
+    pub date_commits: Vec<Commit>,
+    pub topology_commits: Vec<Commit>,
+    pub all_date_commits: Vec<Commit>,
+    pub all_topology_commits: Vec<Commit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitOrder {
+    Date,
+    Topology,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitScope {
+    CurrentBranch,
+    AllBranches,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,7 +150,31 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
-    let commits = load_commits(&root, 2_500)?;
+    let date_commits = load_commits(
+        &root,
+        HISTORY_COMMIT_LIMIT,
+        CommitOrder::Date,
+        CommitScope::CurrentBranch,
+    )?;
+    let topology_commits = load_commits(
+        &root,
+        HISTORY_COMMIT_LIMIT,
+        CommitOrder::Topology,
+        CommitScope::CurrentBranch,
+    )?;
+    let all_date_commits = load_commits(
+        &root,
+        HISTORY_COMMIT_LIMIT,
+        CommitOrder::Date,
+        CommitScope::AllBranches,
+    )?;
+    let all_topology_commits = load_commits(
+        &root,
+        HISTORY_COMMIT_LIMIT,
+        CommitOrder::Topology,
+        CommitScope::AllBranches,
+    )?;
+    let commits = date_commits.clone();
 
     Ok(RepositorySnapshot {
         root,
@@ -143,7 +188,77 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         staged,
         unstaged,
         commits,
+        date_commits,
+        topology_commits,
+        all_date_commits,
+        all_topology_commits,
     })
+}
+
+pub fn init_repository(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let output = git_command()
+        .arg("-C")
+        .arg(path)
+        .arg("init")
+        .output()
+        .with_context(|| format!("failed to run git init in {}", path.display()))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    discover_root(path)
+}
+
+pub fn clone_repository(url: &str, destination: impl AsRef<Path>) -> Result<PathBuf> {
+    let destination = destination.as_ref();
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let output = git_command()
+        .arg("clone")
+        .arg(url)
+        .arg(destination)
+        .output()
+        .with_context(|| format!("failed to run git clone {}", url))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    discover_root(destination)
+}
+
+pub fn validate_remote_url(url: &str) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(anyhow!("remote URL is empty"));
+    }
+
+    let output = git_command()
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["ls-remote", url])
+        .output()
+        .with_context(|| format!("failed to validate remote URL {}", url))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitDetails> {
@@ -158,6 +273,88 @@ pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitD
         hash: hash.to_owned(),
         files,
     })
+}
+
+pub fn search_commits_by_changed_file(root: impl AsRef<Path>, query: &str) -> Result<Vec<String>> {
+    let raw_query = query.trim();
+    if raw_query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_count = format!("--max-count={HISTORY_COMMIT_LIMIT}");
+    let path_output = git_output(
+        root.as_ref(),
+        &[
+            "log",
+            "--date-order",
+            &max_count,
+            "--name-only",
+            "--format=%x1e%H",
+        ],
+    )?;
+    let content_regex = literal_git_regex(raw_query);
+    let content_output = git_output(
+        root.as_ref(),
+        &[
+            "log",
+            "--date-order",
+            &max_count,
+            "--regexp-ignore-case",
+            "-G",
+            &content_regex,
+            "--format=%H",
+        ],
+    )?;
+
+    let mut hashes = parse_changed_file_search_log(&path_output, raw_query);
+    for hash in parse_hash_lines(&content_output) {
+        if !hashes.iter().any(|existing| existing == &hash) {
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+fn parse_changed_file_search_log(output: &str, query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hashes = Vec::new();
+    for record in output
+        .split('\x1e')
+        .filter(|record| !record.trim().is_empty())
+    {
+        let mut lines = record.lines().filter(|line| !line.trim().is_empty());
+        let Some(hash) = lines.next().map(str::trim) else {
+            continue;
+        };
+        if lines.any(|path| path.to_lowercase().contains(&query)) {
+            hashes.push(hash.to_owned());
+        }
+    }
+    hashes
+}
+
+fn parse_hash_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn literal_git_regex(query: &str) -> String {
+    let mut escaped = String::new();
+    for ch in query.chars() {
+        if matches!(ch, '\\' | '.' | '^' | '$' | '*' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 pub fn load_file_diff(root: impl AsRef<Path>, hash: &str, path: &str) -> Result<FileDiff> {
@@ -270,6 +467,16 @@ pub fn delete_branch(root: impl AsRef<Path>, name: &str, force: bool) -> Result<
     } else {
         git_output(root.as_ref(), &["branch", "-d", name]).map(|_| ())
     }
+}
+
+pub fn delete_remote_branch(root: impl AsRef<Path>, remote_branch: &str) -> Result<()> {
+    let (remote, branch) = remote_branch
+        .split_once('/')
+        .ok_or_else(|| anyhow!("remote branch must look like remote/name"))?;
+    if remote.trim().is_empty() || branch.trim().is_empty() {
+        return Err(anyhow!("remote branch must look like remote/name"));
+    }
+    git_output(root.as_ref(), &["push", remote, "--delete", branch]).map(|_| ())
 }
 
 pub fn create_tag(root: impl AsRef<Path>, name: &str, hash: &str) -> Result<()> {
@@ -516,7 +723,7 @@ fn load_tags(root: &Path) -> Result<Vec<Tag>> {
             "tag",
             "--list",
             "--sort=-creatordate",
-            "--format=%(refname:short)%x1f%(objectname:short)%x1f%(subject)",
+            "--format=%(refname:short)%09%(objectname:short)%09%(subject)",
         ],
     )?;
     Ok(parse_tags(&output))
@@ -526,7 +733,14 @@ fn parse_tags(output: &str) -> Vec<Tag> {
     output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.split('\x1f');
+            let mut parts = if line.contains('\t') {
+                line.split('\t').collect::<Vec<_>>()
+            } else if line.contains('\x1f') {
+                line.split('\x1f').collect::<Vec<_>>()
+            } else {
+                line.split("%x1f").collect::<Vec<_>>()
+            }
+            .into_iter();
             let name = parts.next()?.trim();
             let target = parts.next().unwrap_or_default().trim();
             let subject = parts.next().unwrap_or_default().trim();
@@ -573,22 +787,33 @@ fn discover_root(path: &Path) -> Result<PathBuf> {
     ))
 }
 
-fn load_commits(root: &Path, limit: usize) -> Result<Vec<Commit>> {
+fn load_commits(
+    root: &Path,
+    limit: usize,
+    order: CommitOrder,
+    scope: CommitScope,
+) -> Result<Vec<Commit>> {
     if !has_head(root) {
         return Ok(Vec::new());
     }
 
     let max_count = format!("--max-count={limit}");
-    let output = git_output(
-        root,
-        &[
-            "log",
-            "--date-order",
-            "--topo-order",
-            &max_count,
-            "--format=%H%x1f%P%x1f%an%x1f%ar%x1f%s",
-        ],
-    )?;
+    let order_arg = match order {
+        CommitOrder::Date => "--date-order",
+        CommitOrder::Topology => "--topo-order",
+    };
+    let mut args = vec![
+        "log",
+        order_arg,
+        &max_count,
+        "--date=format-local:%Y-%m-%d %H:%M",
+        "--decorate=short",
+    ];
+    if scope == CommitScope::AllBranches {
+        args.push("--all");
+    }
+    args.push("--format=%H%x1f%P%x1f%an%x1f%cd%x1f%ar%x1f%D%x1f%s");
+    let output = git_output(root, &args)?;
 
     Ok(output
         .lines()
@@ -602,7 +827,17 @@ fn load_commits(root: &Path, limit: usize) -> Result<Vec<Commit>> {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let author = parts.next().unwrap_or_default().to_owned();
+            let date = parts.next().unwrap_or_default().to_owned();
             let relative_time = parts.next().unwrap_or_default().to_owned();
+            let refs = parts
+                .next()
+                .unwrap_or_default()
+                .split(", ")
+                .filter_map(|name| {
+                    let name = name.trim();
+                    (!name.is_empty()).then(|| name.to_owned())
+                })
+                .collect::<Vec<_>>();
             let subject = parts.next().unwrap_or_default().to_owned();
             let short_hash = hash.chars().take(8).collect();
 
@@ -611,8 +846,10 @@ fn load_commits(root: &Path, limit: usize) -> Result<Vec<Commit>> {
                 short_hash,
                 parents,
                 author,
+                date,
                 relative_time,
                 subject,
+                refs,
             })
         })
         .collect())
@@ -657,6 +894,29 @@ fn git_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_commit_limit_supports_large_repositories() {
+        assert!(HISTORY_COMMIT_LIMIT >= 50_000);
+    }
+
+    #[test]
+    fn parses_changed_file_search_log_by_path() {
+        let output = "\x1eabc123\nsrc/styles/pretty.scss\nREADME.md\n\x1edef456\nsrc/main.rs\n\x1efed789\ncomponents/AntButton.vue\n";
+
+        let matches = parse_changed_file_search_log(output, "ant");
+
+        assert_eq!(matches, vec!["fed789"]);
+    }
+
+    #[test]
+    fn parses_content_search_hash_lines_and_escapes_literal_regex() {
+        assert_eq!(
+            parse_hash_lines("abc123\n\n def456 \n"),
+            vec!["abc123", "def456"]
+        );
+        assert_eq!(literal_git_regex(".ant[foo]*"), r"\.ant\[foo\]\*");
+    }
 
     #[test]
     fn parses_name_status_output() {
@@ -752,5 +1012,15 @@ mod tests {
         assert_eq!(tags[0].name, "v1.0.0");
         assert_eq!(tags[0].target, "abcd1234");
         assert_eq!(tags[0].subject, "release commit");
+    }
+
+    #[test]
+    fn parses_tag_list_output_when_separator_is_literal() {
+        let tags = parse_tags("v3.6.0%x1f20c49fd0%x1fMerge branch\n");
+
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "v3.6.0");
+        assert_eq!(tags[0].target, "20c49fd0");
+        assert_eq!(tags[0].subject, "Merge branch");
     }
 }

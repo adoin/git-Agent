@@ -11,6 +11,8 @@ pub struct GraphLayout {
 #[derive(Clone, Debug, Default)]
 pub struct GraphRow {
     pub lane: usize,
+    pub before_lanes: Vec<usize>,
+    pub after_lanes: Vec<usize>,
     pub edges: Vec<GraphEdge>,
 }
 
@@ -38,10 +40,19 @@ pub fn layout(commits: &[Commit]) -> GraphLayout {
     let mut max_lanes = 1;
 
     for commit in commits {
-        let lane = active
+        let lane = if let Some(index) = active
             .iter()
             .position(|hash| hash.as_deref() == Some(commit.hash.as_str()))
-            .unwrap_or_else(|| first_free_lane(&mut active));
+        {
+            index
+        } else {
+            first_free_lane(&mut active)
+        };
+        let before_lanes = active
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| hash.is_some().then_some(index))
+            .collect::<Vec<_>>();
 
         let visible_parents = commit
             .parents
@@ -80,7 +91,18 @@ pub fn layout(commits: &[Commit]) -> GraphLayout {
             .collect();
 
         max_lanes = max_lanes.max(active.len());
-        rows.push(GraphRow { lane, edges });
+        let mut after_lanes = active
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| hash.is_some().then_some(index))
+            .collect::<Vec<_>>();
+        after_lanes.sort_unstable();
+        rows.push(GraphRow {
+            lane,
+            before_lanes,
+            after_lanes,
+            edges,
+        });
         trim_trailing_free_lanes(&mut active);
     }
 
@@ -128,8 +150,10 @@ mod tests {
             short_hash: hash.to_owned(),
             parents: parents.iter().map(|parent| parent.to_string()).collect(),
             author: "Ada".to_owned(),
+            date: "2026-06-23 09:51".to_owned(),
             relative_time: "now".to_owned(),
             subject: hash.to_owned(),
+            refs: Vec::new(),
         }
     }
 
@@ -162,6 +186,27 @@ mod tests {
                 .iter()
                 .any(|edge| edge.kind != EdgeKind::Continue)
         );
+        assert!(graph.rows[1].before_lanes.contains(&0));
+        assert!(graph.rows[1].after_lanes.contains(&0));
+        assert!(graph.rows[2].before_lanes.contains(&1));
+        assert!(graph.rows[2].after_lanes.contains(&1));
+    }
+
+    #[test]
+    fn separates_lane_entry_and_exit_segments() {
+        let graph = layout(&[
+            commit("m", &["b", "f"]),
+            commit("b", &["a"]),
+            commit("f", &["e"]),
+            commit("e", &["a"]),
+            commit("a", &[]),
+        ]);
+
+        assert!(graph.rows[0].before_lanes.is_empty());
+        assert!(graph.rows[0].after_lanes.contains(&0));
+        assert!(graph.rows[0].after_lanes.contains(&1));
+        assert!(!graph.rows[0].before_lanes.contains(&1));
+        assert!(!graph.rows[4].after_lanes.contains(&0));
     }
 
     #[test]
@@ -182,8 +227,10 @@ mod tests {
                     short_hash: hash,
                     parents,
                     author: "Ada".to_owned(),
+                    date: "2026-06-23 09:51".to_owned(),
                     relative_time: "now".to_owned(),
                     subject: format!("commit {index}"),
+                    refs: Vec::new(),
                 }
             })
             .collect::<Vec<_>>();

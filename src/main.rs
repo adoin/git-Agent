@@ -30,7 +30,15 @@ fn app_icon_data() -> eframe::egui::IconData {
     let teal = [69, 238, 216, 255];
 
     paint_line_color(&mut rgba, size, 24, 16, 24, 48, 4, teal);
-    paint_quadratic_color(&mut rgba, size, (24.0, 34.0), (36.0, 34.0), (45.0, 21.0), 4, teal);
+    paint_quadratic_color(
+        &mut rgba,
+        size,
+        (24.0, 34.0),
+        (36.0, 34.0),
+        (45.0, 21.0),
+        4,
+        teal,
+    );
 
     for (x, y) in [(24, 16), (24, 48), (45, 21)] {
         paint_ring(&mut rgba, size, x, y, 9, 4, teal);
@@ -113,13 +121,18 @@ fn paint_quadratic_color(
     for step in 0..=steps {
         let t = step as f32 / steps as f32;
         let one_minus_t = 1.0 - t;
-        let x = one_minus_t * one_minus_t * start.0
-            + 2.0 * one_minus_t * t * control.0
-            + t * t * end.0;
-        let y = one_minus_t * one_minus_t * start.1
-            + 2.0 * one_minus_t * t * control.1
-            + t * t * end.1;
-        paint_disc(rgba, size, x.round() as usize, y.round() as usize, radius, color);
+        let x =
+            one_minus_t * one_minus_t * start.0 + 2.0 * one_minus_t * t * control.0 + t * t * end.0;
+        let y =
+            one_minus_t * one_minus_t * start.1 + 2.0 * one_minus_t * t * control.1 + t * t * end.1;
+        paint_disc(
+            rgba,
+            size,
+            x.round() as usize,
+            y.round() as usize,
+            radius,
+            color,
+        );
     }
 }
 
@@ -153,7 +166,11 @@ mod tests {
         let icon = app_icon_data();
         assert_eq!(icon.width, 64);
         assert_eq!(icon.height, 64);
-        assert!(icon.rgba.chunks_exact(4).any(|px| px == [69, 238, 216, 255]));
+        assert!(
+            icon.rgba
+                .chunks_exact(4)
+                .any(|px| px == [69, 238, 216, 255])
+        );
         assert!(icon.rgba.chunks_exact(4).any(|px| px[3] == 0));
         let logo = include_str!("../assets/icons/logo-ga.svg");
         assert!(logo.contains("stroke=\"#45EED8\""));

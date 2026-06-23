@@ -5,11 +5,21 @@ use eframe::egui::{
 };
 
 static THEME_MODE: AtomicU8 = AtomicU8::new(0);
+static THEME_ACCENT: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThemeMode {
     Dark,
     Light,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThemeAccent {
+    Green,
+    Blue,
+    Purple,
+    Rose,
+    Orange,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +33,8 @@ pub struct Palette {
     pub accent_deep: Color32,
     pub accent_soft: Color32,
     pub accent_shadow: Color32,
+    pub hover: Color32,
+    pub scroll_track: Color32,
     pub info: Color32,
     pub warning: Color32,
 }
@@ -48,10 +60,10 @@ pub const LANES: [Color32; 8] = [
 
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
-    apply(ctx, ThemeMode::Dark);
+    apply(ctx, ThemeMode::Dark, ThemeAccent::Green);
 }
 
-pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
+pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     THEME_MODE.store(
         match mode {
             ThemeMode::Dark => 0,
@@ -59,7 +71,8 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
         },
         Ordering::Relaxed,
     );
-    let palette = palette(mode);
+    THEME_ACCENT.store(accent_index(accent), Ordering::Relaxed);
+    let palette = palette_for(mode, accent);
     let mut visuals = match mode {
         ThemeMode::Dark => Visuals::dark(),
         ThemeMode::Light => Visuals::light(),
@@ -67,7 +80,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     visuals.panel_fill = palette.bg;
     visuals.window_fill = palette.panel;
     visuals.window_stroke = Stroke::NONE;
-    visuals.extreme_bg_color = palette.bg;
+    visuals.extreme_bg_color = palette.scroll_track;
     visuals.faint_bg_color = palette.panel_soft;
     visuals.widgets.noninteractive.bg_fill = palette.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
@@ -75,11 +88,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.weak_bg_fill = palette.panel_soft;
     visuals.widgets.inactive.fg_stroke.color = palette.text;
-    visuals.widgets.hovered.bg_fill = if mode == ThemeMode::Dark {
-        Color32::from_rgb(43, 49, 64)
-    } else {
-        palette.accent_soft
-    };
+    visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
     visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
     visuals.widgets.hovered.fg_stroke.color = palette.text;
@@ -100,8 +109,14 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
     visuals.hyperlink_color = palette.accent;
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
+    style.spacing.scroll.foreground_color = false;
+    style.spacing.scroll.active_background_opacity = 0.24;
+    style.spacing.scroll.interact_background_opacity = 0.36;
+    style.spacing.scroll.active_handle_opacity = 0.74;
+    style.spacing.scroll.interact_handle_opacity = 1.0;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.interaction.tooltip_delay = 0.12;
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -133,7 +148,43 @@ pub fn current_mode() -> ThemeMode {
     }
 }
 
+pub fn current_accent() -> ThemeAccent {
+    accent_from_index(THEME_ACCENT.load(Ordering::Relaxed))
+}
+
 pub fn palette(mode: ThemeMode) -> Palette {
+    palette_for(mode, current_accent())
+}
+
+pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
+    let seed = accent_seed(accent);
+    let hsl = rgb_to_hsl(seed);
+    let accent_color = hsl_to_rgb(hsl.h, hsl.s, hsl.l);
+    let accent_deep = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.72).clamp(0.0, 1.0), 0.28),
+        ThemeMode::Light => hsl_to_rgb(hsl.h, (hsl.s * 0.78).clamp(0.0, 1.0), 0.34),
+    };
+    let accent_soft = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.42).clamp(0.0, 1.0), 0.16),
+        ThemeMode::Light => hsl_to_rgb(hsl.h, (hsl.s * 0.30).clamp(0.0, 1.0), 0.91),
+    };
+    let hover = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.36).clamp(0.0, 1.0), 0.22),
+        ThemeMode::Light => hsl_to_rgb(hsl.h, (hsl.s * 0.30).clamp(0.0, 1.0), 0.88),
+    };
+    let scroll_track = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.48).clamp(0.0, 1.0), 0.11),
+        ThemeMode::Light => hsl_to_rgb(hsl.h, (hsl.s * 0.24).clamp(0.0, 1.0), 0.84),
+    };
+    let accent_shadow = match mode {
+        ThemeMode::Dark => Color32::from_rgba_unmultiplied(
+            accent_color.r(),
+            accent_color.g(),
+            accent_color.b(),
+            34,
+        ),
+        ThemeMode::Light => Color32::from_rgba_unmultiplied(44, 56, 72, 54),
+    };
     match mode {
         ThemeMode::Dark => Palette {
             bg: BG,
@@ -141,10 +192,12 @@ pub fn palette(mode: ThemeMode) -> Palette {
             panel_soft: PANEL_SOFT,
             text: TEXT,
             muted: MUTED,
-            accent: ACCENT,
-            accent_deep: Color32::from_rgb(34, 75, 82),
-            accent_soft: Color32::from_rgb(27, 43, 46),
-            accent_shadow: Color32::from_rgba_unmultiplied(69, 238, 216, 28),
+            accent: accent_color,
+            accent_deep,
+            accent_soft,
+            accent_shadow,
+            hover,
+            scroll_track,
             info: Color32::from_rgb(120, 164, 255),
             warning: WARNING,
         },
@@ -154,10 +207,12 @@ pub fn palette(mode: ThemeMode) -> Palette {
             panel_soft: Color32::from_rgb(229, 236, 242),
             text: Color32::from_rgb(32, 39, 50),
             muted: Color32::from_rgb(101, 112, 130),
-            accent: Color32::from_rgb(0, 118, 137),
-            accent_deep: Color32::from_rgb(23, 94, 102),
-            accent_soft: Color32::from_rgb(225, 240, 239),
-            accent_shadow: Color32::from_rgba_unmultiplied(69, 238, 216, 38),
+            accent: accent_color,
+            accent_deep,
+            accent_soft,
+            accent_shadow,
+            hover,
+            scroll_track,
             info: Color32::from_rgb(59, 107, 185),
             warning: Color32::from_rgb(181, 98, 28),
         },
@@ -206,6 +261,123 @@ pub fn info() -> Color32 {
 
 pub fn warning() -> Color32 {
     palette(current_mode()).warning
+}
+
+pub fn all_accents() -> [ThemeAccent; 5] {
+    [
+        ThemeAccent::Green,
+        ThemeAccent::Blue,
+        ThemeAccent::Purple,
+        ThemeAccent::Rose,
+        ThemeAccent::Orange,
+    ]
+}
+
+pub fn accent_color(accent: ThemeAccent) -> Color32 {
+    accent_seed(accent)
+}
+
+fn accent_index(accent: ThemeAccent) -> u8 {
+    match accent {
+        ThemeAccent::Green => 0,
+        ThemeAccent::Blue => 1,
+        ThemeAccent::Purple => 2,
+        ThemeAccent::Rose => 3,
+        ThemeAccent::Orange => 4,
+    }
+}
+
+fn accent_from_index(index: u8) -> ThemeAccent {
+    match index {
+        1 => ThemeAccent::Blue,
+        2 => ThemeAccent::Purple,
+        3 => ThemeAccent::Rose,
+        4 => ThemeAccent::Orange,
+        _ => ThemeAccent::Green,
+    }
+}
+
+fn accent_seed(accent: ThemeAccent) -> Color32 {
+    match accent {
+        ThemeAccent::Green => ACCENT,
+        ThemeAccent::Blue => Color32::from_rgb(74, 137, 229),
+        ThemeAccent::Purple => Color32::from_rgb(142, 105, 222),
+        ThemeAccent::Rose => Color32::from_rgb(210, 88, 132),
+        ThemeAccent::Orange => Color32::from_rgb(213, 126, 48),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Hsl {
+    h: f32,
+    s: f32,
+    l: f32,
+}
+
+fn rgb_to_hsl(color: Color32) -> Hsl {
+    let r = color.r() as f32 / 255.0;
+    let g = color.g() as f32 / 255.0;
+    let b = color.b() as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if (max - min).abs() < f32::EPSILON {
+        return Hsl { h: 0.0, s: 0.0, l };
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let mut h = if (max - r).abs() < f32::EPSILON {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    h /= 6.0;
+    Hsl { h, s, l }
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color32 {
+    if s <= 0.0 {
+        let v = (l.clamp(0.0, 1.0) * 255.0).round() as u8;
+        return Color32::from_rgb(v, v, v);
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let r = hue_to_rgb(p, q, h + 1.0 / 3.0);
+    let g = hue_to_rgb(p, q, h);
+    let b = hue_to_rgb(p, q, h - 1.0 / 3.0);
+    Color32::from_rgb(
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < 1.0 / 6.0 {
+        p + (q - p) * 6.0 * t
+    } else if t < 1.0 / 2.0 {
+        q
+    } else if t < 2.0 / 3.0 {
+        p + (q - p) * (2.0 / 3.0 - t) * 6.0
+    } else {
+        p
+    }
 }
 
 fn install_fonts(ctx: &egui::Context) {

@@ -22,6 +22,15 @@ impl Language {
 }
 
 pub fn t(language: Language, key: &'static str) -> &'static str {
+    if language == Language::Chinese {
+        if let Some(value) = ZH_SOURCE
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == key).then_some(*value))
+        {
+            return value;
+        }
+    }
+
     let entries = match language {
         Language::English => EN,
         Language::Chinese => ZH,
@@ -32,6 +41,94 @@ pub fn t(language: Language, key: &'static str) -> &'static str {
         .find_map(|(candidate, value)| (*candidate == key).then_some(*value))
         .unwrap_or(key)
 }
+
+const ZH_SOURCE: &[(&str, &str)] = &[
+    (
+        "status.hash_copied",
+        "\u{5df2}\u{590d}\u{5236}\u{5b8c}\u{6574} hash",
+    ),
+    ("diff.blocks", "\u{5dee}\u{5f02}\u{5757}"),
+    ("diff.full_file", "\u{5b8c}\u{6574}\u{6587}\u{4ef6}"),
+    ("menu.copy", "\u{590d}\u{5236}"),
+    ("repo.source.new_tab", "New tab"),
+    ("repo.source.close_tab", "\u{5173}\u{95ed}\u{6807}\u{7b7e}"),
+    ("repo.source.title", "\u{672c}\u{5730}\u{4ed3}\u{5e93}"),
+    ("repo.source.local", "\u{672c}\u{5730}"),
+    ("repo.source.remote", "\u{8fdc}\u{7a0b}"),
+    ("repo.source.clone", "\u{514b}\u{9686}"),
+    ("repo.source.add", "\u{6dfb}\u{52a0}"),
+    ("repo.source.create", "\u{521b}\u{5efa}"),
+    ("repo.source.search", "\u{641c}\u{7d22}"),
+    (
+        "repo.source.local_repositories",
+        "\u{672c}\u{5730}\u{4ed3}\u{5e93}",
+    ),
+    (
+        "repo.source.empty",
+        "\u{672a}\u{627e}\u{5230}\u{672c}\u{5730}\u{4ed3}\u{5e93}\u{3002}",
+    ),
+    ("repo.source.clone_url", "\u{6e90} URL"),
+    (
+        "repo.source.destination",
+        "\u{76ee}\u{6807}\u{8def}\u{5f84}",
+    ),
+    ("repo.source.browse", "\u{6d4f}\u{89c8}"),
+    ("repo.source.pending", "\u{7b49}\u{5f85}\u{6821}\u{9a8c}"),
+    ("repo.source.checking", "\u{6821}\u{9a8c}\u{4e2d}"),
+    ("repo.source.valid", "\u{6709}\u{6548}"),
+    ("repo.source.invalid", "\u{65e0}\u{6548}\u{8fde}\u{63a5}"),
+    ("repo.git_flow", "Git\u{5de5}\u{4f5c}\u{6d41}"),
+    ("repo.remote", "\u{8fdc}\u{7a0b}"),
+    (
+        "repo.command_mode",
+        "\u{547d}\u{4ee4}\u{884c}\u{6a21}\u{5f0f}",
+    ),
+    (
+        "repo.resource_manager",
+        "\u{8d44}\u{6e90}\u{7ba1}\u{7406}\u{5668}",
+    ),
+    (
+        "repo.git_flow.opened",
+        "\u{5df2}\u{6253}\u{5f00} Git \u{5de5}\u{4f5c}\u{6d41}",
+    ),
+    (
+        "repo.command_mode.failed",
+        "\u{6253}\u{5f00}\u{547d}\u{4ee4}\u{884c}\u{5931}\u{8d25}",
+    ),
+    (
+        "repo.resource_manager.failed",
+        "\u{6253}\u{5f00}\u{8d44}\u{6e90}\u{7ba1}\u{7406}\u{5668}\u{5931}\u{8d25}",
+    ),
+    (
+        "repo.source.clone_missing",
+        "\u{8bf7}\u{8f93}\u{5165}\u{6e90} URL \u{548c}\u{76ee}\u{6807}\u{8def}\u{5f84}\u{3002}",
+    ),
+    (
+        "repo.source.create_missing",
+        "\u{521b}\u{5efa}\u{4ed3}\u{5e93}\u{524d}\u{8bf7}\u{9009}\u{62e9}\u{6587}\u{4ef6}\u{5939}\u{3002}",
+    ),
+    (
+        "branch.delete_remote",
+        "\u{5220}\u{9664}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+    ),
+    (
+        "branch.sync_remote",
+        "\u{540c}\u{6b65}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+    ),
+    (
+        "branch.local_alias",
+        "\u{672c}\u{5730}\u{5206}\u{652f}\u{522b}\u{540d}",
+    ),
+    (
+        "branch.confirm_delete_remote",
+        "\u{5220}\u{9664}\u{8fdc}\u{7a0b}\u{5206}\u{652f}\u{ff1f}",
+    ),
+    ("remote.title", "\u{8fdc}\u{7a0b}\u{5206}\u{652f}"),
+    (
+        "remote.none",
+        "\u{6ca1}\u{6709}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+    ),
+];
 
 const EN: &[(&str, &str)] = &[
     ("app.title", "Git Agent"),
@@ -48,6 +145,7 @@ const EN: &[(&str, &str)] = &[
     ("settings.language", "Language"),
     ("status.loading_repo", "Loading repository"),
     ("status.action_completed", "Action completed"),
+    ("status.hash_copied", "Full hash copied"),
     ("common.more", "more"),
     ("common.local", "local"),
     ("common.remote", "remote"),
@@ -55,8 +153,46 @@ const EN: &[(&str, &str)] = &[
     ("diff.queued", "Diff is queued for loading."),
     ("diff.empty", "No textual diff for this file."),
     ("diff.truncated", "Diff truncated at 1200 lines"),
+    ("diff.blocks", "Diff blocks"),
+    ("diff.full_file", "Full file"),
     ("repo.title", "Repository"),
     ("repo.none", "No repository loaded"),
+    ("repo.source.new_tab", "New tab"),
+    ("repo.source.close_tab", "Close tab"),
+    ("repo.source.title", "Local Repositories"),
+    ("repo.source.local", "Local"),
+    ("repo.source.remote", "Remote"),
+    ("repo.source.clone", "Clone"),
+    ("repo.source.add", "Add"),
+    ("repo.source.create", "Create"),
+    ("repo.source.search", "Search"),
+    ("repo.source.local_repositories", "Local repositories"),
+    ("repo.source.empty", "No local repositories found."),
+    ("repo.source.clone_url", "Source URL"),
+    ("repo.source.destination", "Destination Path"),
+    ("repo.source.browse", "Browse"),
+    ("repo.source.pending", "Waiting to check"),
+    ("repo.source.checking", "Checking"),
+    ("repo.source.valid", "Valid"),
+    ("repo.source.invalid", "Invalid remote"),
+    ("repo.git_flow", "Git Workflow"),
+    ("repo.remote", "Remote"),
+    ("repo.command_mode", "Command Mode"),
+    ("repo.resource_manager", "Resource Manager"),
+    ("repo.git_flow.opened", "Git workflow opened"),
+    ("repo.command_mode.failed", "Failed to open command mode"),
+    (
+        "repo.resource_manager.failed",
+        "Failed to open resource manager",
+    ),
+    (
+        "repo.source.clone_missing",
+        "Enter a source URL and destination path.",
+    ),
+    (
+        "repo.source.create_missing",
+        "Choose a folder before creating a repository.",
+    ),
     ("branch.current", "Branch"),
     ("branch.local", "Local Branches"),
     ("branch.remote", "Remote Branches"),
@@ -65,11 +201,15 @@ const EN: &[(&str, &str)] = &[
     ("branch.name", "Branch name"),
     ("branch.checkout", "Checkout branch"),
     ("branch.checkout_remote", "Checkout remote branch"),
+    ("branch.sync_remote", "Sync remote branch"),
+    ("branch.local_alias", "Local branch alias"),
     ("branch.delete", "Delete branch"),
+    ("branch.delete_remote", "Delete remote branch"),
     ("branch.force_delete", "Force delete"),
     ("branch.confirm_delete", "Delete this branch?"),
-    ("remote.title", "Remotes"),
-    ("remote.none", "No remotes"),
+    ("branch.confirm_delete_remote", "Delete this remote branch?"),
+    ("remote.title", "Remote Branches"),
+    ("remote.none", "No remote branches"),
     ("worktree.title", "Working Tree"),
     ("worktree.clean", "Clean"),
     ("worktree.clean_detail", "No pending file changes."),
@@ -132,6 +272,7 @@ const EN: &[(&str, &str)] = &[
     ("dialog.discard", "Discard"),
     ("menu.copy_hash", "Copy commit hash"),
     ("menu.copy_short_hash", "Copy short hash"),
+    ("menu.copy", "Copy"),
     ("menu.checkout_commit", "Checkout this commit"),
     ("menu.create_branch", "Create branch here"),
     ("menu.create_tag", "Create tag here"),
@@ -287,5 +428,22 @@ mod tests {
             "\u{63d0}\u{4ea4}\u{8be6}\u{60c5}"
         );
         assert_eq!(t(Language::Chinese, "dialog.ok"), "\u{786e}\u{5b9a}");
+        assert_eq!(
+            t(Language::Chinese, "repo.source.clone"),
+            "\u{514b}\u{9686}"
+        );
+        assert_eq!(t(Language::Chinese, "repo.source.add"), "\u{6dfb}\u{52a0}");
+        assert_eq!(
+            t(Language::Chinese, "repo.source.create"),
+            "\u{521b}\u{5efa}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "repo.source.invalid"),
+            "\u{65e0}\u{6548}\u{8fde}\u{63a5}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "repo.command_mode"),
+            "\u{547d}\u{4ee4}\u{884c}\u{6a21}\u{5f0f}"
+        );
     }
 }
