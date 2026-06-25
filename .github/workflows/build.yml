@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,10 +50,34 @@ jobs:
             libgl1-mesa-dev \
             pkg-config
 
+      - name: Normalize Git line endings
+        if: runner.os != 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false && git config --global core.safecrlf false
+
+      - name: Normalize Git line endings
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: git config --global core.autocrlf false && git config --global core.safecrlf false
+
       - name: Test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cargo test --locked
+
+      - name: Test
+        if: runner.os == 'Windows'
+        shell: cmd
         run: cargo test --locked
 
       - name: Build release binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Build release binaries
+        if: runner.os == 'Windows'
+        shell: cmd
         run: cargo build --release --locked
 
       - name: Package installer
@@ -127,4 +151,42 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
+          retention-days: 3
           path: dist/${{ matrix.artifact }}/
+
+  cleanup:
+    name: Keep recent build history
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Delete older build workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: build.yml
+          KEEP_RUNS: "3"
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          run_ids=$(gh api "/repos/$REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?per_page=100" \
+            --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id')
+
+          index=0
+          for run_id in $run_ids; do
+            index=$((index + 1))
+            if [ "$index" -le "$KEEP_RUNS" ]; then
+              continue
+            fi
+
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              continue
+            fi
+
+            gh api --method DELETE "/repos/$REPOSITORY/actions/runs/$run_id"
+          done

@@ -22,6 +22,8 @@ Each package includes:
 
 Run the installer script from the downloaded package to install both executables.
 
+The workflow keeps only the latest 3 build runs and sets uploaded installer artifacts to expire after 3 days, which helps limit GitHub Actions storage usage.
+
 ## Support
 
 If this project helps you, you can support it on 爱发电:
