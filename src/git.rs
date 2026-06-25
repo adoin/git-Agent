@@ -1047,10 +1047,17 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
     #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
-    command
+    {
+        let mut command = Command::new("git");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("git")
+    }
 }
 
 #[cfg(test)]
