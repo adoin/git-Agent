@@ -149,7 +149,7 @@ jobs:
           Write-Host "Installed git-agent and git-agent-merge to $InstallDir"
           '@ | Set-Content -LiteralPath (Join-Path $packageDir "install.ps1") -Encoding UTF8
 
-          Compress-Archive -LiteralPath (Join-Path $packageDir "*") -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
 
       - name: Upload installer package
         uses: actions/upload-artifact@v7
