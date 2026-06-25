@@ -24,6 +24,17 @@ Run the installer script from the downloaded package to install both executables
 
 The workflow keeps only the latest 3 build runs and sets uploaded installer artifacts to expire after 3 days, which helps limit GitHub Actions storage usage.
 
+## Release
+
+Create and push a version tag to publish a GitHub Release with Linux, macOS, and Windows installer packages:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release assets are generated automatically from the workflow build outputs.
+
 ## Support
 
 If this project helps you, you can support it on 爱发电:
