@@ -1,0 +1,130 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: git-agent-linux-installer
+          - name: macOS
+            os: macos-latest
+            artifact: git-agent-macos-installer
+          - name: Windows
+            os: windows-latest
+            artifact: git-agent-windows-installer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            pkg-config
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="dist/${{ matrix.artifact }}"
+          mkdir -p "$package_dir"
+          cp target/release/git-agent "$package_dir/"
+          cp target/release/git-agent-merge "$package_dir/"
+          cat > "$package_dir/install.sh" <<'INSTALLER'
+          #!/usr/bin/env sh
+          set -eu
+
+          script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          prefix=${PREFIX:-"$HOME/.local"}
+          install_dir=${INSTALL_DIR:-"$prefix/bin"}
+
+          mkdir -p "$install_dir"
+          cp "$script_dir/git-agent" "$install_dir/git-agent"
+          cp "$script_dir/git-agent-merge" "$install_dir/git-agent-merge"
+          chmod 755 "$install_dir/git-agent" "$install_dir/git-agent-merge"
+
+          echo "Installed git-agent and git-agent-merge to $install_dir"
+          echo "Add $install_dir to PATH if it is not already there."
+          INSTALLER
+          sed -i.bak 's/^          //' "$package_dir/install.sh"
+          rm "$package_dir/install.sh.bak"
+          chmod +x "$package_dir/git-agent" "$package_dir/git-agent-merge" "$package_dir/install.sh"
+
+      - name: Package installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packageDir = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item -LiteralPath "target/release/git-agent.exe" -Destination $packageDir
+          Copy-Item -LiteralPath "target/release/git-agent-merge.exe" -Destination $packageDir
+
+          @'
+          param(
+              [string]$InstallDir = "$env:LOCALAPPDATA\Programs\GitAgent"
+          )
+
+          $ErrorActionPreference = "Stop"
+          $PackageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+          Copy-Item -LiteralPath (Join-Path $PackageDir "git-agent.exe") -Destination $InstallDir -Force
+          Copy-Item -LiteralPath (Join-Path $PackageDir "git-agent-merge.exe") -Destination $InstallDir -Force
+
+          $CurrentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $PathParts = @()
+          if ($CurrentPath) {
+              $PathParts = $CurrentPath -split ";" | Where-Object { $_ }
+          }
+
+          if ($PathParts -notcontains $InstallDir) {
+              $NewPath = (@($PathParts) + $InstallDir) -join ";"
+              [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+              Write-Host "Added $InstallDir to user PATH. Open a new terminal to use it."
+          }
+
+          Write-Host "Installed git-agent and git-agent-merge to $InstallDir"
+          '@ | Set-Content -LiteralPath (Join-Path $packageDir "install.ps1") -Encoding UTF8
+
+      - name: Upload installer package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: dist/${{ matrix.artifact }}/
