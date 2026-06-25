@@ -47,6 +47,7 @@ pub struct Remote {
     pub push_url: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct UpstreamStatus {
     pub name: String,
@@ -74,6 +75,15 @@ pub struct WorktreeFile {
     pub worktree_status: char,
     pub path: String,
     pub display_path: String,
+}
+
+impl WorktreeFile {
+    pub fn is_conflicted(&self) -> bool {
+        matches!(
+            (self.index_status, self.worktree_status),
+            ('A', 'A') | ('D', 'D') | ('U', _) | (_, 'U')
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,7 +141,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         branch
     };
 
-    let status = git_output(&root, &["status", "--short"])
+    let status = git_output(&root, &["status", "--short", "--untracked-files=all"])
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
@@ -379,14 +389,64 @@ pub fn diff_key(hash: &str, path: &str) -> String {
     format!("{hash}:{path}")
 }
 
-pub fn load_worktree_diff(root: impl AsRef<Path>, path: &str, staged: bool) -> Result<FileDiff> {
-    let text = if staged {
-        git_output(root.as_ref(), &["diff", "--cached", "--", path])?
+pub fn load_worktree_diff(
+    root: impl AsRef<Path>,
+    path: &str,
+    staged: bool,
+    untracked: bool,
+) -> Result<FileDiff> {
+    let root = root.as_ref();
+    let text = if untracked && !staged {
+        load_untracked_file_diff(root, path)?
+    } else if staged {
+        git_output(root, &["diff", "--cached", "--", path])?
     } else {
-        git_output(root.as_ref(), &["diff", "--", path])?
+        git_output(root, &["diff", "--", path])?
     };
     let key = worktree_diff_key(path, staged);
     Ok(FileDiff { key, text })
+}
+
+fn load_untracked_file_diff(root: &Path, path: &str) -> Result<String> {
+    let content = fs::read_to_string(root.join(path)).with_context(|| {
+        format!(
+            "failed to read untracked file {}",
+            root.join(path).display()
+        )
+    })?;
+    Ok(new_file_unified_diff(path, &content))
+}
+
+fn new_file_unified_diff(path: &str, content: &str) -> String {
+    let line_count = content.lines().count();
+    let hunk_target = if line_count == 0 {
+        "+0,0".to_owned()
+    } else {
+        format!("+1,{line_count}")
+    };
+    let mut diff = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..0000000\n--- /dev/null\n+++ b/{path}\n@@ -0,0 {hunk_target} @@\n"
+    );
+    for line in content.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        diff.push_str("\\ No newline at end of file\n");
+    }
+    diff
+}
+
+pub fn conflict_file_versions(
+    root: impl AsRef<Path>,
+    path: &str,
+) -> Result<(String, String, String)> {
+    let root = root.as_ref();
+    let base = git_output(root, &["show", &format!(":1:{path}")]).unwrap_or_default();
+    let local = git_output(root, &["show", &format!(":2:{path}")]).unwrap_or_default();
+    let remote = git_output(root, &["show", &format!(":3:{path}")]).unwrap_or_default();
+    Ok((base, local, remote))
 }
 
 pub fn worktree_diff_key(path: &str, staged: bool) -> String {
@@ -402,6 +462,21 @@ pub fn checkout_commit(root: impl AsRef<Path>, hash: &str) -> Result<()> {
 
 pub fn cherry_pick_commit(root: impl AsRef<Path>, hash: &str) -> Result<()> {
     git_output(root.as_ref(), &["cherry-pick", hash]).map(|_| ())
+}
+
+pub fn cherry_pick_commits(root: impl AsRef<Path>, hashes: &[String]) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let args = cherry_pick_args(hashes);
+    git_output(root.as_ref(), &args).map(|_| ())
+}
+
+fn cherry_pick_args(hashes: &[String]) -> Vec<&str> {
+    let mut args = Vec::with_capacity(hashes.len() + 1);
+    args.push("cherry-pick");
+    args.extend(hashes.iter().map(String::as_str));
+    args
 }
 
 pub fn revert_commit(root: impl AsRef<Path>, hash: &str) -> Result<()> {
@@ -519,8 +594,85 @@ pub fn clean_untracked_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
     git_output(root.as_ref(), &["clean", "-fd", "--", path]).map(|_| ())
 }
 
-pub fn commit(root: impl AsRef<Path>, message: &str) -> Result<()> {
-    git_output(root.as_ref(), &["commit", "-m", message]).map(|_| ())
+pub fn add_to_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<()> {
+    let root = root.as_ref();
+    let pattern = normalize_gitignore_pattern(pattern);
+    if pattern.is_empty() {
+        return Ok(());
+    }
+
+    let ignore_path = root.join(".gitignore");
+    let existing = fs::read_to_string(&ignore_path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == pattern) {
+        return Ok(());
+    }
+
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&pattern);
+    next.push('\n');
+    fs::write(&ignore_path, next)
+        .with_context(|| format!("write {}", ignore_path.display()))
+        .map(|_| ())
+}
+
+fn normalize_gitignore_pattern(pattern: &str) -> String {
+    let mut normalized = pattern.replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_owned();
+    }
+    normalized.trim().to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictSide {
+    Ours,
+    Theirs,
+}
+
+pub fn accept_conflict_side(root: impl AsRef<Path>, path: &str, side: ConflictSide) -> Result<()> {
+    let root = root.as_ref();
+    let selector = match side {
+        ConflictSide::Ours => "--ours",
+        ConflictSide::Theirs => "--theirs",
+    };
+    git_output(root, &["checkout", selector, "--", path])?;
+    git_output(root, &["add", "--", path]).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitOptions {
+    pub amend: bool,
+    pub no_verify: bool,
+    pub gpg_sign: bool,
+}
+
+pub fn commit_args(message: &str, options: CommitOptions) -> Vec<String> {
+    let mut args = vec!["commit".to_owned()];
+    if options.amend {
+        args.push("--amend".to_owned());
+    }
+    if options.no_verify {
+        args.push("--no-verify".to_owned());
+    }
+    if options.gpg_sign {
+        args.push("-S".to_owned());
+    }
+    args.push("-m".to_owned());
+    args.push(message.to_owned());
+    args
+}
+
+pub fn commit_with_options(
+    root: impl AsRef<Path>,
+    message: &str,
+    options: CommitOptions,
+) -> Result<()> {
+    let args = commit_args(message, options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
 }
 
 pub fn fetch(root: impl AsRef<Path>) -> Result<()> {
@@ -629,24 +781,34 @@ fn load_branches(root: &Path) -> Result<Vec<Branch>> {
         &[
             "branch",
             "--all",
-            "--format=%(HEAD)%x1f%(refname:short)%x1f%(refname)",
+            "--format=%(HEAD)%09%(refname:short)%09%(refname)",
         ],
     )?;
 
-    Ok(output
+    Ok(parse_branches(&output))
+}
+
+fn parse_branches(output: &str) -> Vec<Branch> {
+    output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.split('\x1f');
-            let head = parts.next().unwrap_or_default();
-            let name = parts.next()?.trim().to_owned();
-            let refname = parts.next().unwrap_or_default();
+            let parts = if line.contains('\t') {
+                line.split('\t').collect::<Vec<_>>()
+            } else if line.contains('\x1f') {
+                line.split('\x1f').collect::<Vec<_>>()
+            } else {
+                line.split("%x1f").collect::<Vec<_>>()
+            };
+            let head = parts.first().copied().unwrap_or_default();
+            let name = parts.get(1)?.trim().to_owned();
+            let refname = parts.get(2).copied().unwrap_or_default();
             (!name.is_empty()).then(|| Branch {
                 remote: refname.starts_with("refs/remotes/"),
-                current: head == "*",
+                current: head.trim() == "*",
                 name,
             })
         })
-        .collect())
+        .collect()
 }
 
 fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
@@ -959,6 +1121,74 @@ mod tests {
     }
 
     #[test]
+    fn open_repository_requests_all_untracked_files() {
+        let source = include_str!("git.rs");
+        assert!(source.contains("\"--untracked-files=all\""));
+    }
+
+    #[test]
+    fn worktree_diff_for_untracked_file_contains_full_file_body() {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-untracked-diff-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .arg("init")
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/new.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+
+        let diff = load_worktree_diff(&root, "src/new.rs", false, true).unwrap();
+
+        assert!(diff.text.contains("--- /dev/null"));
+        assert!(diff.text.contains("+++ b/src/new.rs"));
+        assert!(diff.text.contains("+fn main() {"));
+        assert!(diff.text.contains("+    println!(\"hi\");"));
+        assert!(diff.text.contains("+}"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn add_to_gitignore_appends_unique_normalized_patterns() {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-ignore-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        add_to_gitignore(&root, r".\src\").unwrap();
+        add_to_gitignore(&root, "src/").unwrap();
+        add_to_gitignore(&root, r"src\app.rs").unwrap();
+
+        let content = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(content, "src/\nsrc/app.rs\n");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn marks_unmerged_status_entries_as_conflicted() {
+        let lines = vec![
+            "UU story.txt".to_owned(),
+            "AA both-added.txt".to_owned(),
+            "DU deleted-by-us.txt".to_owned(),
+        ];
+
+        let (staged, unstaged) = parse_status_entries(&lines);
+
+        assert_eq!(staged.len(), 3);
+        assert_eq!(unstaged.len(), 3);
+        assert!(staged.iter().all(WorktreeFile::is_conflicted));
+        assert!(unstaged.iter().all(WorktreeFile::is_conflicted));
+    }
+
+    #[test]
     fn parses_remote_verbose_output() {
         let output =
             "origin\thttps://example/repo.git (fetch)\norigin\thttps://example/repo.git (push)\n";
@@ -995,6 +1225,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_branch_list_output_with_tabs() {
+        let output = " \tfeature-batch\trefs/heads/feature-batch\n \tfeature-clean\trefs/heads/feature-clean\n*\tmain\trefs/heads/main\n";
+
+        let branches = parse_branches(output);
+
+        assert_eq!(branches.len(), 3);
+        assert_eq!(branches[0].name, "feature-batch");
+        assert!(!branches[0].remote);
+        assert!(!branches[0].current);
+        assert_eq!(branches[2].name, "main");
+        assert!(branches[2].current);
+    }
+
+    #[test]
+    fn parses_remote_branch_refs_from_branch_list_output() {
+        let output = " \tlocal-test/main\trefs/remotes/local-test/main\n \torigin/feature\trefs/remotes/origin/feature\n";
+
+        let branches = parse_branches(output);
+
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "local-test/main");
+        assert!(branches[0].remote);
+        assert!(!branches[0].current);
+        assert_eq!(branches[1].name, "origin/feature");
+        assert!(branches[1].remote);
+    }
+
+    #[test]
     fn parses_stash_list_output() {
         let stashes = parse_stashes("stash@{0}\x1f2 hours ago\x1fWIP on main: abc init\n");
 
@@ -1022,5 +1280,33 @@ mod tests {
         assert_eq!(tags[0].name, "v3.6.0");
         assert_eq!(tags[0].target, "20c49fd0");
         assert_eq!(tags[0].subject, "Merge branch");
+    }
+
+    #[test]
+    fn batch_cherry_pick_args_keep_requested_order() {
+        let hashes = vec!["old123".to_owned(), "new456".to_owned()];
+
+        let args = cherry_pick_args(&hashes);
+
+        assert_eq!(args, vec!["cherry-pick", "old123", "new456"]);
+    }
+
+    #[test]
+    fn commit_args_include_selected_options() {
+        assert_eq!(
+            commit_args(
+                "update",
+                CommitOptions {
+                    amend: true,
+                    no_verify: true,
+                    gpg_sign: true,
+                },
+            ),
+            vec!["commit", "--amend", "--no-verify", "-S", "-m", "update"]
+        );
+        assert_eq!(
+            commit_args("plain", CommitOptions::default()),
+            vec!["commit", "-m", "plain"]
+        );
     }
 }

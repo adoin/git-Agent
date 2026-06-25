@@ -27,6 +27,7 @@ pub struct Palette {
     pub bg: Color32,
     pub panel: Color32,
     pub panel_soft: Color32,
+    pub panel_recessed: Color32,
     pub text: Color32,
     pub muted: Color32,
     pub accent: Color32,
@@ -35,6 +36,8 @@ pub struct Palette {
     pub accent_shadow: Color32,
     pub hover: Color32,
     pub scroll_track: Color32,
+    pub inset_highlight: Color32,
+    pub inset_shadow: Color32,
     pub info: Color32,
     pub warning: Color32,
 }
@@ -106,6 +109,7 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     } else {
         palette.accent_deep
     };
+    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
     visuals.hyperlink_color = palette.accent;
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
@@ -159,6 +163,12 @@ pub fn palette(mode: ThemeMode) -> Palette {
 pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
     let seed = accent_seed(accent);
     let hsl = rgb_to_hsl(seed);
+    let neutral_s = (hsl.s * 0.10).clamp(0.02, 0.09);
+    let muted_s = (hsl.s * 0.18).clamp(0.04, 0.16);
+    let neutral = |lightness: f32| hsl_to_rgb(hsl.h, neutral_s, lightness);
+    let muted_neutral = |lightness: f32| hsl_to_rgb(hsl.h, muted_s, lightness);
+    let recessed_neutral =
+        |lightness: f32| hsl_to_rgb(hsl.h, (hsl.s * 0.20).clamp(0.08, 0.18), lightness);
     let accent_color = hsl_to_rgb(hsl.h, hsl.s, hsl.l);
     let accent_deep = match mode {
         ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.72).clamp(0.0, 1.0), 0.28),
@@ -176,43 +186,62 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
         ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.48).clamp(0.0, 1.0), 0.11),
         ThemeMode::Light => hsl_to_rgb(hsl.h, (hsl.s * 0.24).clamp(0.0, 1.0), 0.84),
     };
+    let shadow_base = muted_neutral(match mode {
+        ThemeMode::Dark => 0.36,
+        ThemeMode::Light => 0.28,
+    });
     let accent_shadow = match mode {
-        ThemeMode::Dark => Color32::from_rgba_unmultiplied(
-            accent_color.r(),
-            accent_color.g(),
-            accent_color.b(),
-            34,
-        ),
-        ThemeMode::Light => Color32::from_rgba_unmultiplied(44, 56, 72, 54),
+        ThemeMode::Dark => {
+            Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 42)
+        }
+        ThemeMode::Light => {
+            Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 58)
+        }
     };
     match mode {
         ThemeMode::Dark => Palette {
-            bg: BG,
-            panel: PANEL,
-            panel_soft: PANEL_SOFT,
-            text: TEXT,
-            muted: MUTED,
+            bg: neutral(0.085),
+            panel: neutral(0.115),
+            panel_soft: neutral(0.155),
+            panel_recessed: neutral(0.125),
+            text: muted_neutral(0.94),
+            muted: muted_neutral(0.62),
             accent: accent_color,
             accent_deep,
             accent_soft,
             accent_shadow,
             hover,
             scroll_track,
+            inset_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            inset_shadow: Color32::from_rgba_unmultiplied(
+                shadow_base.r(),
+                shadow_base.g(),
+                shadow_base.b(),
+                98,
+            ),
             info: Color32::from_rgb(120, 164, 255),
             warning: WARNING,
         },
         ThemeMode::Light => Palette {
-            bg: Color32::from_rgb(238, 241, 245),
-            panel: Color32::from_rgb(250, 251, 253),
-            panel_soft: Color32::from_rgb(229, 236, 242),
-            text: Color32::from_rgb(32, 39, 50),
-            muted: Color32::from_rgb(101, 112, 130),
+            bg: neutral(0.948),
+            panel: neutral(0.982),
+            panel_soft: neutral(0.91),
+            panel_recessed: recessed_neutral(0.985),
+            text: muted_neutral(0.16),
+            muted: muted_neutral(0.46),
             accent: accent_color,
             accent_deep,
             accent_soft,
             accent_shadow,
             hover,
             scroll_track,
+            inset_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+            inset_shadow: Color32::from_rgba_unmultiplied(
+                shadow_base.r(),
+                shadow_base.g(),
+                shadow_base.b(),
+                86,
+            ),
             info: Color32::from_rgb(59, 107, 185),
             warning: Color32::from_rgb(181, 98, 28),
         },
@@ -229,6 +258,10 @@ pub fn panel() -> Color32 {
 
 pub fn panel_soft() -> Color32 {
     palette(current_mode()).panel_soft
+}
+
+pub fn panel_recessed() -> Color32 {
+    palette(current_mode()).panel_recessed
 }
 
 pub fn text() -> Color32 {
@@ -253,6 +286,18 @@ pub fn accent_soft() -> Color32 {
 
 pub fn accent_shadow() -> Color32 {
     palette(current_mode()).accent_shadow
+}
+
+pub fn hover() -> Color32 {
+    palette(current_mode()).hover
+}
+
+pub fn inset_highlight() -> Color32 {
+    palette(current_mode()).inset_highlight
+}
+
+pub fn inset_shadow() -> Color32 {
+    palette(current_mode()).inset_shadow
 }
 
 pub fn info() -> Color32 {
@@ -377,6 +422,30 @@ fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
         p + (q - p) * (2.0 / 3.0 - t) * 6.0
     } else {
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_surfaces_are_derived_from_theme_accent_hsl() {
+        let green = palette_for(ThemeMode::Light, ThemeAccent::Green);
+        let blue = palette_for(ThemeMode::Light, ThemeAccent::Blue);
+        let dark_green = palette_for(ThemeMode::Dark, ThemeAccent::Green);
+        let dark_blue = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
+
+        assert_ne!(green.bg, blue.bg);
+        assert_ne!(green.panel, blue.panel);
+        assert_ne!(green.panel_soft, blue.panel_soft);
+        assert_ne!(green.panel_recessed, blue.panel_recessed);
+        assert_ne!(green.accent_shadow, blue.accent_shadow);
+        assert!(green.panel_recessed.r() >= green.panel.r());
+        assert!(green.panel_recessed.g() >= green.panel.g());
+        assert!(green.panel_recessed.b() >= green.panel.b());
+        assert_ne!(dark_green.panel, dark_blue.panel);
+        assert_ne!(dark_green.panel_recessed, dark_blue.panel_recessed);
     }
 }
 

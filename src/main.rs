@@ -1,11 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-mod app;
-mod git;
-mod graph;
-mod i18n;
-mod theme;
-
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -20,30 +14,34 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Git Agent",
         options,
-        Box::new(|cc| Ok(Box::new(app::GitAgentApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(git_agent::app::GitAgentApp::new(cc)))),
     )
 }
 
 fn app_icon_data() -> eframe::egui::IconData {
     let size = 64;
     let mut rgba = vec![0_u8; size * size * 4];
-    let teal = [69, 238, 216, 255];
+    let green = [21, 196, 151, 255];
+    let blue = [47, 111, 234, 255];
 
-    paint_line_color(&mut rgba, size, 24, 16, 24, 48, 4, teal);
+    paint_line_color(&mut rgba, size, 23, 17, 23, 47, 4, blue);
+    paint_line_color(&mut rgba, size, 23, 17, 23, 30, 4, green);
     paint_quadratic_color(
         &mut rgba,
         size,
-        (24.0, 34.0),
-        (36.0, 34.0),
-        (45.0, 21.0),
+        (23.0, 31.0),
+        (31.0, 31.0),
+        (42.0, 22.0),
         4,
-        teal,
+        blue,
     );
 
-    for (x, y) in [(24, 16), (24, 48), (45, 21)] {
-        paint_ring(&mut rgba, size, x, y, 9, 4, teal);
-        clear_disc(&mut rgba, size, x, y, 5);
-    }
+    paint_ring(&mut rgba, size, 23, 17, 8, 4, green);
+    clear_disc(&mut rgba, size, 23, 17, 4);
+    paint_ring(&mut rgba, size, 23, 47, 8, 4, blue);
+    clear_disc(&mut rgba, size, 23, 47, 4);
+    paint_ring(&mut rgba, size, 42, 22, 8, 4, blue);
+    clear_disc(&mut rgba, size, 42, 22, 4);
 
     eframe::egui::IconData {
         rgba,
@@ -169,12 +167,21 @@ mod tests {
         assert!(
             icon.rgba
                 .chunks_exact(4)
-                .any(|px| px == [69, 238, 216, 255])
+                .any(|px| px == [21, 196, 151, 255])
         );
-        assert!(icon.rgba.chunks_exact(4).any(|px| px[3] == 0));
+        assert!(
+            icon.rgba
+                .chunks_exact(4)
+                .any(|px| px == [47, 111, 234, 255])
+        );
+        assert_eq!(&icon.rgba[0..4], &[0, 0, 0, 0]);
         let logo = include_str!("../assets/icons/logo-ga.svg");
-        assert!(logo.contains("stroke=\"#45EED8\""));
-        assert!(logo.contains("<circle cx=\"45\" cy=\"21\""));
+        assert!(!logo.contains("fill=\"#FFFFFF\""));
+        assert!(!logo.contains("fill-opacity"));
+        assert!(!logo.contains("<rect"));
+        assert!(logo.contains("stroke=\"#15C497\""));
+        assert!(logo.contains("stroke=\"#2F6FEA\""));
+        assert!(logo.contains("<circle cx=\"42\" cy=\"22\""));
         assert!(logo.contains("fill=\"none\""));
         assert!(include_str!("main.rs").contains("with_decorations(false)"));
     }
