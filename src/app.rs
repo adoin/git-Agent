@@ -12,11 +12,11 @@ use std::{
 };
 
 use eframe::{
-    egui::{
-        self, epaint::CubicBezierShape, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2,
-        Rect, RichText, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, Vec2,
-    },
     App, CreationContext,
+    egui::{
+        self, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText,
+        ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, Vec2, epaint::CubicBezierShape,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ const FILE_ROW_HEIGHT: f32 = 24.0;
 const FILE_ROW_ICON_SLOT: f32 = 24.0;
 const FILE_ROW_LEFT_INSET: f32 = 10.0;
 const BRANCH_CURRENT_BADGE_RIGHT_GAP: f32 = 4.0;
-const BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 2.5;
+const BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 0.0;
 const WORKSPACE_LIST_COMMIT_GAP: f32 = 2.0;
 const WORKSPACE_HEADER_TOP_GAP: f32 = 4.0;
 const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 6.0;
@@ -317,6 +317,7 @@ pub struct GitAgentApp {
     search_dimension: SearchDimension,
     repo_task: Option<Receiver<RepoTaskResult>>,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
     details_task: Option<Receiver<anyhow::Result<CommitDetails>>>,
@@ -342,6 +343,7 @@ pub struct GitAgentApp {
     loading_repo: bool,
     loading_details_hash: Option<String>,
     loading_diff_key: Option<String>,
+    pending_branch_checkout: Option<String>,
     pending_commit_action: Option<CommitActionDialog>,
     last_notice: Option<String>,
     toast_notice: Option<(String, Instant)>,
@@ -393,6 +395,7 @@ struct KnownRepository {
 }
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
+type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 
@@ -706,11 +709,7 @@ struct WorktreeSelectionState {
 
 impl WorktreeSelectionState {
     fn paths(&self, staged: bool) -> &HashSet<String> {
-        if staged {
-            &self.staged
-        } else {
-            &self.unstaged
-        }
+        if staged { &self.staged } else { &self.unstaged }
     }
 
     fn paths_mut(&mut self, staged: bool) -> &mut HashSet<String> {
@@ -1430,6 +1429,7 @@ impl GitAgentApp {
             search_dimension: SearchDimension::Message,
             repo_task: None,
             remote_git_task: None,
+            branch_checkout_task: None,
             merge_tool_task: None,
             repo_source_task: None,
             details_task: None,
@@ -1455,6 +1455,7 @@ impl GitAgentApp {
             loading_repo: false,
             loading_details_hash: None,
             loading_diff_key: None,
+            pending_branch_checkout: None,
             pending_commit_action: None,
             last_notice: None,
             toast_notice: None,
@@ -1519,9 +1520,25 @@ impl GitAgentApp {
     }
 
     fn load_repository(&mut self, path: PathBuf) {
+        self.load_repository_with_cache_mode(path, true);
+    }
+
+    fn load_repository_uncached(&mut self, path: PathBuf) {
+        self.load_repository_with_cache_mode(path, false);
+    }
+
+    fn load_repository_with_cache_mode(&mut self, path: PathBuf, use_cache: bool) {
+        let can_keep_current_snapshot = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| paths_equal(&snapshot.root, &path));
         self.ensure_repo_tab(path.clone());
         self.load_commit_state_for_active_repo();
-        if !self.apply_cached_snapshot_for(&path) {
+        if use_cache {
+            if !self.apply_cached_snapshot_for(&path) {
+                self.clear_repository_snapshot_view();
+            }
+        } else if !can_keep_current_snapshot {
             self.clear_repository_snapshot_view();
         }
         let (sender, receiver) = mpsc::channel();
@@ -1992,6 +2009,39 @@ impl GitAgentApp {
         }
     }
 
+    fn branch_checkout_busy(&self) -> bool {
+        self.branch_checkout_task.is_some() || self.pending_branch_checkout.is_some()
+    }
+
+    fn branch_actions_busy(&self) -> bool {
+        self.loading_repo || self.branch_checkout_busy() || self.remote_git_busy()
+    }
+
+    fn start_branch_checkout(&mut self, name: String) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        if snapshot.branch == name {
+            return;
+        }
+        let root = snapshot.root.clone();
+
+        let (sender, receiver) = mpsc::channel();
+        self.branch_checkout_task = Some(receiver);
+        self.pending_branch_checkout = Some(name.clone());
+        self.loading_repo = true;
+        self.error = None;
+        self.last_notice = None;
+
+        thread::spawn(move || {
+            let result = git::checkout_branch(&root, &name);
+            let _ = sender.send((root, name, result));
+        });
+    }
+
     fn remote_git_busy(&self) -> bool {
         self.remote_git_task.is_some()
     }
@@ -2101,6 +2151,7 @@ impl GitAgentApp {
                     self.cache_repository_snapshot(&snapshot);
                     if self.active_repo_root_matches(&requested_root) {
                         self.apply_repository_snapshot(snapshot);
+                        self.pending_branch_checkout = None;
                         self.loading_repo = false;
                         self.error = None;
                     }
@@ -2108,6 +2159,7 @@ impl GitAgentApp {
                 }
                 Ok((requested_root, Err(error))) => {
                     if self.active_repo_root_matches(&requested_root) {
+                        self.pending_branch_checkout = None;
                         self.clear_repository_snapshot_view();
                         self.loading_repo = false;
                         self.error = Some(error.to_string());
@@ -2119,8 +2171,39 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_branch_checkout = None;
                     self.loading_repo = false;
                     self.error = Some("Repository loader stopped unexpectedly".to_owned());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.branch_checkout_task.take() {
+            match receiver.try_recv() {
+                Ok((root, name, Ok(()))) => {
+                    self.error = None;
+                    self.last_notice = None;
+                    self.pending_branch_checkout = Some(name);
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((_, _, Err(error))) => {
+                    self.branch_checkout_task = None;
+                    self.pending_branch_checkout = None;
+                    self.loading_repo = false;
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.branch_checkout_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_branch_checkout = None;
+                    self.loading_repo = false;
+                    self.error = Some("Branch checkout stopped unexpectedly".to_owned());
                     ctx.request_repaint();
                 }
             }
@@ -3393,6 +3476,7 @@ impl GitAgentApp {
         if let Some(tool_content_row) = tool_content_row {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tool_content_row), |ui| {
                 let repo_action_busy = self.loading_repo || self.remote_git_busy();
+                let branch_actions_enabled = !self.branch_actions_busy();
                 let upstream_counts = upstream_sync_counts(self.snapshot.as_ref());
                 let pull_label = toolbar_sync_label(
                     self.tr("action.pull"),
@@ -3443,8 +3527,13 @@ impl GitAgentApp {
                                 self.fetch_all();
                             }
                             ui.add_space(LAYOUT_GAP as f32);
-                            if toolbar_button(ui, "branch", self.tr("branch.title"), has_repo)
-                                .clicked()
+                            if toolbar_button(
+                                ui,
+                                "branch",
+                                self.tr("branch.title"),
+                                has_repo && branch_actions_enabled,
+                            )
+                            .clicked()
                             {
                                 self.handle_branch_action(BranchMenuAction::Create);
                             }
@@ -3811,9 +3900,10 @@ impl GitAgentApp {
 
         ui.add_space(16.0);
 
+        let branch_actions_enabled = !self.branch_actions_busy();
+        let pending_branch_checkout = self.pending_branch_checkout.clone();
         if let Some(snapshot) = &self.snapshot {
             ui.add_space(8.0);
-            let upstream_counts = upstream_sync_counts(Some(snapshot));
 
             let mut branch_action = None;
             let mut tag_action = None;
@@ -3822,15 +3912,16 @@ impl GitAgentApp {
 
             let branch_create_label = self.tr("branch.create");
             let branches_open_before = self.branches_open;
-            let (branches_visible, create_branch_clicked) = tree_header_with_action(
+            let (branches_visible, create_branch_clicked) = tree_header_with_action_enabled(
                 ui,
                 &mut self.branches_open,
                 UiIcon::Branch,
                 i18n::t(self.language, "branch.local"),
                 UiIcon::Plus,
                 branch_create_label,
+                branch_actions_enabled,
             );
-            if create_branch_clicked {
+            if create_branch_clicked && branch_actions_enabled {
                 branch_action = Some(BranchMenuAction::Create);
             }
             if self.branches_open != branches_open_before {
@@ -3843,13 +3934,16 @@ impl GitAgentApp {
                     .filter(|branch| !branch.remote)
                     .take(18)
                 {
+                    let current =
+                        branch_current_for_display(branch, pending_branch_checkout.as_deref());
                     branch_row(
                         ui,
-                        branch.current,
+                        current,
                         branch.remote,
                         &branch.name,
-                        branch.current.then_some(upstream_counts),
+                        upstream_sync_counts_for_branch(branch),
                         self.language,
+                        branch_actions_enabled,
                         &mut branch_action,
                     );
                 }
@@ -3907,6 +4001,7 @@ impl GitAgentApp {
                             0,
                             self.language,
                             &mut self.remote_branch_collapsed_groups,
+                            branch_actions_enabled,
                             &mut branch_action,
                         );
                     }
@@ -3948,8 +4043,10 @@ impl GitAgentApp {
             if let Some(action) = stash_action {
                 self.handle_stash_action(action);
             }
-            if let Some(action) = branch_action {
-                self.handle_branch_action(action);
+            if branch_actions_enabled {
+                if let Some(action) = branch_action {
+                    self.handle_branch_action(action);
+                }
             }
             if let Some(action) = tag_action {
                 self.handle_tag_action(action);
@@ -5161,6 +5258,8 @@ impl GitAgentApp {
             .filter(|branch| branch.remote)
             .cloned()
             .collect::<Vec<_>>();
+        let branch_actions_enabled = !self.branch_actions_busy();
+        let pending_branch_checkout = self.pending_branch_checkout.clone();
         let mut action = None;
 
         content_panel_frame(theme::bg()).show(ui, |ui| {
@@ -5169,7 +5268,13 @@ impl GitAgentApp {
                 self.tr("branch.local"),
                 &format!("{} local  {} remote", local.len(), remote.len()),
                 |ui| {
-                    if ui.button(self.tr("branch.create")).clicked() {
+                    if ui
+                        .add_enabled(
+                            branch_actions_enabled,
+                            egui::Button::new(self.tr("branch.create")),
+                        )
+                        .clicked()
+                    {
                         action = Some(BranchMenuAction::Create);
                     }
                 },
@@ -5180,12 +5285,15 @@ impl GitAgentApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for branch in &local {
+                        let current =
+                            branch_current_for_display(branch, pending_branch_checkout.as_deref());
                         branch_table_row(
                             ui,
-                            branch.current,
+                            current,
                             false,
                             &branch.name,
                             self.language,
+                            branch_actions_enabled,
                             &mut action,
                         );
                     }
@@ -5196,6 +5304,7 @@ impl GitAgentApp {
                             true,
                             &branch.name,
                             self.language,
+                            branch_actions_enabled,
                             &mut action,
                         );
                     }
@@ -5205,8 +5314,10 @@ impl GitAgentApp {
                 });
         });
 
-        if let Some(action) = action {
-            self.handle_branch_action(action);
+        if branch_actions_enabled {
+            if let Some(action) = action {
+                self.handle_branch_action(action);
+            }
         }
     }
 
@@ -5507,7 +5618,7 @@ impl GitAgentApp {
                 });
             }
             BranchMenuAction::Checkout { name } => {
-                self.execute_git_action(|root| git::checkout_branch(root, &name));
+                self.start_branch_checkout(name);
             }
             BranchMenuAction::CheckoutRemote { remote_branch } => {
                 let local_branch = remote_branch
@@ -6454,6 +6565,7 @@ impl GitAgentApp {
         let mut keep_open = true;
         let mut close_after = false;
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let branch_actions_enabled = !self.branch_actions_busy();
 
         match &mut dialog {
             BranchActionDialog::Create { name, checkout } => {
@@ -6467,7 +6579,13 @@ impl GitAgentApp {
                     ui.checkbox(checkout, self.tr("branch.checkout"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("dialog.create")).clicked() && !name.trim().is_empty()
+                        if ui
+                            .add_enabled(
+                                branch_actions_enabled,
+                                egui::Button::new(self.tr("dialog.create")),
+                            )
+                            .clicked()
+                            && !name.trim().is_empty()
                         {
                             let branch_name = name.trim().to_owned();
                             let checkout = *checkout;
@@ -6500,7 +6618,12 @@ impl GitAgentApp {
                         ui.add(TextEdit::singleline(local_branch));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if ui.button(self.tr("dialog.checkout")).clicked()
+                            if ui
+                                .add_enabled(
+                                    branch_actions_enabled,
+                                    egui::Button::new(self.tr("dialog.checkout")),
+                                )
+                                .clicked()
                                 && !local_branch.trim().is_empty()
                             {
                                 let remote_branch = remote_branch.clone();
@@ -6524,7 +6647,13 @@ impl GitAgentApp {
                     ui.checkbox(force, self.tr("branch.force_delete"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("branch.delete")).clicked() {
+                        if ui
+                            .add_enabled(
+                                branch_actions_enabled,
+                                egui::Button::new(self.tr("branch.delete")),
+                            )
+                            .clicked()
+                        {
                             let name = name.clone();
                             let force = *force;
                             execute =
@@ -6550,7 +6679,13 @@ impl GitAgentApp {
                         ui.label(RichText::new(remote_branch.as_str()).color(theme::warning()));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
-                            if ui.button(self.tr("branch.delete_remote")).clicked() {
+                            if ui
+                                .add_enabled(
+                                    branch_actions_enabled,
+                                    egui::Button::new(self.tr("branch.delete_remote")),
+                                )
+                                .clicked()
+                            {
                                 let remote_branch = remote_branch.clone();
                                 execute = Some(Box::new(move |root| {
                                     git::delete_remote_branch(root, &remote_branch)
@@ -7667,24 +7802,35 @@ fn workspace_main_layout(
     workspace_list_pct: f32,
     workspace_staged_pct: f32,
 ) -> WorkspaceMainLayout {
-    let table_gap = LAYOUT_GAP as f32;
-    let list_commit_gap = WORKSPACE_LIST_COMMIT_GAP;
     let body_rect = Rect::from_min_max(
         Pos2::new(body_rect.left().round(), body_rect.top().round()),
         Pos2::new(body_rect.right().round(), body_rect.bottom().round()),
     );
-    let available_height = body_rect.height();
-    let list_height = (available_height * workspace_list_pct)
+    let available_height = body_rect.height().max(0.0);
+    let list_commit_gap = WORKSPACE_LIST_COMMIT_GAP.min(available_height);
+    let usable_height = (available_height - list_commit_gap).max(0.0);
+    let desired_list_height = (available_height * workspace_list_pct)
         .round()
-        .clamp(220.0, (available_height - 260.0).max(220.0));
+        .clamp(0.0, usable_height);
+    let list_height = if usable_height >= 480.0 {
+        desired_list_height.clamp(220.0, usable_height - 260.0)
+    } else {
+        desired_list_height
+    };
     let list_rect = Rect::from_min_size(
         body_rect.left_top(),
         Vec2::new(body_rect.width(), list_height),
     );
-    let table_total = (list_rect.height() - table_gap).max(160.0);
-    let staged_height = (table_total * workspace_staged_pct)
+    let table_gap = (LAYOUT_GAP as f32).min(list_rect.height());
+    let table_total = (list_rect.height() - table_gap).max(0.0);
+    let desired_staged_height = (table_total * workspace_staged_pct)
         .round()
-        .clamp(86.0, (table_total - 86.0).max(86.0));
+        .clamp(0.0, table_total);
+    let staged_height = if table_total >= 172.0 {
+        desired_staged_height.clamp(86.0, table_total - 86.0)
+    } else {
+        desired_staged_height
+    };
     let staged_rect = Rect::from_min_size(
         list_rect.left_top(),
         Vec2::new(list_rect.width(), staged_height),
@@ -7885,7 +8031,26 @@ fn full_row_click_response(
     rect: Rect,
     id_salt: impl std::hash::Hash,
 ) -> egui::Response {
-    pointing_hand_cursor(ui.interact(rect, ui.id().with(id_salt), Sense::click()))
+    full_row_click_response_enabled(ui, rect, id_salt, true)
+}
+
+fn full_row_click_response_enabled(
+    ui: &mut Ui,
+    rect: Rect,
+    id_salt: impl std::hash::Hash,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    if enabled {
+        pointing_hand_cursor(response)
+    } else {
+        response
+    }
 }
 
 fn resize_handle_rect(rect: Rect, vertical: bool) -> Rect {
@@ -11133,7 +11298,25 @@ fn tree_header_with_action(
     action_icon: UiIcon,
     action_label: &str,
 ) -> (bool, bool) {
-    tree_header_inner(ui, open, icon, label, Some((action_icon, action_label)))
+    tree_header_with_action_enabled(ui, open, icon, label, action_icon, action_label, true)
+}
+
+fn tree_header_with_action_enabled(
+    ui: &mut Ui,
+    open: &mut bool,
+    icon: UiIcon,
+    label: &str,
+    action_icon: UiIcon,
+    action_label: &str,
+    action_enabled: bool,
+) -> (bool, bool) {
+    tree_header_inner(
+        ui,
+        open,
+        icon,
+        label,
+        Some((action_icon, action_label, action_enabled)),
+    )
 }
 
 fn tree_header_inner(
@@ -11141,7 +11324,7 @@ fn tree_header_inner(
     open: &mut bool,
     icon: UiIcon,
     label: &str,
-    action: Option<(UiIcon, &str)>,
+    action: Option<(UiIcon, &str, bool)>,
 ) -> (bool, bool) {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
@@ -11164,9 +11347,9 @@ fn tree_header_inner(
                 [label_width, 24.0],
                 egui::Label::new(RichText::new(label).strong().color(theme::text())).truncate(),
             );
-            if let Some((action_icon, action_label)) = action {
+            if let Some((action_icon, action_label, action_enabled)) = action {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let response = icon_button(ui, action_icon, action_label, true);
+                    let response = icon_button(ui, action_icon, action_label, action_enabled);
                     action_clicked = response.clicked();
                 });
             }
@@ -11596,6 +11779,7 @@ fn branch_table_row(
     remote: bool,
     name: &str,
     language: Language,
+    enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
     let (rect, response) = resource_row_response(ui);
@@ -11638,7 +11822,7 @@ fn branch_table_row(
             );
         });
     });
-    branch_context_menu(response, current, remote, name, language, action)
+    branch_context_menu(response, current, remote, name, language, enabled, action)
 }
 
 fn branch_context_menu(
@@ -11647,6 +11831,7 @@ fn branch_context_menu(
     remote: bool,
     name: &str,
     language: Language,
+    enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
     response.context_menu(|ui| {
@@ -11655,7 +11840,10 @@ fn branch_context_menu(
         ui.separator();
         if remote {
             if ui
-                .button(i18n::t(language, "branch.checkout_remote"))
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(i18n::t(language, "branch.checkout_remote")),
+                )
                 .clicked()
             {
                 *action = Some(BranchMenuAction::CheckoutRemote {
@@ -11664,7 +11852,10 @@ fn branch_context_menu(
                 ui.close_menu();
             }
             if ui
-                .button(i18n::t(language, "branch.delete_remote"))
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(i18n::t(language, "branch.delete_remote")),
+                )
                 .clicked()
             {
                 *action = Some(BranchMenuAction::DeleteRemote {
@@ -11675,7 +11866,7 @@ fn branch_context_menu(
         } else {
             if ui
                 .add_enabled(
-                    !current,
+                    enabled && !current,
                     egui::Button::new(i18n::t(language, "branch.checkout")),
                 )
                 .clicked()
@@ -11687,7 +11878,7 @@ fn branch_context_menu(
             }
             if ui
                 .add_enabled(
-                    !current,
+                    enabled && !current,
                     egui::Button::new(i18n::t(language, "branch.delete")),
                 )
                 .clicked()
@@ -11881,6 +12072,7 @@ fn branch_row(
     name: &str,
     sync_counts: Option<UpstreamSyncCounts>,
     language: Language,
+    enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
@@ -11893,53 +12085,39 @@ fn branch_row(
             CornerRadius::same(2),
             theme::accent_deep(),
         );
-    } else if row_rect_hovered(ui, rect) {
+    } else if enabled && row_rect_hovered(ui, rect) {
         ui.painter()
             .rect_filled(row_rect, CornerRadius::same(4), theme::hover());
     }
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(if current { 22.0 } else { 16.0 });
-            let color = if current {
-                theme::accent()
-            } else if remote {
-                theme::info()
-            } else {
-                theme::muted()
-            };
-            let mut name_text = RichText::new(name).color(if current {
-                theme::text()
-            } else {
-                theme::muted()
-            });
-            if current {
-                name_text = name_text.strong();
-            }
-            ui.label(name_text);
-            if current || remote {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(BRANCH_CURRENT_BADGE_RIGHT_GAP);
-                    if let Some(sync_counts) = sync_counts {
-                        branch_sync_badges(ui, sync_counts);
-                    }
-                    if current {
-                        branch_current_badge(ui, language);
-                    }
-                    if remote {
-                        ui.label(
-                            RichText::new(i18n::t(language, "common.remote"))
-                                .small()
-                                .color(color),
-                        );
-                    }
-                });
-            }
-        });
+    let color = if current {
+        theme::accent()
+    } else if remote {
+        theme::info()
+    } else {
+        theme::muted()
+    };
+    let badge_left =
+        paint_branch_row_badges(ui, row_rect, current, remote, sync_counts, language, color)
+            .unwrap_or(row_rect.right());
+    let name_left = rect.left() + if current { 22.0 } else { 16.0 };
+    let name_right = (badge_left - 6.0).max(name_left);
+    let name_rect = Rect::from_min_max(
+        Pos2::new(name_left, rect.top()),
+        Pos2::new(name_right, rect.bottom()),
+    );
+    let mut name_text = RichText::new(name).color(if current {
+        theme::text()
+    } else {
+        theme::muted()
     });
+    if current {
+        name_text = name_text.strong();
+    }
+    paint_branch_name(ui, name_rect, name_text);
 
-    let response = full_row_click_response(ui, rect, ("branch_row", remote, name));
-    if response.double_clicked() {
+    let response = full_row_click_response_enabled(ui, rect, ("branch_row", remote, name), enabled);
+    if enabled && response.double_clicked() {
         if remote {
             *action = Some(BranchMenuAction::CheckoutRemote {
                 remote_branch: name.to_owned(),
@@ -11957,7 +12135,10 @@ fn branch_row(
         ui.separator();
         if remote {
             if ui
-                .button(i18n::t(language, "branch.checkout_remote"))
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(i18n::t(language, "branch.checkout_remote")),
+                )
                 .clicked()
             {
                 *action = Some(BranchMenuAction::CheckoutRemote {
@@ -11968,7 +12149,7 @@ fn branch_row(
         } else {
             if ui
                 .add_enabled(
-                    !current,
+                    enabled && !current,
                     egui::Button::new(i18n::t(language, "branch.checkout")),
                 )
                 .clicked()
@@ -11980,7 +12161,7 @@ fn branch_row(
             }
             if ui
                 .add_enabled(
-                    !current,
+                    enabled && !current,
                     egui::Button::new(i18n::t(language, "branch.delete")),
                 )
                 .clicked()
@@ -12003,51 +12184,94 @@ fn branch_current_indicator_rect(row_rect: Rect) -> Rect {
     )
 }
 
-fn branch_current_badge(ui: &mut Ui, language: Language) {
-    let label = i18n::t(language, "branch.current_badge");
-    let text_width = ui.fonts(|fonts| {
-        fonts
-            .layout_no_wrap(label.to_owned(), FontId::proportional(10.5), Color32::WHITE)
-            .rect
-            .width()
-    });
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new((text_width + 14.0).max(38.0), 17.0),
-        Sense::hover(),
+fn paint_branch_name(ui: &mut Ui, name_rect: Rect, name_text: RichText) {
+    let mut layout_job = egui::text::LayoutJob::default();
+    name_text.append_to(
+        &mut layout_job,
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
     );
-    let rect = rect.translate(Vec2::new(0.0, BRANCH_CURRENT_BADGE_Y_OFFSET));
+    layout_job.wrap.max_width = name_rect.width();
+    layout_job.wrap.max_rows = 1;
+    layout_job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(layout_job);
+    let text_pos = Align2::LEFT_CENTER
+        .anchor_size(name_rect.left_center(), galley.size())
+        .min;
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(4), theme::accent_deep());
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(10.5),
-        Color32::WHITE,
-    );
+        .with_clip_rect(name_rect)
+        .galley(text_pos, galley, theme::muted());
 }
 
-fn branch_sync_badges(ui: &mut Ui, counts: UpstreamSyncCounts) {
-    if let Some(label) = upstream_pull_badge(Some(counts)) {
-        branch_sync_badge(ui, &label, theme::accent_deep());
+fn paint_branch_row_badges(
+    ui: &mut Ui,
+    row_rect: Rect,
+    current: bool,
+    remote: bool,
+    sync_counts: Option<UpstreamSyncCounts>,
+    language: Language,
+    remote_color: Color32,
+) -> Option<f32> {
+    let mut right = row_rect.right() - BRANCH_CURRENT_BADGE_RIGHT_GAP;
+    let mut painted = false;
+    if let Some(counts) = sync_counts {
+        if let Some(label) = upstream_pull_badge(Some(counts)) {
+            right = paint_branch_badge_at(ui, row_rect, right, &label, theme::accent_deep());
+            painted = true;
+        }
+        if let Some(label) = upstream_push_badge(Some(counts)) {
+            right = paint_branch_badge_at(ui, row_rect, right, &label, theme::text());
+            painted = true;
+        }
     }
-    if let Some(label) = upstream_push_badge(Some(counts)) {
-        branch_sync_badge(ui, &label, theme::text());
+    if current {
+        right = paint_branch_current_badge_at(
+            ui,
+            row_rect,
+            right,
+            i18n::t(language, "branch.current_badge"),
+        );
+        painted = true;
     }
+    if remote {
+        right = paint_branch_text_badge_at(
+            ui,
+            row_rect,
+            right,
+            i18n::t(language, "common.remote"),
+            remote_color,
+        );
+        painted = true;
+    }
+    painted.then_some(right + 4.0)
 }
 
-fn branch_sync_badge(ui: &mut Ui, label: &str, fill: Color32) {
+fn paint_branch_current_badge_at(ui: &mut Ui, row_rect: Rect, right: f32, label: &str) -> f32 {
+    paint_branch_badge_at(ui, row_rect, right, label, theme::accent_deep())
+}
+
+fn paint_branch_badge_at(
+    ui: &mut Ui,
+    row_rect: Rect,
+    right: f32,
+    label: &str,
+    fill: Color32,
+) -> f32 {
     let text_width = ui.fonts(|fonts| {
         fonts
             .layout_no_wrap(label.to_owned(), FontId::proportional(10.5), Color32::WHITE)
             .rect
             .width()
     });
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new((text_width + 12.0).max(26.0), 17.0),
-        Sense::hover(),
+    let width = (text_width + 12.0).max(26.0);
+    let rect = Rect::from_center_size(
+        Pos2::new(
+            right - width / 2.0,
+            row_rect.center().y + BRANCH_CURRENT_BADGE_Y_OFFSET,
+        ),
+        Vec2::new(width, 17.0),
     );
-    let rect = rect.translate(Vec2::new(0.0, BRANCH_CURRENT_BADGE_Y_OFFSET));
     ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
     ui.painter().text(
         rect.center(),
@@ -12056,7 +12280,34 @@ fn branch_sync_badge(ui: &mut Ui, label: &str, fill: Color32) {
         FontId::proportional(10.5),
         Color32::WHITE,
     );
-    ui.add_space(4.0);
+    rect.left() - 4.0
+}
+
+fn paint_branch_text_badge_at(
+    ui: &mut Ui,
+    row_rect: Rect,
+    right: f32,
+    label: &str,
+    color: Color32,
+) -> f32 {
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), FontId::proportional(11.0), color)
+            .rect
+            .width()
+    });
+    let center = Pos2::new(
+        right - text_width / 2.0,
+        row_rect.center().y + BRANCH_CURRENT_BADGE_Y_OFFSET,
+    );
+    ui.painter().text(
+        center,
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        color,
+    );
+    right - text_width - 4.0
 }
 
 #[derive(Clone, Debug, Default)]
@@ -12124,11 +12375,12 @@ fn remote_branch_tree_rows(
     depth: usize,
     language: Language,
     collapsed_groups: &mut HashSet<String>,
+    enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) {
     if node.children.is_empty() {
         if let Some(full_name) = &node.full_name {
-            remote_branch_row(ui, full_name, &node.name, depth, language, action);
+            remote_branch_row(ui, full_name, &node.name, depth, language, enabled, action);
         }
         return;
     }
@@ -12143,7 +12395,15 @@ fn remote_branch_tree_rows(
     }
     if !collapsed {
         for child in node.children.values() {
-            remote_branch_tree_rows(ui, child, depth + 1, language, collapsed_groups, action);
+            remote_branch_tree_rows(
+                ui,
+                child,
+                depth + 1,
+                language,
+                collapsed_groups,
+                enabled,
+                action,
+            );
         }
     }
 }
@@ -12182,10 +12442,11 @@ fn remote_branch_row(
     display_name: &str,
     depth: usize,
     language: Language,
+    enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
-    if row_rect_hovered(ui, rect) {
+    if enabled && row_rect_hovered(ui, rect) {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 1.0)),
             CornerRadius::same(4),
@@ -12200,8 +12461,9 @@ fn remote_branch_row(
         });
     });
 
-    let response = full_row_click_response(ui, rect, ("remote_branch_row", full_name));
-    if response.double_clicked() {
+    let response =
+        full_row_click_response_enabled(ui, rect, ("remote_branch_row", full_name), enabled);
+    if enabled && response.double_clicked() {
         *action = Some(BranchMenuAction::CheckoutRemote {
             remote_branch: full_name.to_owned(),
         });
@@ -12212,7 +12474,10 @@ fn remote_branch_row(
         ui.label(RichText::new(full_name).color(theme::text()));
         ui.separator();
         if ui
-            .button(i18n::t(language, "branch.checkout_remote"))
+            .add_enabled(
+                enabled,
+                egui::Button::new(i18n::t(language, "branch.checkout_remote")),
+            )
             .clicked()
         {
             *action = Some(BranchMenuAction::CheckoutRemote {
@@ -12221,7 +12486,10 @@ fn remote_branch_row(
             ui.close_menu();
         }
         if ui
-            .button(i18n::t(language, "branch.delete_remote"))
+            .add_enabled(
+                enabled,
+                egui::Button::new(i18n::t(language, "branch.delete_remote")),
+            )
             .clicked()
         {
             *action = Some(BranchMenuAction::DeleteRemote {
@@ -13380,6 +13648,19 @@ fn upstream_sync_counts(snapshot: Option<&RepositorySnapshot>) -> UpstreamSyncCo
         .unwrap_or_default()
 }
 
+fn branch_current_for_display(branch: &git::Branch, pending_checkout: Option<&str>) -> bool {
+    pending_checkout.map_or(branch.current, |pending| {
+        !branch.remote && branch.name == pending
+    })
+}
+
+fn upstream_sync_counts_for_branch(branch: &git::Branch) -> Option<UpstreamSyncCounts> {
+    branch.upstream.as_ref().map(|upstream| UpstreamSyncCounts {
+        ahead: upstream.ahead,
+        behind: upstream.behind,
+    })
+}
+
 fn upstream_pull_badge(counts: Option<UpstreamSyncCounts>) -> Option<String> {
     let behind = counts?.behind;
     (behind > 0).then(|| format!("\u{2193}{behind}"))
@@ -13634,8 +13915,10 @@ mod ui_tests {
         assert!(top_bar_source.contains("tool_row_corners()"));
         assert!(top_bar_source.contains("theme::panel()"));
         assert!(top_bar_source.contains(".paint(tool_row_panel_rect)"));
-        assert!(top_bar_source
-            .contains("paint_layout_debug_rect(ui, tool_row_panel_rect, \"top.toolbar\""));
+        assert!(
+            top_bar_source
+                .contains("paint_layout_debug_rect(ui, tool_row_panel_rect, \"top.toolbar\"")
+        );
         assert_eq!(TOP_BAR_GLOBAL_ACTION_Y_OFFSET, -1.0);
         assert!(
             top_bar_source
@@ -13658,7 +13941,9 @@ mod ui_tests {
             menu_button_source.contains("ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0)")
         );
         assert!(menu_button_source.contains("widgets.inactive.bg_fill = Color32::TRANSPARENT"));
-        assert!(menu_button_source.contains("widgets.inactive.weak_bg_fill = Color32::TRANSPARENT"));
+        assert!(
+            menu_button_source.contains("widgets.inactive.weak_bg_fill = Color32::TRANSPARENT")
+        );
         let tab_right_start = source
             .find("ui.allocate_new_ui(egui::UiBuilder::new().max_rect(global_action_row)")
             .unwrap();
@@ -13674,8 +13959,11 @@ mod ui_tests {
             "toolbar_button(\n                    ui,\n                    \"resource-manager\""
         ));
         assert!(!tab_right_source.contains("toolbar_button(ui, \"open\""));
-        assert!(!tab_right_source
-            .contains("toolbar_button(\n                    ui,\n                    \"refresh\""));
+        assert!(
+            !tab_right_source.contains(
+                "toolbar_button(\n                    ui,\n                    \"refresh\""
+            )
+        );
         assert_eq!(
             menu_label(Language::Chinese, "tools"),
             "\u{5de5}\u{5177}(T)"
@@ -13796,15 +14084,24 @@ mod ui_tests {
         let layout_source = &implementation_source[layout_start..layout_start + layout_end];
 
         assert!(implementation_source.contains("fn exact_panel_at_rect("));
-        assert!(layout_source
-            .contains("exact_panel_at_rect(\n            ui,\n            sidebar_rect"));
-        assert!(layout_source
-            .contains("exact_panel_at_rect(\n            ui,\n            center_rect"));
-        assert!(layout_source
-            .contains("exact_panel_at_rect(\n                ui,\n                details_rect"));
+        assert!(
+            layout_source
+                .contains("exact_panel_at_rect(\n            ui,\n            sidebar_rect")
+        );
+        assert!(
+            layout_source
+                .contains("exact_panel_at_rect(\n            ui,\n            center_rect")
+        );
+        assert!(
+            layout_source.contains(
+                "exact_panel_at_rect(\n                ui,\n                details_rect"
+            )
+        );
         assert!(!layout_source.contains("content_panel_frame(theme::panel()).show"));
-        assert!(!layout_source
-            .contains("soft_panel_frame(theme::panel(), LAYOUT_GAP, LAYOUT_GAP).show"));
+        assert!(
+            !layout_source
+                .contains("soft_panel_frame(theme::panel(), LAYOUT_GAP, LAYOUT_GAP).show")
+        );
     }
 
     #[test]
@@ -14035,16 +14332,90 @@ mod ui_tests {
         let branch_row_source =
             &implementation_source[branch_row_start..branch_row_start + branch_row_end];
         assert!(implementation_source.contains("const BRANCH_CURRENT_BADGE_RIGHT_GAP: f32 = 4.0;"));
-        assert!(implementation_source.contains("const BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 2.5;"));
-        assert!(branch_row_source.contains("branch_current_badge("));
+        assert!(implementation_source.contains("const BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 0.0;"));
+        assert!(branch_row_source.contains("paint_branch_row_badges("));
+        assert!(!branch_row_source.contains("Layout::right_to_left(Align::Center)"));
         assert!(branch_row_source.contains("branch_current_indicator_rect("));
         assert!(branch_row_source.contains("branch.current_badge"));
         assert!(branch_row_source.contains("theme::accent_deep()"));
         assert!(branch_row_source.contains("name_text = name_text.strong()"));
-        assert!(branch_row_source.contains("if current || remote"));
-        assert!(branch_row_source.contains("if remote {\n                        ui.label"));
+        assert!(branch_row_source.contains("paint_branch_row_badges("));
+        assert!(branch_row_source.contains("paint_branch_text_badge_at("));
         assert!(!branch_row_source.contains("RichText::new(if current { \"*\" } else { \" \" })"));
         assert!(!branch_row_source.contains("i18n::t(language, \"common.local\")"));
+    }
+
+    #[test]
+    fn branch_sync_badges_are_painted_inside_row_right_edge() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
+        let branch_row_end = implementation_source[branch_row_start..]
+            .find("fn remote_branch_row(")
+            .unwrap();
+        let branch_row_source =
+            &implementation_source[branch_row_start..branch_row_start + branch_row_end];
+        let Some(badge_start) = implementation_source.find("fn paint_branch_row_badges(") else {
+            panic!("branch badges must be painted from the row rect right edge");
+        };
+        let badge_end = implementation_source[badge_start..]
+            .find("#[derive(Clone, Debug, Default)]")
+            .unwrap();
+        let badge_source = &implementation_source[badge_start..badge_start + badge_end];
+        let compact_branch_row_source = branch_row_source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(compact_branch_row_source.contains("let badge_left = paint_branch_row_badges("));
+        assert!(branch_row_source.contains("let name_right = (badge_left - 6.0).max(name_left);"));
+        assert!(branch_row_source.contains("paint_branch_name(ui, name_rect, name_text);"));
+        assert!(!branch_row_source.contains("egui::Label::new(name_text).truncate()"));
+        assert!(!branch_row_source.contains("branch_sync_badges(ui, sync_counts)"));
+        assert!(
+            badge_source
+                .contains("let mut right = row_rect.right() - BRANCH_CURRENT_BADGE_RIGHT_GAP;")
+        );
+        assert!(badge_source.contains("paint_branch_badge_at("));
+        assert!(badge_source.contains("Rect::from_center_size("));
+        assert!(badge_source.contains("right - width / 2.0"));
+        assert!(badge_source.contains("row_rect.center().y + BRANCH_CURRENT_BADGE_Y_OFFSET"));
+        assert!(!badge_source.contains("BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 2.5"));
+    }
+
+    #[test]
+    fn branch_names_stay_left_aligned_when_badges_are_right_aligned() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
+        let branch_row_end = implementation_source[branch_row_start..]
+            .find("fn remote_branch_row(")
+            .unwrap();
+        let branch_row_source =
+            &implementation_source[branch_row_start..branch_row_start + branch_row_end];
+
+        assert!(branch_row_source.contains("paint_branch_name(ui, name_rect, name_text);"));
+        assert!(!branch_row_source.contains("egui::Label::new(name_text).truncate()"));
+        assert!(!branch_row_source.contains("ui.add_sized("));
+        let paint_name_start = implementation_source.find("fn paint_branch_name(").unwrap();
+        let paint_name_end = implementation_source[paint_name_start..]
+            .find("fn paint_branch_row_badges(")
+            .unwrap();
+        let paint_name_source =
+            &implementation_source[paint_name_start..paint_name_start + paint_name_end];
+        let compact_paint_name_source = paint_name_source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(paint_name_source.contains("layout_job.wrap.max_width = name_rect.width();"));
+        assert!(paint_name_source.contains("layout_job.wrap.max_rows = 1;"));
+        assert!(paint_name_source.contains("layout_job.wrap.break_anywhere = true;"));
+        assert!(paint_name_source.contains("Align::Min"));
+        assert!(!paint_name_source.contains("Align::Center"));
+        assert!(paint_name_source.contains("Align2::LEFT_CENTER"));
+        assert!(paint_name_source.contains("anchor_size(name_rect.left_center(), galley.size())"));
+        assert!(compact_paint_name_source.contains(".min;"));
+        assert!(paint_name_source.contains("with_clip_rect(name_rect)"));
     }
 
     #[test]
@@ -14076,7 +14447,10 @@ mod ui_tests {
             let start = source.find(start_marker).unwrap();
             let end = source[start..].find(end_marker).unwrap();
             let block = &source[start..start + end];
-            assert!(block.contains("full_row_click_response(ui, rect"));
+            assert!(
+                block.contains("full_row_click_response(ui, rect")
+                    || block.contains("full_row_click_response_enabled(ui, rect")
+            );
         }
     }
 
@@ -14117,16 +14491,19 @@ mod ui_tests {
                 name: "origin/feature/login".to_owned(),
                 remote: true,
                 current: false,
+                upstream: None,
             },
             git::Branch {
                 name: "origin/main".to_owned(),
                 remote: true,
                 current: false,
+                upstream: None,
             },
             git::Branch {
                 name: "upstream/release/1.0".to_owned(),
                 remote: true,
                 current: false,
+                upstream: None,
             },
         ];
         let branch_refs = branches.iter().collect::<Vec<_>>();
@@ -14256,8 +14633,10 @@ mod ui_tests {
         let end = source[start..].find("fn history_commit_table(").unwrap();
         let history_view_source = &source[start..start + end];
         assert!(history_view_source.contains("let min_top_height = history_top_min_height()"));
-        assert!(history_view_source
-            .contains("let top_height = if self.layout_prefs.history_top_pct > 0.0"));
+        assert!(
+            history_view_source
+                .contains("let top_height = if self.layout_prefs.history_top_pct > 0.0")
+        );
         assert!(!history_view_source.contains("history_top_content_height"));
         assert!(!history_view_source.contains("max_top_height.min(content_top_height)"));
         assert!(!history_view_source.contains(".clamp(150.0"));
@@ -14271,8 +14650,10 @@ mod ui_tests {
             .unwrap();
         let table_source = &source[table_start..table_start + table_end];
         assert!(table_source.contains("let body_height = ui.available_height().max(0.0)"));
-        assert!(table_source
-            .contains("ui.allocate_exact_size(Vec2::new(ui.available_width(), body_height)"));
+        assert!(
+            table_source
+                .contains("ui.allocate_exact_size(Vec2::new(ui.available_width(), body_height)")
+        );
         assert!(table_source.contains("egui::UiBuilder::new().max_rect(body_rect)"));
         assert!(table_source.contains("safe_set_min_size(ui, body_rect.size())"));
         assert!(table_source.contains("ui.set_max_height(body_rect.height())"));
@@ -14280,8 +14661,10 @@ mod ui_tests {
         assert!(table_source.contains("self.refresh_history_rows_cache()"));
         assert!(table_source.contains(".show_viewport(ui, |ui, viewport|"));
         assert!(table_source.contains("history_virtual_row_range("));
-        assert!(table_source
-            .contains("ui.set_min_height(visible_row_count as f32 * HISTORY_TABLE_ROW_HEIGHT)"));
+        assert!(
+            table_source
+                .contains("ui.set_min_height(visible_row_count as f32 * HISTORY_TABLE_ROW_HEIGHT)")
+        );
         assert!(table_source.contains("self.history_rows_cache.index_at(row_index)"));
         assert!(!table_source.contains(".show_rows("));
 
@@ -14545,7 +14928,9 @@ mod ui_tests {
         assert!(implementation_source.contains("commit_checkbox("));
         assert!(implementation_source.contains("UiIcon::History"));
         assert!(implementation_source.contains("git::CommitOptions"));
-        assert!(implementation_source.contains("git::commit_with_options(root, &message, options)"));
+        assert!(
+            implementation_source.contains("git::commit_with_options(root, &message, options)")
+        );
         assert!(implementation_source.contains("git::push(root)"));
         assert!(implementation_source.contains("self.add_commit_message_history(message.clone())"));
 
@@ -14593,8 +14978,11 @@ mod ui_tests {
         assert!(!panel_source.contains("let panel_height = ui.available_height()"));
         assert!(panel_source.contains("ui.allocate_exact_size("));
         assert!(panel_source.contains("Vec2::new(ui.available_width(), panel_height)"));
-        assert!(panel_source
-            .contains("let message_height = commit_message_editor_height(ui.available_height())"));
+        assert!(
+            panel_source.contains(
+                "let message_height = commit_message_editor_height(ui.available_height())"
+            )
+        );
         assert!(panel_source.contains("COMMIT_BUTTON_ROW_HEIGHT"));
         assert!(panel_source.contains("ui.available_height() - COMMIT_BUTTON_ROW_HEIGHT"));
         assert!(panel_source.contains("COMMIT_MESSAGE_BOTTOM_GAP"));
@@ -14624,10 +15012,15 @@ mod ui_tests {
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
 
         assert!(implementation_source.contains("const WORKSPACE_LIST_COMMIT_GAP: f32 = 2.0;"));
-        assert!(implementation_source.contains("let list_commit_gap = WORKSPACE_LIST_COMMIT_GAP;"));
+        assert!(
+            implementation_source
+                .contains("let list_commit_gap = WORKSPACE_LIST_COMMIT_GAP.min(available_height);")
+        );
         assert!(workspace_source.contains("workspace_main_layout("));
-        assert!(workspace_source
-            .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())"));
+        assert!(
+            workspace_source
+                .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())")
+        );
         assert!(!panel_source.contains("ui.add_space(14.0)"));
         assert!(!panel_source.contains("let panel_height = ui.available_height()"));
         assert!(panel_source.contains("panel_rect"));
@@ -14673,7 +15066,9 @@ mod ui_tests {
         assert!(editor_source.contains(".text_color(theme::text())"));
         assert!(editor_ui_source.contains("themed_text_edit_selection(ui);"));
         assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())"));
+        assert!(
+            helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())")
+        );
         assert!(submit_source.contains("theme::accent_deep()"));
         assert!(submit_source.contains("Color32::WHITE"));
         assert!(submit_source.contains("Sense::click()"));
@@ -14715,7 +15110,9 @@ mod ui_tests {
         assert!(search_source.contains("themed_singleline_text_edit("));
         assert!(helper_source.contains(".text_color(theme::text())"));
         assert!(helper_source.contains("selection.bg_fill = theme::accent_soft()"));
-        assert!(helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())"));
+        assert!(
+            helper_source.contains("selection.stroke = Stroke::new(1.0, theme::accent_deep())")
+        );
     }
 
     #[test]
@@ -14786,8 +15183,10 @@ mod ui_tests {
         assert!(!implementation_source.contains("fn top_bar_press_drag_region("));
         assert!(top_bar_source.contains("source_title_gap_drag_region"));
         assert!(!top_bar_source.contains("source_title_row_drag_region"));
-        assert!(title_bar_source
-            .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")"));
+        assert!(
+            title_bar_source
+                .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")")
+        );
         assert!(top_bar_source.contains("top_bar_drag_region("));
         assert!(!top_bar_source.contains("top_bar_press_drag_region("));
     }
@@ -14809,11 +15208,15 @@ mod ui_tests {
         let top_bar_source = &implementation_source[top_bar_start..top_bar_start + top_bar_end];
 
         assert!(!title_bar_source.contains("source_active"));
-        assert!(title_bar_source
-            .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")"));
+        assert!(
+            title_bar_source
+                .contains("top_bar_drag_region(ctx, ui, drag_rect, \"custom_title_drag_region\")")
+        );
         assert!(top_bar_source.contains("self.custom_title_bar(ctx, ui, has_repo, has_remote);"));
-        assert!(!top_bar_source
-            .contains("self.custom_title_bar(ctx, ui, has_repo, has_remote, source_active);"));
+        assert!(
+            !top_bar_source
+                .contains("self.custom_title_bar(ctx, ui, has_repo, has_remote, source_active);")
+        );
     }
 
     #[test]
@@ -14926,6 +15329,27 @@ mod ui_tests {
     }
 
     #[test]
+    fn workspace_main_layout_never_returns_negative_child_rects() {
+        let body = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(310.0, 110.0));
+        let layout = workspace_main_layout(body, 0.58, 0.5);
+
+        for rect in [
+            layout.staged_rect,
+            layout.staged_unstaged_splitter_rect,
+            layout.unstaged_rect,
+            layout.list_commit_splitter_rect,
+            layout.commit_rect,
+        ] {
+            assert!(
+                rect.width() >= 0.0 && rect.height() >= 0.0,
+                "workspace child rect must be non-negative: {rect:?}"
+            );
+            assert!(rect.top() >= body.top());
+            assert!(rect.bottom() <= body.bottom());
+        }
+    }
+
+    #[test]
     fn workspace_cards_use_recessed_shadow_inside_raised_workspace() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -14976,8 +15400,11 @@ mod ui_tests {
         assert!(!frame_source.contains("egui::StrokeKind::Inside"));
         assert!(!frame_source.contains("paint_workspace_card_edge_shadow("));
         assert!(!frame_source.contains("fn add_arc_points("));
-        assert!(clean_source
-            .contains("ui.allocate_exact_size(safe_ui_size(ui.available_size()), Sense::hover())"));
+        assert!(
+            clean_source.contains(
+                "ui.allocate_exact_size(safe_ui_size(ui.available_size()), Sense::hover())"
+            )
+        );
         assert!(clean_source.contains("ui.painter().text("));
         assert!(!clean_source.contains("soft_panel_frame("));
         assert!(!clean_source.contains("panel_shadow()"));
@@ -15125,8 +15552,10 @@ mod ui_tests {
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
 
-        assert!(workspace_source
-            .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())"));
+        assert!(
+            workspace_source
+                .contains("self.commit_panel(ui, staged.len(), layout.commit_rect.height())")
+        );
         assert!(panel_source.contains(
             "fn commit_panel(&mut self, ui: &mut Ui, staged_count: usize, panel_height: f32)"
         ));
@@ -15169,8 +15598,10 @@ mod ui_tests {
         assert!(compact_panel_source.contains(
             "let commit_shortcut = input.modifiers.ctrl && input.key_pressed(egui::Key::Enter);"
         ));
-        assert!(!compact_panel_source
-            .contains("let commit_shortcut = input.modifiers.ctrl && input.modifiers.shift"));
+        assert!(
+            !compact_panel_source
+                .contains("let commit_shortcut = input.modifiers.ctrl && input.modifiers.shift")
+        );
         assert!(panel_source.contains("&& !input.modifiers.shift"));
         assert!(panel_source.contains("self.commit_current_message(staged_count)"));
         assert!(panel_source.contains("toggle_push_immediately"));
@@ -15178,7 +15609,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn upstream_sync_counts_feed_toolbar_and_current_branch_badges() {
+    fn upstream_sync_counts_feed_toolbar_and_branch_badges() {
         let counts = UpstreamSyncCounts {
             ahead: 3,
             behind: 5,
@@ -15225,10 +15656,8 @@ mod ui_tests {
             .find("fn workspace_view(")
             .unwrap();
         let sidebar_source = &implementation_source[sidebar_start..sidebar_start + sidebar_end];
-        assert!(
-            sidebar_source.contains("let upstream_counts = upstream_sync_counts(Some(snapshot));")
-        );
-        assert!(sidebar_source.contains("branch.current.then_some(upstream_counts)"));
+        assert!(!sidebar_source.contains("branch.current.then_some(upstream_counts)"));
+        assert!(sidebar_source.contains("upstream_sync_counts_for_branch(branch)"));
 
         let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
         let branch_row_end = implementation_source[branch_row_start..]
@@ -15236,9 +15665,24 @@ mod ui_tests {
             .unwrap();
         let branch_row_source =
             &implementation_source[branch_row_start..branch_row_start + branch_row_end];
-        assert!(branch_row_source.contains("branch_sync_badges(ui, sync_counts);"));
+        assert!(branch_row_source.contains("paint_branch_row_badges("));
         assert!(branch_row_source.contains("upstream_pull_badge("));
         assert!(branch_row_source.contains("upstream_push_badge("));
+
+        let branch_counts = git::Branch {
+            name: "develop".to_owned(),
+            current: false,
+            remote: false,
+            upstream: Some(git::UpstreamStatus {
+                name: "origin/develop".to_owned(),
+                ahead: 0,
+                behind: 8,
+            }),
+        };
+        assert_eq!(
+            upstream_pull_badge(upstream_sync_counts_for_branch(&branch_counts)),
+            Some("\u{2193}8".to_owned())
+        );
     }
 
     #[test]
@@ -15361,10 +15805,15 @@ mod ui_tests {
     fn completed_actions_do_not_show_success_noise() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(!implementation_source
-            .contains("self.show_toast(self.tr(\"status.action_completed\"))"));
-        assert!(!implementation_source
-            .contains("self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"));
+        assert!(
+            !implementation_source
+                .contains("self.show_toast(self.tr(\"status.action_completed\"))")
+        );
+        assert!(
+            !implementation_source.contains(
+                "self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"
+            )
+        );
     }
 
     #[test]
@@ -15535,9 +15984,11 @@ diff --git a/file.txt b/file.txt
         let blocks = collect_unified_diff_items(diff, DiffDisplayMode::Blocks);
 
         assert!(blocks.len() < full.len());
-        assert!(blocks
-            .iter()
-            .any(|item| matches!(item, DiffRenderItem::Omitted)));
+        assert!(
+            blocks
+                .iter()
+                .any(|item| matches!(item, DiffRenderItem::Omitted))
+        );
         let visible_lines = blocks
             .iter()
             .filter(|item| matches!(item, DiffRenderItem::Line(_)))
@@ -15618,8 +16069,11 @@ diff --git a/file.txt b/file.txt
     fn toolbar_branch_button_opens_create_branch_dialog() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        let toolbar_start = implementation_source
-            .find("if toolbar_button(ui, \"branch\"")
+        let branch_label_start = implementation_source
+            .find("\"branch\",\n                                self.tr(\"branch.title\")")
+            .unwrap();
+        let toolbar_start = implementation_source[..branch_label_start]
+            .rfind("if toolbar_button(")
             .unwrap();
         let toolbar_end = implementation_source[toolbar_start..]
             .find("if toolbar_button(ui, \"tag\"")
@@ -15627,6 +16081,7 @@ diff --git a/file.txt b/file.txt
         let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
 
         assert!(toolbar_source.contains("self.tr(\"branch.title\")"));
+        assert!(toolbar_source.contains("has_repo && branch_actions_enabled"));
         assert!(toolbar_source.contains("self.handle_branch_action(BranchMenuAction::Create)"));
         assert!(!toolbar_source.contains("self.tr(\"branch.local\")"));
         assert!(!toolbar_source.contains("self.active_view = MainView::Branches"));
@@ -15756,7 +16211,8 @@ diff --git a/file.txt b/file.txt
             let block = &source[start..start + end];
             assert!(
                 block.contains("pointing_hand_cursor(")
-                    || block.contains("full_row_click_response("),
+                    || block.contains("full_row_click_response(")
+                    || block.contains("full_row_click_response_enabled("),
                 "{start_marker} should set pointing hand cursor"
             );
         }
@@ -15766,12 +16222,16 @@ diff --git a/file.txt b/file.txt
     fn remote_git_toolbar_actions_use_busy_state_without_success_noise() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(implementation_source
-            .contains("remote_git_task: Option<Receiver<RemoteGitTaskResult>>"));
+        assert!(
+            implementation_source
+                .contains("remote_git_task: Option<Receiver<RemoteGitTaskResult>>")
+        );
         assert!(implementation_source.contains("fn remote_git_busy(&self) -> bool"));
         assert!(implementation_source.contains("fn start_remote_git_action("));
-        assert!(implementation_source
-            .contains("let repo_action_busy = self.loading_repo || self.remote_git_busy()"));
+        assert!(
+            implementation_source
+                .contains("let repo_action_busy = self.loading_repo || self.remote_git_busy()")
+        );
         assert!(implementation_source.contains("!repo_action_busy && has_repo && has_remote"));
         assert!(implementation_source.contains("if self.remote_git_busy()"));
 
@@ -15787,8 +16247,88 @@ diff --git a/file.txt b/file.txt
         assert!(
             !remote_task_source.contains("self.show_toast(self.tr(\"status.action_completed\"))")
         );
-        assert!(!remote_task_source
-            .contains("self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"));
+        assert!(
+            !remote_task_source.contains(
+                "self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"
+            )
+        );
+    }
+
+    #[test]
+    fn local_branch_checkout_uses_pending_async_state_and_uncached_reload() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(
+            implementation_source
+                .contains("type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>)")
+        );
+        assert!(
+            implementation_source
+                .contains("branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>")
+        );
+        assert!(implementation_source.contains("pending_branch_checkout: Option<String>"));
+        assert!(implementation_source.contains("fn branch_checkout_busy(&self) -> bool"));
+        assert!(
+            implementation_source.contains("fn start_branch_checkout(&mut self, name: String)")
+        );
+        assert!(implementation_source.contains("self.start_branch_checkout(name);"));
+        assert!(
+            implementation_source.contains("fn load_repository_uncached(&mut self, path: PathBuf)")
+        );
+
+        let branch_task_start = implementation_source
+            .find("if let Some(receiver) = self.branch_checkout_task.take()")
+            .unwrap();
+        let branch_task_end = implementation_source[branch_task_start..]
+            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .unwrap();
+        let branch_task_source =
+            &implementation_source[branch_task_start..branch_task_start + branch_task_end];
+        assert!(branch_task_source.contains("self.pending_branch_checkout = None"));
+        assert!(branch_task_source.contains("self.load_repository_uncached(root)"));
+    }
+
+    #[test]
+    fn branch_rows_disable_branch_actions_while_checkout_or_reload_is_busy() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("fn branch_actions_busy(&self) -> bool"));
+        assert!(implementation_source.contains("self.loading_repo || self.branch_checkout_busy()"));
+        assert!(
+            implementation_source
+                .contains("let branch_actions_enabled = !self.branch_actions_busy();")
+        );
+
+        let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
+        let branch_row_end = implementation_source[branch_row_start..]
+            .find("fn branch_current_indicator_rect(")
+            .unwrap();
+        let branch_row_source =
+            &implementation_source[branch_row_start..branch_row_start + branch_row_end];
+        assert!(branch_row_source.contains("enabled: bool"));
+        assert!(branch_row_source.contains("full_row_click_response_enabled("));
+        assert!(branch_row_source.contains("if enabled && response.double_clicked()"));
+        assert!(branch_row_source.contains("enabled && !current"));
+
+        let table_row_start = implementation_source.find("fn branch_table_row(").unwrap();
+        let table_row_end = implementation_source[table_row_start..]
+            .find("fn branch_context_menu(")
+            .unwrap();
+        let table_row_source =
+            &implementation_source[table_row_start..table_row_start + table_row_end];
+        assert!(table_row_source.contains("enabled: bool"));
+        assert!(table_row_source.contains("branch_context_menu("));
+
+        let remote_row_start = implementation_source.find("fn remote_branch_row(").unwrap();
+        let remote_row_end = implementation_source[remote_row_start..]
+            .find("fn remote_empty_label(")
+            .unwrap();
+        let remote_row_source =
+            &implementation_source[remote_row_start..remote_row_start + remote_row_end];
+        assert!(remote_row_source.contains("enabled: bool"));
+        assert!(remote_row_source.contains("if enabled && response.double_clicked()"));
     }
 
     #[test]
@@ -16318,11 +16858,15 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("conflict_resolution_actions_panel("));
         assert!(implementation_source.contains("CONFLICT_ACTION_BUTTON_SIZE"));
         assert!(implementation_source.contains("CONFLICT_MODAL_SIZE"));
-        assert!(implementation_source
-            .contains("CONFLICT_MODAL_SIZE: Vec2 = Vec2 { x: 760.0, y: 360.0 }"));
+        assert!(
+            implementation_source
+                .contains("CONFLICT_MODAL_SIZE: Vec2 = Vec2 { x: 760.0, y: 360.0 }")
+        );
         assert!(implementation_source.contains("conflict_resolution_dialog_background()"));
-        assert!(implementation_source
-            .contains("soft_panel_frame(conflict_resolution_dialog_background(), 12, 12)"));
+        assert!(
+            implementation_source
+                .contains("soft_panel_frame(conflict_resolution_dialog_background(), 12, 12)")
+        );
         assert!(dialog_source.contains(".fixed_pos(modal_rect.min)"));
         assert!(dialog_source.contains("safe_set_min_size(ui, CONFLICT_MODAL_SIZE)"));
         assert!(dialog_source.contains("ui.set_max_size(CONFLICT_MODAL_SIZE)"));
@@ -16338,8 +16882,10 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("worktree_header_action_button("));
         assert!(implementation_source.contains("WorktreeMenuAction::ResolveConflict"));
         assert!(implementation_source.contains("fn open_conflict_merge_tool("));
-        assert!(implementation_source
-            .contains("merge_tool_task: Option<Receiver<MergeToolTaskResult>>"));
+        assert!(
+            implementation_source
+                .contains("merge_tool_task: Option<Receiver<MergeToolTaskResult>>")
+        );
         assert!(implementation_source.contains("fn poll_merge_tool_task("));
         assert!(implementation_source.contains(".wait()"));
         assert!(implementation_source.contains("self.load_repository(root)"));
@@ -16481,8 +17027,10 @@ diff --git a/file.txt b/file.txt
         assert!(modal_source.contains("settings_dialog_title_row("));
         assert!(modal_source.contains("repo_settings_tab_strip("));
         assert!(modal_source.contains("settings_dialog_body_frame().show"));
-        assert!(modal_source
-            .contains("settings_dialog_title_row(ui, self.tr(\"repo.settings.title\"), size.x"));
+        assert!(
+            modal_source
+                .contains("settings_dialog_title_row(ui, self.tr(\"repo.settings.title\"), size.x")
+        );
         assert!(modal_source.contains("window_control_button(ui, \"\\u{00d7}\", true)"));
         assert!(
             !modal_source.contains("settings_dialog_header(ui, self.tr(\"repo.settings.title\"))")
@@ -16518,8 +17066,10 @@ diff --git a/file.txt b/file.txt
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
 
         assert!(implementation_source.contains("enum RepoRemoteActionDialog"));
-        assert!(implementation_source
-            .contains("pending_repo_remote_action: Option<RepoRemoteActionDialog>"));
+        assert!(
+            implementation_source
+                .contains("pending_repo_remote_action: Option<RepoRemoteActionDialog>")
+        );
         assert!(implementation_source.contains("self.repo_remote_action_modal(ctx);"));
         assert!(implementation_source.contains("RepoRemoteActionDialog::Add"));
         assert!(implementation_source.contains("RepoRemoteActionDialog::Edit"));

@@ -38,6 +38,7 @@ pub struct Branch {
     pub name: String,
     pub current: bool,
     pub remote: bool,
+    pub upstream: Option<UpstreamStatus>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +165,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
             name: branch.clone(),
             current: true,
             remote: false,
+            upstream: None,
         });
     }
     let remotes = load_remotes(&root).unwrap_or_default();
@@ -807,11 +809,29 @@ fn load_branches(root: &Path) -> Result<Vec<Branch>> {
         &[
             "branch",
             "--all",
-            "--format=%(HEAD)%09%(refname:short)%09%(refname)",
+            "--format=%(HEAD)%09%(refname:short)%09%(refname)%09%(upstream:short)",
         ],
     )?;
 
-    Ok(parse_branches(&output))
+    let mut branches = parse_branches(&output);
+    for branch in branches.iter_mut().filter(|branch| !branch.remote) {
+        let Some(upstream_name) = branch
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.name.clone())
+        else {
+            continue;
+        };
+        if let Ok((ahead, behind)) = load_branch_upstream_counts(root, &branch.name, &upstream_name)
+        {
+            branch.upstream = Some(UpstreamStatus {
+                name: upstream_name,
+                ahead,
+                behind,
+            });
+        }
+    }
+    Ok(branches)
 }
 
 fn parse_branches(output: &str) -> Vec<Branch> {
@@ -828,13 +848,34 @@ fn parse_branches(output: &str) -> Vec<Branch> {
             let head = parts.first().copied().unwrap_or_default();
             let name = parts.get(1)?.trim().to_owned();
             let refname = parts.get(2).copied().unwrap_or_default();
+            let upstream_name = parts.get(3).copied().unwrap_or_default().trim();
+            let remote = refname.starts_with("refs/remotes/");
+            let upstream = (!remote && !upstream_name.is_empty()).then(|| UpstreamStatus {
+                name: upstream_name.to_owned(),
+                ahead: 0,
+                behind: 0,
+            });
             (!name.is_empty()).then(|| Branch {
-                remote: refname.starts_with("refs/remotes/"),
+                remote,
                 current: head.trim() == "*",
                 name,
+                upstream,
             })
         })
         .collect()
+}
+
+fn load_branch_upstream_counts(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+) -> Result<(usize, usize)> {
+    let range = format!("{branch}...{upstream}");
+    let counts = git_output(root, &["rev-list", "--left-right", "--count", &range])?;
+    let mut parts = counts.split_whitespace();
+    let ahead = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let behind = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Ok((ahead, behind))
 }
 
 fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
@@ -1298,7 +1339,7 @@ mod tests {
 
     #[test]
     fn parses_branch_list_output_with_tabs() {
-        let output = " \tfeature-batch\trefs/heads/feature-batch\n \tfeature-clean\trefs/heads/feature-clean\n*\tmain\trefs/heads/main\n";
+        let output = " \tfeature-batch\trefs/heads/feature-batch\torigin/feature-batch\n \tfeature-clean\trefs/heads/feature-clean\t\n*\tmain\trefs/heads/main\torigin/main\n";
 
         let branches = parse_branches(output);
 
@@ -1306,8 +1347,22 @@ mod tests {
         assert_eq!(branches[0].name, "feature-batch");
         assert!(!branches[0].remote);
         assert!(!branches[0].current);
+        assert_eq!(
+            branches[0]
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.name.as_str()),
+            Some("origin/feature-batch")
+        );
         assert_eq!(branches[2].name, "main");
         assert!(branches[2].current);
+        assert_eq!(
+            branches[2]
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.name.as_str()),
+            Some("origin/main")
+        );
     }
 
     #[test]
