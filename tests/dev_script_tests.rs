@@ -40,7 +40,9 @@ fn dev_script_stops_running_app_before_building_bins() {
         .expect("Stop-MainWindow should end before Stop-DevBinaries")
         + stop_main_start;
     let stop_main_body = &script[stop_main_start..stop_main_end];
-    assert!(stop_main_body.contains("Write-DevLog \"stop git-agent pid=$($script:mainProcess.Id)\""));
+    assert!(
+        stop_main_body.contains("Write-DevLog \"stop git-agent pid=$($script:mainProcess.Id)\"")
+    );
     assert!(stop_main_body.contains("Write-DevLog \"stop stray git-agent pid=$($_.Id)\""));
 }
 

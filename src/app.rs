@@ -2017,6 +2017,13 @@ impl GitAgentApp {
         self.loading_repo || self.branch_checkout_busy() || self.remote_git_busy()
     }
 
+    fn repo_toolbar_loading_busy(&self) -> bool {
+        self.loading_repo
+            || self.branch_checkout_busy()
+            || self.remote_git_busy()
+            || self.repo_source_task.is_some()
+    }
+
     fn start_branch_checkout(&mut self, name: String) {
         if self.branch_actions_busy() {
             return;
@@ -3475,6 +3482,7 @@ impl GitAgentApp {
 
         if let Some(tool_content_row) = tool_content_row {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tool_content_row), |ui| {
+                let repo_toolbar_loading = self.repo_toolbar_loading_busy();
                 let repo_action_busy = self.loading_repo || self.remote_git_busy();
                 let branch_actions_enabled = !self.branch_actions_busy();
                 let upstream_counts = upstream_sync_counts(self.snapshot.as_ref());
@@ -3486,83 +3494,77 @@ impl GitAgentApp {
                     self.tr("action.push"),
                     upstream_push_badge(Some(upstream_counts)),
                 );
-                ScrollArea::horizontal()
-                    .id_salt("repo_toolbar_strip")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
-                            ui.add_space(16.0);
-                            if toolbar_button(ui, "commit", self.tr("commit.panel"), true).clicked()
-                            {
-                                self.active_view = MainView::Workspace;
-                            }
-                            if toolbar_button(
-                                ui,
-                                "pull",
-                                &pull_label,
-                                !repo_action_busy && has_repo && has_remote,
-                            )
-                            .clicked()
-                            {
-                                self.pull_current();
-                            }
-                            if toolbar_button(
-                                ui,
-                                "push",
-                                &push_label,
-                                !repo_action_busy && has_repo && has_remote,
-                            )
-                            .clicked()
-                            {
-                                self.push_current();
-                            }
-                            if toolbar_button(
-                                ui,
-                                "fetch",
-                                self.tr("action.fetch"),
-                                !repo_action_busy && has_repo && has_remote,
-                            )
-                            .clicked()
-                            {
-                                self.fetch_all();
-                            }
-                            ui.add_space(LAYOUT_GAP as f32);
-                            if toolbar_button(
-                                ui,
-                                "branch",
-                                self.tr("branch.title"),
-                                has_repo && branch_actions_enabled,
-                            )
-                            .clicked()
-                            {
-                                self.handle_branch_action(BranchMenuAction::Create);
-                            }
-                            if toolbar_button(ui, "tag", self.tr("tag.title"), has_repo).clicked() {
-                                self.active_view = MainView::Tags;
-                            }
-                            if toolbar_button(ui, "stash", self.tr("stash.title"), has_repo)
+                if repo_toolbar_loading {
+                    repo_toolbar_loading_indicator(ui);
+                } else {
+                    ScrollArea::horizontal()
+                        .id_salt("repo_toolbar_strip")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.add_space(16.0);
+                                if toolbar_button(ui, "commit", self.tr("commit.panel"), true)
+                                    .clicked()
+                                {
+                                    self.active_view = MainView::Workspace;
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    "pull",
+                                    &pull_label,
+                                    !repo_action_busy && has_repo && has_remote,
+                                )
                                 .clicked()
-                            {
-                                self.active_view = MainView::Stashes;
-                            }
-                            if self.remote_git_busy() {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new(self.tr("status.loading_repo"))
-                                        .color(theme::muted()),
-                                );
-                            } else if self.loading_repo {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new(self.tr("status.loading_repo"))
-                                        .color(theme::muted()),
-                                );
-                            }
-                            if let Some(notice) = &self.last_notice {
-                                ui.label(RichText::new(notice).color(theme::accent()));
-                            }
+                                {
+                                    self.pull_current();
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    "push",
+                                    &push_label,
+                                    !repo_action_busy && has_repo && has_remote,
+                                )
+                                .clicked()
+                                {
+                                    self.push_current();
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    "fetch",
+                                    self.tr("action.fetch"),
+                                    !repo_action_busy && has_repo && has_remote,
+                                )
+                                .clicked()
+                                {
+                                    self.fetch_all();
+                                }
+                                ui.add_space(LAYOUT_GAP as f32);
+                                if toolbar_button(
+                                    ui,
+                                    "branch",
+                                    self.tr("branch.title"),
+                                    has_repo && branch_actions_enabled,
+                                )
+                                .clicked()
+                                {
+                                    self.handle_branch_action(BranchMenuAction::Create);
+                                }
+                                if toolbar_button(ui, "tag", self.tr("tag.title"), has_repo)
+                                    .clicked()
+                                {
+                                    self.active_view = MainView::Tags;
+                                }
+                                if toolbar_button(ui, "stash", self.tr("stash.title"), has_repo)
+                                    .clicked()
+                                {
+                                    self.active_view = MainView::Stashes;
+                                }
+                                if let Some(notice) = &self.last_notice {
+                                    ui.label(RichText::new(notice).color(theme::accent()));
+                                }
+                            });
                         });
-                    });
+                }
             });
         }
 
@@ -8094,6 +8096,7 @@ enum UiIcon {
     CherryPick,
     Warning,
     More,
+    Loading,
 }
 
 #[derive(Clone, Copy)]
@@ -8616,6 +8619,22 @@ fn toolbar_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> egui::
     AppButton::toolbar(icon, label, enabled).show(ui)
 }
 
+fn repo_toolbar_loading_indicator(ui: &mut Ui) {
+    let rect = ui.max_rect();
+    let size = 18.0;
+    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size));
+    let angle = ui.input(|input| input.time as f32 * std::f32::consts::TAU);
+    ui.ctx().request_repaint();
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(icon_rect), |ui| {
+        ui.add(
+            egui::Image::new(icon_source(UiIcon::Loading))
+                .fit_to_exact_size(Vec2::splat(size))
+                .rotate(angle, Vec2::splat(0.5))
+                .tint(theme::muted()),
+        );
+    });
+}
+
 fn themed_text_edit_selection(ui: &mut Ui) {
     ui.visuals_mut().selection.bg_fill = theme::accent_soft();
     ui.visuals_mut().selection.stroke = Stroke::new(1.0, theme::accent_deep());
@@ -8813,6 +8832,7 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::CherryPick => egui::include_image!("../assets/icons/cherry-pick.svg"),
         UiIcon::Warning => egui::include_image!("../assets/icons/warning.svg"),
         UiIcon::More => egui::include_image!("../assets/icons/more.svg"),
+        UiIcon::Loading => egui::include_image!("../assets/icons/loading.svg"),
     }
 }
 
@@ -16069,16 +16089,19 @@ diff --git a/file.txt b/file.txt
     fn toolbar_branch_button_opens_create_branch_dialog() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        let branch_label_start = implementation_source
-            .find("\"branch\",\n                                self.tr(\"branch.title\")")
+        let panel_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("if let Some(index) = close_repo_tab")
             .unwrap();
-        let toolbar_start = implementation_source[..branch_label_start]
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        let branch_label_start = panel_source.find("self.tr(\"branch.title\")").unwrap();
+        let toolbar_start = panel_source[..branch_label_start]
             .rfind("if toolbar_button(")
             .unwrap();
-        let toolbar_end = implementation_source[toolbar_start..]
-            .find("if toolbar_button(ui, \"tag\"")
+        let toolbar_end = panel_source[toolbar_start..]
+            .find("if toolbar_button(ui, \"tag\", self.tr(\"tag.title\"), has_repo)")
             .unwrap();
-        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        let toolbar_source = &panel_source[toolbar_start..toolbar_start + toolbar_end];
 
         assert!(toolbar_source.contains("self.tr(\"branch.title\")"));
         assert!(toolbar_source.contains("has_repo && branch_actions_enabled"));
@@ -16252,6 +16275,38 @@ diff --git a/file.txt b/file.txt
                 "self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"
             )
         );
+    }
+
+    #[test]
+    fn repo_toolbar_loading_replaces_entire_action_row() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("fn repo_toolbar_loading_busy(&self) -> bool"));
+        assert!(implementation_source.contains("fn repo_toolbar_loading_indicator("));
+        assert!(implementation_source.contains("UiIcon::Loading"));
+        assert!(implementation_source.contains("../assets/icons/loading.svg"));
+
+        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_end = implementation_source[toolbar_start..]
+            .find("if let Some(index) = close_repo_tab")
+            .unwrap();
+        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        assert!(
+            toolbar_source.contains("let repo_toolbar_loading = self.repo_toolbar_loading_busy();")
+        );
+        assert!(toolbar_source.contains("if repo_toolbar_loading {"));
+        assert!(toolbar_source.contains("repo_toolbar_loading_indicator(ui);"));
+        assert!(toolbar_source.contains("} else {"));
+
+        let loading_branch_start = toolbar_source.find("if repo_toolbar_loading {").unwrap();
+        let loading_branch_end = toolbar_source[loading_branch_start..]
+            .find("} else {")
+            .unwrap();
+        let loading_branch =
+            &toolbar_source[loading_branch_start..loading_branch_start + loading_branch_end];
+        assert!(!loading_branch.contains("toolbar_button("));
+        assert!(!loading_branch.contains("status.loading_repo"));
     }
 
     #[test]

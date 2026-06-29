@@ -196,10 +196,7 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "settings.remote_account_name",
         "\u{8d26}\u{6237}\u{540d}\u{79f0}",
     ),
-    (
-        "settings.remote_account_host",
-        "\u{4e3b}\u{673a}",
-    ),
+    ("settings.remote_account_host", "\u{4e3b}\u{673a}"),
     (
         "repo.settings.add_remote",
         "\u{6dfb}\u{52a0}\u{8fdc}\u{7aef}",
