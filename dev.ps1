@@ -56,11 +56,15 @@ function Stop-ExistingRunner {
 
 function Stop-MainWindow {
     if ($script:mainProcess -and -not $script:mainProcess.HasExited) {
+        Write-DevLog "stop git-agent pid=$($script:mainProcess.Id)"
         Stop-Process -Id $script:mainProcess.Id -Force -ErrorAction SilentlyContinue
     }
 
     Get-Process -Name "git-agent" -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+        ForEach-Object {
+            Write-DevLog "stop stray git-agent pid=$($_.Id)"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
 }
 
 function Stop-DevBinaries {
@@ -111,10 +115,28 @@ function Start-MainWindow {
     }
 
     Write-DevLog "start $mainExe"
-    return Start-Process `
+    $process = Start-Process `
         -FilePath $mainExe `
         -WorkingDirectory $root `
         -PassThru
+    Write-DevLog "started git-agent pid=$($process.Id)"
+    return $process
+}
+
+function Test-MainWindowExit {
+    if (-not $script:mainProcess) {
+        return
+    }
+
+    $processId = $script:mainProcess.Id
+    $script:mainProcess.Refresh()
+    if (-not $script:mainProcess.HasExited) {
+        return
+    }
+
+    $exitCode = $script:mainProcess.ExitCode
+    Write-DevLog "git-agent exited pid=$processId exit=$exitCode"
+    $script:mainProcess = $null
 }
 
 function Restart-DevApp {
@@ -144,6 +166,7 @@ try {
     while ($true) {
         $change = $watcher.WaitForChanged("Changed, Created, Deleted, Renamed", 1000)
         if ($change.TimedOut) {
+            Test-MainWindowExit
             continue
         }
 

@@ -54,7 +54,7 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("repo.source.close_tab", "\u{5173}\u{95ed}\u{6807}\u{7b7e}"),
     ("repo.source.title", "\u{672c}\u{5730}\u{4ed3}\u{5e93}"),
     ("repo.source.local", "\u{672c}\u{5730}"),
-    ("repo.source.remote", "\u{8fdc}\u{7a0b}"),
+    ("repo.source.remote", "\u{8fdc}\u{7aef}"),
     ("repo.source.clone", "\u{514b}\u{9686}"),
     ("repo.source.add", "\u{6dfb}\u{52a0}"),
     ("repo.source.create", "\u{521b}\u{5efa}"),
@@ -91,7 +91,7 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{62e3}\u{9009}\u{9009}\u{4e2d}\u{7684}\u{63d0}\u{4ea4}\u{ff1f}",
     ),
     ("repo.git_flow", "Git\u{5de5}\u{4f5c}\u{6d41}"),
-    ("repo.remote", "\u{8fdc}\u{7a0b}"),
+    ("repo.remote", "\u{8fdc}\u{7aef}"),
     (
         "repo.command_mode",
         "\u{547d}\u{4ee4}\u{884c}\u{6a21}\u{5f0f}",
@@ -114,11 +114,11 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     (
         "repo.remote.missing",
-        "\u{672a}\u{914d}\u{7f6e}\u{8fdc}\u{7a0b} URL",
+        "\u{672a}\u{914d}\u{7f6e}\u{8fdc}\u{7aef} URL",
     ),
     (
         "repo.remote.failed",
-        "\u{6253}\u{5f00}\u{8fdc}\u{7a0b} URL \u{5931}\u{8d25}",
+        "\u{6253}\u{5f00}\u{8fdc}\u{7aef} URL \u{5931}\u{8d25}",
     ),
     (
         "repo.source.clone_missing",
@@ -130,13 +130,14 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     ("branch.title", "\u{5206}\u{652f}"),
     ("branch.current_badge", "\u{5f53}\u{524d}"),
+    ("branch.remote", "\u{8fdc}\u{7aef}\u{5206}\u{652f}"),
     (
         "branch.delete_remote",
-        "\u{5220}\u{9664}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+        "\u{5220}\u{9664}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
     ),
     (
         "branch.sync_remote",
-        "\u{540c}\u{6b65}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+        "\u{540c}\u{6b65}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
     ),
     (
         "branch.local_alias",
@@ -144,17 +145,132 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     (
         "branch.confirm_delete_remote",
-        "\u{5220}\u{9664}\u{8fdc}\u{7a0b}\u{5206}\u{652f}\u{ff1f}",
+        "\u{5220}\u{9664}\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{ff1f}",
     ),
-    ("remote.title", "\u{8fdc}\u{7a0b}\u{5206}\u{652f}"),
+    ("remote.title", "\u{8fdc}\u{7aef}\u{5206}\u{652f}"),
     (
         "remote.none",
-        "\u{6ca1}\u{6709}\u{8fdc}\u{7a0b}\u{4ed3}\u{5e93}",
+        "\u{6ca1}\u{6709}\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
     ),
     (
         "remote.no_branches",
-        "\u{672a}\u{83b7}\u{53d6}\u{5230}\u{8fdc}\u{7a0b}\u{5206}\u{652f}",
+        "\u{672a}\u{83b7}\u{53d6}\u{5230}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
     ),
+    ("common.remote", "\u{8fdc}\u{7aef}"),
+    (
+        "branch.checkout_remote",
+        "\u{68c0}\u{51fa}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "menu.open_remote",
+        "\u{5728}\u{8fdc}\u{7aef}\u{6253}\u{5f00}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "repo.settings.remote_paths",
+        "\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}\u{8def}\u{5f84}",
+    ),
+    (
+        "repo.settings.remote_details",
+        "\u{8fdc}\u{7aef}\u{7ec6}\u{8282}",
+    ),
+    ("repo.settings.name", "\u{540d}\u{79f0}"),
+    ("repo.settings.path", "\u{8def}\u{5f84}"),
+    (
+        "repo.settings.remote_name",
+        "\u{8fdc}\u{7aef}\u{540d}\u{79f0}",
+    ),
+    (
+        "repo.settings.default_remote",
+        "\u{9ed8}\u{8ba4}\u{8fdc}\u{7aef}",
+    ),
+    ("repo.settings.url_path", "URL / \u{8def}\u{5f84}"),
+    (
+        "repo.settings.remote_account",
+        "\u{8fdc}\u{7aef}\u{8d26}\u{6237}",
+    ),
+    (
+        "settings.remote_accounts",
+        "\u{8fdc}\u{7aef}\u{8d26}\u{6237}",
+    ),
+    (
+        "settings.remote_account_name",
+        "\u{8d26}\u{6237}\u{540d}\u{79f0}",
+    ),
+    (
+        "settings.remote_account_host",
+        "\u{4e3b}\u{673a}",
+    ),
+    (
+        "repo.settings.add_remote",
+        "\u{6dfb}\u{52a0}\u{8fdc}\u{7aef}",
+    ),
+    (
+        "repo.settings.edit_remote",
+        "\u{7f16}\u{8f91}\u{8fdc}\u{7aef}",
+    ),
+    (
+        "repo.settings.account_validation_failed",
+        "\u{8d26}\u{6237}\u{914d}\u{7f6e}\u{6821}\u{9a8c}\u{5931}\u{8d25}",
+    ),
+    (
+        "repo.settings.remote_validation_failed",
+        "\u{8fdc}\u{7aef}\u{6821}\u{9a8c}\u{5931}\u{8d25}",
+    ),
+    ("repo.settings.generic_account", "Generic Account"),
+    ("repo.settings.generic_host", "Generic Host"),
+    (
+        "repo.settings.legacy_account_settings",
+        "\u{65e7}\u{7248}\u{8d26}\u{6237}\u{8bbe}\u{7f6e}",
+    ),
+    (
+        "repo.settings.host_type",
+        "\u{6258}\u{7ba1}\u{7c7b}\u{578b}",
+    ),
+    ("repo.settings.unknown", "\u{672a}\u{77e5}"),
+    ("repo.settings.host_url", "\u{6258}\u{7ba1}\u{6839} URL"),
+    ("repo.settings.username", "\u{7528}\u{6237}\u{540d}"),
+    (
+        "repo.settings.remote_account_hint",
+        "\u{6269}\u{5c55}\u{96c6}\u{6210}\u{7528}\u{4e8e}\u{66f4}\u{6df1}\u{5c42}\u{6b21}\u{5730}\u{4e0e}\u{6258}\u{7ba1}\u{670d}\u{52a1}\u{8fdb}\u{884c}\u{6574}\u{5408}\u{ff0c}\u{5305}\u{62ec}\u{4ece}\u{7f51}\u{7ad9}\u{94fe}\u{63a5}\u{5b9a}\u{4f4d}\u{5df2}\u{6709}\u{514b}\u{9686}\u{548c}\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}\u{3002}",
+    ),
+    (
+        "repo.settings.ignore_list",
+        "\u{4ed3}\u{5e93}\u{6307}\u{5b9a}\u{5ffd}\u{7565}\u{5217}\u{8868}",
+    ),
+    ("repo.settings.user", "\u{7528}\u{6237}\u{4fe1}\u{606f}"),
+    (
+        "repo.settings.use_global_user",
+        "\u{4f7f}\u{7528}\u{5168}\u{5c40}\u{7528}\u{6237}\u{914d}\u{7f6e}",
+    ),
+    ("repo.settings.full_name", "\u{5168}\u{540d}"),
+    (
+        "repo.settings.email",
+        "\u{7535}\u{5b50}\u{90ae}\u{4ef6}\u{5730}\u{5740}",
+    ),
+    (
+        "repo.settings.commit_links",
+        "\u{63d0}\u{4ea4}\u{6587}\u{672c}\u{94fe}\u{63a5}",
+    ),
+    ("repo.settings.options", "\u{6742}\u{9879}"),
+    (
+        "repo.settings.auto_refresh",
+        "\u{81ea}\u{52a8}\u{5237}\u{65b0}\u{ff08}\u{5173}\u{95ed}\u{540e}\u{4f60}\u{5fc5}\u{987b}\u{624b}\u{52a8}\u{5237}\u{65b0}\u{6b64}\u{4ed3}\u{5e93}\u{ff09}",
+    ),
+    (
+        "repo.settings.background_remote_refresh",
+        "\u{5728}\u{540e}\u{53f0}\u{5237}\u{65b0}\u{8fdc}\u{7aef}\u{72b6}\u{6001}\u{ff08}\u{5728}\u{5168}\u{5c40}\u{8bbe}\u{7f6e}\u{91cc}\u{5f00}\u{542f}\u{65f6}\u{ff09}",
+    ),
+    (
+        "repo.settings.edit_config_file",
+        "\u{7f16}\u{8f91}\u{914d}\u{7f6e}\u{6587}\u{4ef6}...",
+    ),
+    (
+        "repo.settings.config_failed",
+        "\u{6253}\u{5f00}\u{914d}\u{7f6e}\u{6587}\u{4ef6}\u{5931}\u{8d25}",
+    ),
+    ("repo.settings.add", "\u{6dfb}\u{52a0}"),
+    ("repo.settings.edit", "\u{7f16}\u{8f91}"),
+    ("repo.settings.remove", "\u{79fb}\u{9664}"),
 ];
 
 const EN: &[(&str, &str)] = &[
@@ -169,6 +285,64 @@ const EN: &[(&str, &str)] = &[
     ("options.title", "Options"),
     ("repo.settings", "Repository Settings"),
     ("repo.settings.title", "Repository Settings"),
+    ("repo.settings.remote_paths", "Remote repository paths"),
+    ("repo.settings.remote_details", "Remote Details"),
+    ("repo.settings.name", "Name"),
+    ("repo.settings.path", "Path"),
+    ("repo.settings.remote_name", "Remote name"),
+    ("repo.settings.default_remote", "Default remote"),
+    ("repo.settings.url_path", "URL / Path"),
+    ("repo.settings.remote_account", "Remote Account"),
+    ("settings.remote_accounts", "Remote Accounts"),
+    ("settings.remote_account_name", "Account name"),
+    ("settings.remote_account_host", "Host"),
+    ("repo.settings.add_remote", "Add Remote"),
+    ("repo.settings.edit_remote", "Edit Remote"),
+    (
+        "repo.settings.account_validation_failed",
+        "Account validation failed",
+    ),
+    (
+        "repo.settings.remote_validation_failed",
+        "Remote validation failed",
+    ),
+    ("repo.settings.generic_account", "Generic Account"),
+    ("repo.settings.generic_host", "Generic Host"),
+    (
+        "repo.settings.legacy_account_settings",
+        "Legacy Account Settings",
+    ),
+    ("repo.settings.host_type", "Host type"),
+    ("repo.settings.unknown", "Unknown"),
+    ("repo.settings.host_url", "Host root URL"),
+    ("repo.settings.username", "Username"),
+    (
+        "repo.settings.remote_account_hint",
+        "Extended integration is used for deeper hosting-service features, including locating existing clones from website links and creating pull requests.",
+    ),
+    ("repo.settings.ignore_list", "Repository ignore list"),
+    ("repo.settings.user", "User Information"),
+    (
+        "repo.settings.use_global_user",
+        "Use global user configuration",
+    ),
+    ("repo.settings.full_name", "Full name"),
+    ("repo.settings.email", "Email address"),
+    ("repo.settings.commit_links", "Commit text links"),
+    ("repo.settings.options", "Options"),
+    (
+        "repo.settings.auto_refresh",
+        "Automatically refresh this repository",
+    ),
+    (
+        "repo.settings.background_remote_refresh",
+        "Refresh remote status in the background",
+    ),
+    ("repo.settings.edit_config_file", "Edit config file..."),
+    ("repo.settings.config_failed", "Failed to open config file"),
+    ("repo.settings.add", "Add"),
+    ("repo.settings.edit", "Edit"),
+    ("repo.settings.remove", "Remove"),
     ("settings.language", "Language"),
     ("status.loading_repo", "Loading repository"),
     ("status.hash_copied", "Full hash copied"),
@@ -279,6 +453,9 @@ const EN: &[(&str, &str)] = &[
     ("tag.create", "Create tag"),
     ("tag.name", "Tag name"),
     ("tag.checkout", "Checkout tag"),
+    ("tag.push", "Push"),
+    ("tag.push_after_create", "Push after create"),
+    ("tag.remote", "Remote"),
     ("tag.delete", "Delete tag"),
     ("tag.confirm_delete", "Delete this tag?"),
     ("commit.details", "Commit Details"),
@@ -378,7 +555,7 @@ const ZH: &[(&str, &str)] = &[
     ("status.loading_repo", "正在加载仓库"),
     ("common.more", "更多"),
     ("common.local", "本地"),
-    ("common.remote", "远程"),
+    ("common.remote", "远端"),
     ("diff.loading", "正在加载差异"),
     ("diff.queued", "差异正在排队加载。"),
     ("diff.empty", "这个文件没有可显示的文本差异。"),
@@ -387,17 +564,17 @@ const ZH: &[(&str, &str)] = &[
     ("repo.none", "未加载仓库"),
     ("branch.current", "当前分支"),
     ("branch.local", "本地分支"),
-    ("branch.remote", "远程分支"),
+    ("branch.remote", "远端分支"),
     ("branch.none", "没有分支"),
     ("branch.create", "创建分支"),
     ("branch.name", "分支名称"),
     ("branch.checkout", "检出分支"),
-    ("branch.checkout_remote", "检出远程分支"),
+    ("branch.checkout_remote", "检出远端分支"),
     ("branch.delete", "删除分支"),
     ("branch.force_delete", "强制删除"),
     ("branch.confirm_delete", "删除这个分支？"),
-    ("remote.title", "远程仓库"),
-    ("remote.none", "没有远程仓库"),
+    ("remote.title", "远端仓库"),
+    ("remote.none", "没有远端仓库"),
     ("worktree.title", "工作区"),
     ("worktree.clean", "干净"),
     ("worktree.clean_detail", "没有待处理的文件变更。"),
@@ -433,6 +610,9 @@ const ZH: &[(&str, &str)] = &[
     ("tag.create", "创建标签"),
     ("tag.name", "标签名称"),
     ("tag.checkout", "检出标签"),
+    ("tag.push", "推送"),
+    ("tag.push_after_create", "创建后推送"),
+    ("tag.remote", "远端"),
     ("tag.delete", "删除标签"),
     ("tag.confirm_delete", "删除这个标签？"),
     ("commit.details", "提交详情"),
@@ -486,7 +666,7 @@ const ZH: &[(&str, &str)] = &[
     ("menu.revert", "还原此提交"),
     ("menu.reset", "重置当前分支到这里"),
     ("menu.compare_worktree", "与工作区比较"),
-    ("menu.open_remote", "在远程打开提交"),
+    ("menu.open_remote", "在远端打开提交"),
     ("commit.confirm_cherry_pick", "拣选这个提交？"),
     ("commit.confirm_revert", "还原这个提交？"),
     ("commit.confirm_reset", "重置当前分支到这个提交？"),
@@ -528,6 +708,24 @@ mod tests {
         assert_eq!(
             t(Language::Chinese, "repo.command_mode"),
             "\u{547d}\u{4ee4}\u{884c}\u{6a21}\u{5f0f}"
+        );
+        assert_eq!(t(Language::Chinese, "repo.remote"), "\u{8fdc}\u{7aef}");
+        assert_eq!(
+            t(Language::Chinese, "repo.source.remote"),
+            "\u{8fdc}\u{7aef}"
+        );
+        assert_eq!(t(Language::Chinese, "common.remote"), "\u{8fdc}\u{7aef}");
+        assert_eq!(
+            t(Language::Chinese, "branch.remote"),
+            "\u{8fdc}\u{7aef}\u{5206}\u{652f}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "remote.title"),
+            "\u{8fdc}\u{7aef}\u{5206}\u{652f}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "repo.remote.missing"),
+            "\u{672a}\u{914d}\u{7f6e}\u{8fdc}\u{7aef} URL"
         );
     }
 }

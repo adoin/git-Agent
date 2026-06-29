@@ -22,12 +22,15 @@ jobs:
           - name: Linux
             os: ubuntu-latest
             artifact: git-agent-linux-installer
+            asset-path: dist/git-agent-linux-installer.tar.gz
           - name: macOS
             os: macos-latest
             artifact: git-agent-macos-installer
+            asset-path: dist/git-agent-macos-installer.tar.gz
           - name: Windows
             os: windows-latest
             artifact: git-agent-windows-installer
+            asset-path: dist/GitAgentSetup-*.exe
 
     steps:
       - name: Checkout
@@ -119,47 +122,26 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $packageDir = "dist/${{ matrix.artifact }}"
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-          Copy-Item -LiteralPath "target/release/git-agent.exe" -Destination $packageDir
-          Copy-Item -LiteralPath "target/release/git-agent-merge.exe" -Destination $packageDir
+          choco install innosetup --yes --no-progress
 
-          @'
-          param(
-              [string]$InstallDir = "$env:LOCALAPPDATA\Programs\GitAgent"
-          )
+          $sourceDir = (Resolve-Path "target/release").Path
+          $outputDir = (New-Item -ItemType Directory -Force -Path "dist").FullName
+          $version = "${{ github.ref_name }}"
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6/ISCC.exe"
 
-          $ErrorActionPreference = "Stop"
-          $PackageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-          Copy-Item -LiteralPath (Join-Path $PackageDir "git-agent.exe") -Destination $InstallDir -Force
-          Copy-Item -LiteralPath (Join-Path $PackageDir "git-agent-merge.exe") -Destination $InstallDir -Force
-
-          $CurrentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-          $PathParts = @()
-          if ($CurrentPath) {
-              $PathParts = $CurrentPath -split ";" | Where-Object { $_ }
-          }
-
-          if ($PathParts -notcontains $InstallDir) {
-              $NewPath = (@($PathParts) + $InstallDir) -join ";"
-              [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
-              Write-Host "Added $InstallDir to user PATH. Open a new terminal to use it."
-          }
-
-          Write-Host "Installed git-agent and git-agent-merge to $InstallDir"
-          '@ | Set-Content -LiteralPath (Join-Path $packageDir "install.ps1") -Encoding UTF8
-
-          Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/${{ matrix.artifact }}.zip" -Force
+          & $iscc `
+            "installer/windows/git-agent.iss" `
+            "/DAppVersion=$version" `
+            "/DSourceDir=$sourceDir" `
+            "/DOutputDir=$outputDir"
 
       - name: Upload installer package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
           retention-days: 3
-          path: dist/${{ matrix.artifact }}.*
+          path: ${{ matrix.asset-path }}
 
   release:
     name: Publish GitHub release
@@ -174,7 +156,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download installer packages
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           pattern: git-agent-*-installer
           path: release-assets

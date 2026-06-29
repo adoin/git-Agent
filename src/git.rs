@@ -47,6 +47,15 @@ pub struct Remote {
     pub push_url: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryConfig {
+    pub config_path: PathBuf,
+    pub gitignore_path: PathBuf,
+    pub user_name: String,
+    pub user_email: String,
+    pub uses_global_user: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct UpstreamStatus {
@@ -103,6 +112,7 @@ pub struct RepositorySnapshot {
     pub topology_commits: Vec<Commit>,
     pub all_date_commits: Vec<Commit>,
     pub all_topology_commits: Vec<Commit>,
+    pub config: RepositoryConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +167,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         });
     }
     let remotes = load_remotes(&root).unwrap_or_default();
+    let config = load_repository_config(&root);
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
@@ -202,6 +213,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         topology_commits,
         all_date_commits,
         all_topology_commits,
+        config,
     })
 }
 
@@ -691,6 +703,20 @@ pub fn push_set_upstream(root: impl AsRef<Path>, remote: &str, branch: &str) -> 
     git_output(root.as_ref(), &["push", "-u", remote, branch]).map(|_| ())
 }
 
+#[cfg(test)]
+fn push_tag_args(remote: &str, tag: &str) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        remote.to_owned(),
+        format!("refs/tags/{tag}"),
+    ]
+}
+
+pub fn push_tag(root: impl AsRef<Path>, remote: &str, tag: &str) -> Result<()> {
+    let tag_ref = format!("refs/tags/{tag}");
+    git_output(root.as_ref(), &["push", remote, &tag_ref]).map(|_| ())
+}
+
 pub fn stash_push(root: impl AsRef<Path>, message: &str) -> Result<()> {
     if message.trim().is_empty() {
         git_output(root.as_ref(), &["stash", "push", "--include-untracked"]).map(|_| ())
@@ -843,6 +869,45 @@ fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
     }
 
     Ok(remotes)
+}
+
+fn load_repository_config(root: &Path) -> RepositoryConfig {
+    let config_path = git_path(root, "config").unwrap_or_else(|| root.join(".git").join("config"));
+    let gitignore_path = root.join(".gitignore");
+    let local_user_name = git_config_value(root, &["config", "--local", "--get", "user.name"]);
+    let local_user_email = git_config_value(root, &["config", "--local", "--get", "user.email"]);
+    let effective_user_name = if local_user_name.is_empty() {
+        git_config_value(root, &["config", "--get", "user.name"])
+    } else {
+        local_user_name.clone()
+    };
+    let effective_user_email = if local_user_email.is_empty() {
+        git_config_value(root, &["config", "--get", "user.email"])
+    } else {
+        local_user_email.clone()
+    };
+
+    RepositoryConfig {
+        config_path,
+        gitignore_path,
+        user_name: effective_user_name,
+        user_email: effective_user_email,
+        uses_global_user: local_user_name.is_empty() && local_user_email.is_empty(),
+    }
+}
+
+fn git_config_value(root: &Path, args: &[&str]) -> String {
+    git_output(root, args).unwrap_or_default().trim().to_owned()
+}
+
+fn git_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let raw = git_output(root, &["rev-parse", "--git-path", name]).ok()?;
+    let path = PathBuf::from(raw.trim());
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(root.join(path))
+    }
 }
 
 fn load_upstream_status(root: &Path) -> Result<Option<UpstreamStatus>> {
@@ -1287,6 +1352,49 @@ mod tests {
         assert_eq!(tags[0].name, "v3.6.0");
         assert_eq!(tags[0].target, "20c49fd0");
         assert_eq!(tags[0].subject, "Merge branch");
+    }
+
+    #[test]
+    fn push_tag_args_target_selected_remote_and_local_tag_ref() {
+        let args = push_tag_args("origin", "v1.0.0");
+
+        assert_eq!(args, vec!["push", "origin", "refs/tags/v1.0.0"]);
+    }
+
+    #[test]
+    fn loads_repository_settings_config_for_ui() {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-repo-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .arg("init")
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--local", "user.name", "Ado Wang"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--local", "user.email", "adoin.wang@qq.com"])
+            .output()
+            .unwrap();
+
+        let config = load_repository_config(&root);
+
+        assert_eq!(config.gitignore_path, root.join(".gitignore"));
+        assert_eq!(config.user_name, "Ado Wang");
+        assert_eq!(config.user_email, "adoin.wang@qq.com");
+        assert!(!config.uses_global_user);
+        assert!(config.config_path.ends_with("config"));
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

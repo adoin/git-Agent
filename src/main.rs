@@ -1,6 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() -> eframe::Result<()> {
+    install_panic_logger();
+    append_app_log(format!(
+        "process start pid={} exe={} cwd={}",
+        std::process::id(),
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("<current_exe error: {error}>")),
+        std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("<current_dir error: {error}>"))
+    ));
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Git Agent")
@@ -11,11 +23,52 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Git Agent",
         options,
         Box::new(|cc| Ok(Box::new(git_agent::app::GitAgentApp::new(cc)))),
-    )
+    );
+    append_app_log(format!(
+        "run_native returned {}",
+        match &result {
+            Ok(()) => "ok".to_owned(),
+            Err(error) => format!("error: {error}"),
+        }
+    ));
+    result
+}
+
+fn install_panic_logger() {
+    std::panic::set_hook(Box::new(|info| {
+        append_app_log(format!("panic: {info}"));
+    }));
+}
+
+fn append_app_log(message: impl AsRef<str>) {
+    let Some(path) = app_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "time-before-epoch".to_owned());
+    let line = format!("[{timestamp}] {}\n", message.as_ref());
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
+fn app_log_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .map(|base| base.join("data").join("app.log"))
 }
 
 fn app_icon_data() -> eframe::egui::IconData {
@@ -184,5 +237,17 @@ mod tests {
         assert!(logo.contains("<circle cx=\"42\" cy=\"22\""));
         assert!(logo.contains("fill=\"none\""));
         assert!(include_str!("main.rs").contains("with_decorations(false)"));
+    }
+
+    #[test]
+    fn main_installs_file_logging_for_startup_and_panics() {
+        let source = include_str!("main.rs");
+
+        assert!(source.contains("fn app_log_path()"));
+        assert!(source.contains("\"app.log\""));
+        assert!(source.contains("std::panic::set_hook"));
+        assert!(source.contains("process start"));
+        assert!(source.contains("panic:"));
+        assert!(source.contains("run_native returned"));
     }
 }

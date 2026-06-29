@@ -12,15 +12,20 @@ Release binaries are produced in `target/release/`.
 
 ## GitHub Actions
 
-Pushing to `main` runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads one installer package for that platform.
+Pushing a `v*` tag runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads one installer package for that platform.
 
-Each package includes:
+Linux and macOS releases are published as tarballs with `git-agent`, `git-agent-merge`, and `install.sh`.
 
-- `git-agent`
-- `git-agent-merge`
-- `install.sh` on Linux/macOS or `install.ps1` on Windows
+Windows releases are published as `GitAgentSetup-<version>.exe`. The setup wizard lets you choose the install path and installs both executables.
 
-Run the installer script from the downloaded package to install both executables.
+User data is stored relative to the executable in `data/`, for example:
+
+```text
+<install path>/data/settings.json
+<install path>/data/tabs.json
+<install path>/data/commit-options.json
+<install path>/data/layout.json
+```
 
 The workflow keeps only the latest 3 build runs and sets uploaded installer artifacts to expire after 3 days, which helps limit GitHub Actions storage usage.
 
