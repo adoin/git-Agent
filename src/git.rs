@@ -100,6 +100,7 @@ impl WorktreeFile {
 pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: String,
+    pub merge_message: Option<String>,
     pub upstream: Option<UpstreamStatus>,
     pub branches: Vec<Branch>,
     pub remotes: Vec<Remote>,
@@ -170,6 +171,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     }
     let remotes = load_remotes(&root).unwrap_or_default();
     let config = load_repository_config(&root);
+    let merge_message = load_merge_message(&root, &branch);
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
@@ -202,6 +204,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     Ok(RepositorySnapshot {
         root,
         branch,
+        merge_message,
         upstream,
         branches,
         remotes,
@@ -421,6 +424,13 @@ pub fn load_worktree_diff(
     Ok(FileDiff { key, text })
 }
 
+pub fn diff_worktree_against_commit(root: impl AsRef<Path>, hash: &str) -> Result<String> {
+    git_output(
+        root.as_ref(),
+        &["diff", "--no-ext-diff", "--find-renames", hash, "--"],
+    )
+}
+
 fn load_untracked_file_diff(root: &Path, path: &str) -> Result<String> {
     let content = fs::read_to_string(root.join(path)).with_context(|| {
         format!(
@@ -501,6 +511,12 @@ pub fn reset_to_commit(root: impl AsRef<Path>, hash: &str, mode: ResetMode) -> R
     git_output(root.as_ref(), &["reset", mode.flag(), hash]).map(|_| ())
 }
 
+pub fn discard_all_changes(root: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
+    git_output(root, &["reset", "--hard"])?;
+    git_output(root, &["clean", "-fd"]).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResetMode {
     Soft,
@@ -550,6 +566,46 @@ pub fn checkout_remote_branch(
     .map(|_| ())
 }
 
+pub fn merge_branch(root: impl AsRef<Path>, name: &str) -> Result<()> {
+    let root = root.as_ref();
+    if merge_in_progress(root) {
+        return Ok(());
+    }
+    git_output_allowing_new_conflicts(root, &["merge", name])
+}
+
+pub fn rebase_current_onto(root: impl AsRef<Path>, name: &str) -> Result<()> {
+    git_output(root.as_ref(), &["rebase", name]).map(|_| ())
+}
+
+pub fn rename_branch(root: impl AsRef<Path>, old_name: &str, new_name: &str) -> Result<()> {
+    let args = rename_branch_args(old_name, new_name);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+pub fn fetch_remote_branch(root: impl AsRef<Path>, remote_branch: &str) -> Result<()> {
+    let args = fetch_remote_branch_args(remote_branch)?;
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+pub fn set_branch_upstream(
+    root: impl AsRef<Path>,
+    local_branch: &str,
+    remote_branch: &str,
+) -> Result<()> {
+    let args = set_branch_upstream_args(local_branch, remote_branch);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+pub fn unset_branch_upstream(root: impl AsRef<Path>, local_branch: &str) -> Result<()> {
+    let args = unset_branch_upstream_args(local_branch);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
 pub fn delete_branch(root: impl AsRef<Path>, name: &str, force: bool) -> Result<()> {
     if force {
         git_output(root.as_ref(), &["branch", "-D", name]).map(|_| ())
@@ -559,13 +615,61 @@ pub fn delete_branch(root: impl AsRef<Path>, name: &str, force: bool) -> Result<
 }
 
 pub fn delete_remote_branch(root: impl AsRef<Path>, remote_branch: &str) -> Result<()> {
+    let (remote, branch) = split_remote_branch(remote_branch)?;
+    git_output(root.as_ref(), &["push", remote, "--delete", branch]).map(|_| ())
+}
+
+fn rename_branch_args(old_name: &str, new_name: &str) -> Vec<String> {
+    vec![
+        "branch".to_owned(),
+        "-m".to_owned(),
+        old_name.to_owned(),
+        new_name.to_owned(),
+    ]
+}
+
+fn fetch_remote_branch_args(remote_branch: &str) -> Result<Vec<String>> {
+    let (remote, branch) = split_remote_branch(remote_branch)?;
+    Ok(vec![
+        "fetch".to_owned(),
+        remote.to_owned(),
+        branch.to_owned(),
+    ])
+}
+
+fn push_branch_to_remote_args(remote: &str, branch: &str) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        "-u".to_owned(),
+        remote.to_owned(),
+        branch.to_owned(),
+    ]
+}
+
+fn set_branch_upstream_args(local_branch: &str, remote_branch: &str) -> Vec<String> {
+    vec![
+        "branch".to_owned(),
+        format!("--set-upstream-to={remote_branch}"),
+        local_branch.to_owned(),
+    ]
+}
+
+fn unset_branch_upstream_args(local_branch: &str) -> Vec<String> {
+    vec![
+        "branch".to_owned(),
+        "--unset-upstream".to_owned(),
+        local_branch.to_owned(),
+    ]
+}
+
+fn split_remote_branch(remote_branch: &str) -> Result<(&str, &str)> {
     let (remote, branch) = remote_branch
         .split_once('/')
         .ok_or_else(|| anyhow!("remote branch must look like remote/name"))?;
     if remote.trim().is_empty() || branch.trim().is_empty() {
         return Err(anyhow!("remote branch must look like remote/name"));
     }
-    git_output(root.as_ref(), &["push", remote, "--delete", branch]).map(|_| ())
+    Ok((remote, branch))
 }
 
 pub fn create_tag(root: impl AsRef<Path>, name: &str, hash: &str) -> Result<()> {
@@ -663,6 +767,57 @@ pub struct CommitOptions {
     pub gpg_sign: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PullOptions {
+    pub commit_merge: bool,
+    pub include_tags: bool,
+    pub force_merge_commit: bool,
+    pub rebase: bool,
+}
+
+impl Default for PullOptions {
+    fn default() -> Self {
+        Self {
+            commit_merge: true,
+            include_tags: false,
+            force_merge_commit: false,
+            rebase: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FetchOptions {
+    pub all_remotes: bool,
+    pub prune_tracking: bool,
+    pub fetch_tags: bool,
+    pub force_tags: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            all_remotes: true,
+            prune_tracking: true,
+            fetch_tags: false,
+            force_tags: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PushBranchSpec {
+    pub local_branch: String,
+    pub remote_branch: String,
+    pub track: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PushOptions {
+    pub push_tags: bool,
+    pub force: bool,
+}
+
 pub fn commit_args(message: &str, options: CommitOptions) -> Vec<String> {
     let mut args = vec!["commit".to_owned()];
     if options.amend {
@@ -689,12 +844,69 @@ pub fn commit_with_options(
     git_output(root.as_ref(), &refs).map(|_| ())
 }
 
-pub fn fetch(root: impl AsRef<Path>) -> Result<()> {
-    git_output(root.as_ref(), &["fetch", "--all", "--prune"]).map(|_| ())
+pub fn fetch_with_options(root: impl AsRef<Path>, options: FetchOptions) -> Result<()> {
+    let args = fetch_args(options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+fn fetch_args(options: FetchOptions) -> Vec<String> {
+    let mut args = vec!["fetch".to_owned()];
+    if options.all_remotes {
+        args.push("--all".to_owned());
+    }
+    if options.prune_tracking {
+        args.push("--prune".to_owned());
+    }
+    if options.fetch_tags {
+        args.push("--tags".to_owned());
+        if options.force_tags {
+            args.push("--force".to_owned());
+        }
+    }
+    args
+}
+
+pub fn fetch_remote(root: impl AsRef<Path>, remote: &str) -> Result<()> {
+    git_output(root.as_ref(), &["fetch", remote, "--prune"]).map(|_| ())
+}
+
+pub fn pull_from_remote(
+    root: impl AsRef<Path>,
+    remote: &str,
+    branch: &str,
+    options: PullOptions,
+) -> Result<()> {
+    let args = pull_args(remote, branch, options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+fn pull_args(remote: &str, branch: &str, options: PullOptions) -> Vec<String> {
+    let mut args = vec!["pull".to_owned()];
+    if options.rebase {
+        args.push("--rebase".to_owned());
+    } else {
+        if !options.commit_merge {
+            args.push("--no-commit".to_owned());
+        }
+        if options.include_tags {
+            args.push("--tags".to_owned());
+        }
+        if options.force_merge_commit {
+            args.push("--no-ff".to_owned());
+        }
+    }
+    if options.rebase && options.include_tags {
+        args.push("--tags".to_owned());
+    }
+    args.push(remote.to_owned());
+    args.push(branch.to_owned());
+    args
 }
 
 pub fn pull(root: impl AsRef<Path>) -> Result<()> {
-    git_output(root.as_ref(), &["pull", "--ff-only"]).map(|_| ())
+    git_output(root.as_ref(), &["pull"]).map(|_| ())
 }
 
 pub fn push(root: impl AsRef<Path>) -> Result<()> {
@@ -703,6 +915,43 @@ pub fn push(root: impl AsRef<Path>) -> Result<()> {
 
 pub fn push_set_upstream(root: impl AsRef<Path>, remote: &str, branch: &str) -> Result<()> {
     git_output(root.as_ref(), &["push", "-u", remote, branch]).map(|_| ())
+}
+
+pub fn push_selected(
+    root: impl AsRef<Path>,
+    remote: &str,
+    branches: &[PushBranchSpec],
+    options: PushOptions,
+) -> Result<()> {
+    let root = root.as_ref();
+    for branch in branches {
+        let args = push_branch_args(remote, branch, options.force);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        git_output(root, &refs)?;
+    }
+    if options.push_tags {
+        let args = push_tags_args(remote);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        git_output(root, &refs)?;
+    }
+    Ok(())
+}
+
+fn push_branch_args(remote: &str, branch: &PushBranchSpec, force: bool) -> Vec<String> {
+    let mut args = vec!["push".to_owned()];
+    if force {
+        args.push("--force-with-lease".to_owned());
+    }
+    if branch.track {
+        args.push("-u".to_owned());
+    }
+    args.push(remote.to_owned());
+    args.push(format!("{}:{}", branch.local_branch, branch.remote_branch));
+    args
+}
+
+fn push_tags_args(remote: &str) -> Vec<String> {
+    vec!["push".to_owned(), remote.to_owned(), "--tags".to_owned()]
 }
 
 #[cfg(test)]
@@ -910,6 +1159,44 @@ fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
     }
 
     Ok(remotes)
+}
+
+fn load_merge_message(root: &Path, current_branch: &str) -> Option<String> {
+    let path = git_path(root, "MERGE_MSG")?;
+    let message = fs::read_to_string(path).ok()?;
+    let message = message.trim_end().to_owned();
+    (!message.trim().is_empty()).then(|| format_merge_message_for_branch(&message, current_branch))
+}
+
+fn format_merge_message_for_branch(message: &str, current_branch: &str) -> String {
+    if current_branch.trim().is_empty() || current_branch == "HEAD" {
+        return message.to_owned();
+    }
+    let Some(first_line_end) = message.find('\n') else {
+        return format_merge_message_subject_for_branch(message, current_branch);
+    };
+    let subject = &message[..first_line_end];
+    let rest = &message[first_line_end..];
+    format!(
+        "{}{}",
+        format_merge_message_subject_for_branch(subject, current_branch),
+        rest
+    )
+}
+
+fn format_merge_message_subject_for_branch(subject: &str, current_branch: &str) -> String {
+    if (subject.starts_with("Merge branch ")
+        || subject.starts_with("Merge remote-tracking branch "))
+        && !subject.contains(" into ")
+    {
+        format!("{subject} into {current_branch}")
+    } else {
+        subject.to_owned()
+    }
+}
+
+fn merge_in_progress(root: &Path) -> bool {
+    git_path(root, "MERGE_HEAD").is_some_and(|path| path.exists())
 }
 
 fn load_repository_config(root: &Path) -> RepositoryConfig {
@@ -1152,6 +1439,36 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn git_output_allowing_new_conflicts(root: &Path, args: &[&str]) -> Result<()> {
+    let had_conflicts = has_unmerged_paths(root);
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+
+    if output.status.success() || (!had_conflicts && has_unmerged_paths(root)) {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn has_unmerged_paths(root: &Path) -> bool {
+    git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 fn git_command() -> Command {
     #[cfg(target_os = "windows")]
     {
@@ -1237,6 +1554,110 @@ mod tests {
     fn open_repository_requests_all_untracked_files() {
         let source = include_str!("git.rs");
         assert!(source.contains("\"--untracked-files=all\""));
+    }
+
+    #[test]
+    fn discard_all_changes_resets_tracked_and_cleans_untracked_files() {
+        let source = include_str!("git.rs");
+        let helper_start = source.find("pub fn discard_all_changes(").unwrap();
+        let helper_end = source[helper_start..]
+            .find("pub fn checkout_branch(")
+            .unwrap();
+        let helper_source = &source[helper_start..helper_start + helper_end];
+
+        assert!(helper_source.contains("&[\"reset\", \"--hard\"]"));
+        assert!(helper_source.contains("&[\"clean\", \"-fd\"]"));
+        assert!(
+            helper_source.find("reset").unwrap() < helper_source.find("clean").unwrap(),
+            "tracked changes should reset before untracked files are cleaned"
+        );
+    }
+
+    #[test]
+    fn merge_branch_conflicts_return_ok_so_ui_can_reload_conflict_state() {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-merge-conflict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["init"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "user.name", "Merge Tester"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "user.email", "merge-tester@example.com"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "-b", "main"])
+            .output()
+            .unwrap();
+        fs::write(root.join("story.txt"), "base\n").unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["add", "story.txt"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "-m", "base"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "-b", "feature-conflict"])
+            .output()
+            .unwrap();
+        fs::write(root.join("story.txt"), "feature\n").unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "-am", "feature"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "main"])
+            .output()
+            .unwrap();
+        fs::write(root.join("story.txt"), "main\n").unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["commit", "-am", "main"])
+            .output()
+            .unwrap();
+
+        let merge_result = merge_branch(&root, "feature-conflict");
+        let snapshot = open_repository(&root).unwrap();
+        let staged_conflict = snapshot.staged.iter().any(WorktreeFile::is_conflicted);
+        let unstaged_conflict = snapshot.unstaged.iter().any(WorktreeFile::is_conflicted);
+        let merge_message = snapshot.merge_message.clone().unwrap_or_default();
+        let repeated_merge_result = merge_branch(&root, "feature-conflict");
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(merge_result.is_ok(), "{merge_result:?}");
+        assert!(repeated_merge_result.is_ok(), "{repeated_merge_result:?}");
+        assert!(staged_conflict);
+        assert!(unstaged_conflict);
+        assert!(merge_message.starts_with("Merge branch 'feature-conflict' into main"));
+        assert!(merge_message.contains("# Conflicts:"));
+        assert!(merge_message.contains("story.txt"));
     }
 
     #[test]
@@ -1414,6 +1835,136 @@ mod tests {
         let args = push_tag_args("origin", "v1.0.0");
 
         assert_eq!(args, vec!["push", "origin", "refs/tags/v1.0.0"]);
+    }
+
+    #[test]
+    fn branch_operation_args_target_selected_branch_and_remote() {
+        assert_eq!(
+            rename_branch_args("feature-old", "feature-new"),
+            vec!["branch", "-m", "feature-old", "feature-new"]
+        );
+        assert_eq!(
+            fetch_remote_branch_args("origin/feature-batch").unwrap(),
+            vec!["fetch", "origin", "feature-batch"]
+        );
+        assert_eq!(
+            push_branch_to_remote_args("origin", "feature-batch"),
+            vec!["push", "-u", "origin", "feature-batch"]
+        );
+        assert_eq!(
+            set_branch_upstream_args("feature-batch", "origin/feature-batch"),
+            vec![
+                "branch",
+                "--set-upstream-to=origin/feature-batch",
+                "feature-batch"
+            ]
+        );
+        assert_eq!(
+            unset_branch_upstream_args("feature-batch"),
+            vec!["branch", "--unset-upstream", "feature-batch"]
+        );
+        assert!(fetch_remote_branch_args("origin").is_err());
+    }
+
+    #[test]
+    fn fetch_args_respect_dialog_options() {
+        assert_eq!(
+            fetch_args(FetchOptions::default()),
+            vec!["fetch", "--all", "--prune"]
+        );
+        assert_eq!(
+            fetch_args(FetchOptions {
+                all_remotes: false,
+                prune_tracking: false,
+                fetch_tags: true,
+                force_tags: false,
+            }),
+            vec!["fetch", "--tags"]
+        );
+        assert_eq!(
+            fetch_args(FetchOptions {
+                all_remotes: true,
+                prune_tracking: true,
+                fetch_tags: true,
+                force_tags: true,
+            }),
+            vec!["fetch", "--all", "--prune", "--tags", "--force"]
+        );
+    }
+
+    #[test]
+    fn pull_args_target_selected_remote_branch_and_options() {
+        assert_eq!(
+            pull_args("origin", "main", PullOptions::default()),
+            vec!["pull", "origin", "main"]
+        );
+        assert_eq!(
+            pull_args(
+                "origin",
+                "feature/ui",
+                PullOptions {
+                    commit_merge: false,
+                    include_tags: true,
+                    force_merge_commit: true,
+                    rebase: false,
+                }
+            ),
+            vec![
+                "pull",
+                "--no-commit",
+                "--tags",
+                "--no-ff",
+                "origin",
+                "feature/ui"
+            ]
+        );
+        assert_eq!(
+            pull_args(
+                "origin",
+                "main",
+                PullOptions {
+                    rebase: true,
+                    force_merge_commit: true,
+                    commit_merge: false,
+                    include_tags: false,
+                }
+            ),
+            vec!["pull", "--rebase", "origin", "main"]
+        );
+    }
+
+    #[test]
+    fn push_args_target_selected_branches_tags_force_and_tracking() {
+        assert_eq!(
+            push_branch_args(
+                "origin",
+                &PushBranchSpec {
+                    local_branch: "main".to_owned(),
+                    remote_branch: "main".to_owned(),
+                    track: true,
+                },
+                false,
+            ),
+            vec!["push", "-u", "origin", "main:main"]
+        );
+        assert_eq!(
+            push_branch_args(
+                "upstream",
+                &PushBranchSpec {
+                    local_branch: "feature/ui".to_owned(),
+                    remote_branch: "review/ui".to_owned(),
+                    track: false,
+                },
+                true,
+            ),
+            vec![
+                "push",
+                "--force-with-lease",
+                "upstream",
+                "feature/ui:review/ui"
+            ]
+        );
+        assert_eq!(push_tags_args("origin"), vec!["push", "origin", "--tags"]);
     }
 
     #[test]

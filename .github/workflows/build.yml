@@ -96,6 +96,7 @@ jobs:
           mkdir -p "$package_dir"
           cp target/release/git-agent "$package_dir/"
           cp target/release/git-agent-merge "$package_dir/"
+          cp target/release/git-agent-diff "$package_dir/"
           cat > "$package_dir/install.sh" <<'INSTALLER'
           #!/usr/bin/env sh
           set -eu
@@ -107,14 +108,15 @@ jobs:
           mkdir -p "$install_dir"
           cp "$script_dir/git-agent" "$install_dir/git-agent"
           cp "$script_dir/git-agent-merge" "$install_dir/git-agent-merge"
-          chmod 755 "$install_dir/git-agent" "$install_dir/git-agent-merge"
+          cp "$script_dir/git-agent-diff" "$install_dir/git-agent-diff"
+          chmod 755 "$install_dir/git-agent" "$install_dir/git-agent-merge" "$install_dir/git-agent-diff"
 
-          echo "Installed git-agent and git-agent-merge to $install_dir"
+          echo "Installed git-agent, git-agent-merge, and git-agent-diff to $install_dir"
           echo "Add $install_dir to PATH if it is not already there."
           INSTALLER
           sed -i.bak 's/^          //' "$package_dir/install.sh"
           rm "$package_dir/install.sh.bak"
-          chmod +x "$package_dir/git-agent" "$package_dir/git-agent-merge" "$package_dir/install.sh"
+          chmod +x "$package_dir/git-agent" "$package_dir/git-agent-merge" "$package_dir/git-agent-diff" "$package_dir/install.sh"
           tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C dist "${{ matrix.artifact }}"
 
       - name: Package installer

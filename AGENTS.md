@@ -27,3 +27,21 @@ spawn an external tool, or reload repository state must follow the same transiti
 
 New long-running actions need regression tests that prove: immediate visible feedback, async task
 ownership, shared busy gating, stale-cache avoidance when required, and gate release on completion.
+
+## Web UI Skill Gate
+
+For the `ui-ux-pro-max` skill, use this decision flow instead of matching every UI-related task:
+
+1. First decide whether the task is a Web UI scenario.
+   - Web UI means browser-rendered interface work: HTML/CSS, DOM, canvas/SVG in a browser,
+     web app components, web layout/style/animation, or screenshots from a browser UI.
+
+2. If it is Web UI development and the work changes style, layout, animation, accessibility,
+   or interaction polish, invoke `ui-ux-pro-max` before implementation.
+
+3. If it is not Web UI, do not invoke `ui-ux-pro-max`.
+   - Non-Web UI includes Rust/egui desktop UI, native desktop dialogs, CLI/TUI, native mobile,
+     backend logic, Git behavior, tests, docs, and build scripts unless they directly change a
+     browser-rendered UI.
+
+4. If a task mixes Web UI and non-Web UI work, invoke `ui-ux-pro-max` only for the Web UI portion.

@@ -15,6 +15,7 @@ $stdoutLog = Join-Path $stateDir "dev-watch.out.log"
 $stderrLog = Join-Path $stateDir "dev-watch.err.log"
 $mainExe = Join-Path $root "target\debug\git-agent.exe"
 $mergeExe = Join-Path $root "target\debug\git-agent-merge.exe"
+$diffExe = Join-Path $root "target\debug\git-agent-diff.exe"
 
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
@@ -72,6 +73,8 @@ function Stop-DevBinaries {
 
     Get-Process -Name "git-agent-merge" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name "git-agent-diff" -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 function Build-Bins {
@@ -97,6 +100,7 @@ function Build-Bins {
 
     Write-DevLog "built main=$mainExe"
     Write-DevLog "built merge=$mergeExe"
+    Write-DevLog "built diff=$diffExe"
     return $true
 }
 

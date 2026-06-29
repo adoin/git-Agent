@@ -31,6 +31,7 @@ fn dev_script_stops_running_app_before_building_bins() {
 
     assert!(stop_bins_body.contains("Stop-MainWindow"));
     assert!(stop_bins_body.contains("\"git-agent-merge\""));
+    assert!(stop_bins_body.contains("\"git-agent-diff\""));
 
     let stop_main_start = script
         .find("function Stop-MainWindow")
@@ -52,6 +53,7 @@ fn dev_script_logs_started_app_pid_and_exit_code() {
     let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
 
     assert!(script.contains("function Test-MainWindowExit"));
+    assert!(script.contains("git-agent-diff"));
 
     let start_start = script
         .find("function Start-MainWindow")

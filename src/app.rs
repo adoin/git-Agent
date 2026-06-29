@@ -51,6 +51,7 @@ const TOOLBAR_BUTTON_TEXT: f32 = 11.0;
 const TOOLBAR_BUTTON_X_PADDING: f32 = 36.0;
 const TOOLBAR_BUTTON_MIN_WIDTH: f32 = 48.0;
 const TOOLBAR_BUTTON_MAX_WIDTH: f32 = 160.0;
+const TOOLBAR_DOUBLE_CLICK_DELAY: f64 = 0.28;
 const FILE_ROW_HEIGHT: f32 = 24.0;
 const FILE_ROW_ICON_SLOT: f32 = 24.0;
 const FILE_ROW_LEFT_INSET: f32 = 10.0;
@@ -68,6 +69,10 @@ const COMMIT_MESSAGE_BOTTOM_GAP: f32 = 4.0;
 const COMMIT_SUBMIT_BUTTON_SIZE: Vec2 = Vec2 { x: 54.0, y: 24.0 };
 const HISTORY_TABLE_HEADER_HEIGHT: f32 = 24.0;
 const HISTORY_TABLE_ROW_HEIGHT: f32 = 22.0;
+const HISTORY_REF_BADGE_MIN_WIDTH: f32 = 34.0;
+const HISTORY_REF_BADGE_MAX_WIDTH: f32 = 142.0;
+const HISTORY_REF_BADGE_X_PADDING: f32 = 8.0;
+const HISTORY_REF_BADGE_GAP: f32 = 6.0;
 const HISTORY_BOTTOM_MIN_HEIGHT: f32 = 230.0;
 const HISTORY_DETAILS_MIN_HEIGHT: f32 = 260.0;
 const HISTORY_LIST_MIN_HEIGHT: f32 = 260.0;
@@ -84,6 +89,19 @@ const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
 const SETTINGS_DIALOG_TITLE_HEIGHT: f32 = 32.0;
 const SETTINGS_DIALOG_TITLE_SIZE: f32 = 18.0;
 const ACTION_DIALOG_WIDTH: f32 = 392.0;
+const FETCH_DIALOG_WIDTH: f32 = 392.0;
+const PULL_DIALOG_WIDTH: f32 = 700.0;
+const PUSH_DIALOG_WIDTH: f32 = 790.0;
+const PUSH_REMOTE_FORM_ROW_HEIGHT: f32 = 30.0;
+const PUSH_REMOTE_FORM_LABEL_WIDTH: f32 = 72.0;
+const PUSH_REMOTE_FORM_SELECTOR_WIDTH: f32 = 110.0;
+const PUSH_REMOTE_FORM_CONTROL_HEIGHT: f32 = 26.0;
+const PUSH_SELECT_COLUMN_WIDTH: f32 = 82.0;
+const PUSH_LOCAL_BRANCH_COLUMN_WIDTH: f32 = 160.0;
+const PUSH_TRACK_COLUMN_WIDTH: f32 = 58.0;
+const PUSH_TABLE_COLUMN_GAP: f32 = 8.0;
+const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;
+const PUSH_TABLE_BODY_TEXT_Y_OFFSET: f32 = 3.0;
 const ACTION_DIALOG_TITLE_HEIGHT: f32 = 34.0;
 const ACTION_DIALOG_TITLE_SIZE: f32 = 16.0;
 const REPO_SETTINGS_TABS_HEIGHT: f32 = 34.0;
@@ -347,7 +365,11 @@ pub struct GitAgentApp {
     pending_commit_action: Option<CommitActionDialog>,
     last_notice: Option<String>,
     toast_notice: Option<(String, Instant)>,
+    pending_toolbar_single_click: Option<PendingToolbarClick>,
     pending_worktree_action: Option<WorktreeActionDialog>,
+    pending_fetch_action: Option<FetchActionDialog>,
+    pending_pull_action: Option<PullActionDialog>,
+    pending_push_action: Option<PushActionDialog>,
     commit_message: String,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
@@ -359,6 +381,7 @@ pub struct GitAgentApp {
     branches_open: bool,
     tags_open: bool,
     remotes_open: bool,
+    local_branch_collapsed_groups: HashSet<String>,
     remote_branch_collapsed_groups: HashSet<String>,
     stashes_open: bool,
     sidebar_tree_states: HashMap<String, SidebarTreeState>,
@@ -560,12 +583,64 @@ enum CommitMenuAction {
     CherryPick { hash: String, short_hash: String },
     Revert { hash: String, short_hash: String },
     Reset { hash: String, short_hash: String },
+    CompareWithWorktree { hash: String, short_hash: String },
+    ExternalDiff { hash: String, short_hash: String },
+    OpenRemote { hash: String },
 }
 
 #[derive(Clone, Debug)]
 enum WorktreeActionDialog {
     ConfirmDiscard { path: String, untracked: bool },
     ResolveConflicts { selected_path: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoToolbarAction {
+    Pull,
+    Push,
+    Fetch,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingToolbarClick {
+    action: RepoToolbarAction,
+    due_at: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PullActionDialog {
+    remote: String,
+    remote_branch: String,
+    local_branch: String,
+    commit_merge: bool,
+    include_tags: bool,
+    force_merge_commit: bool,
+    rebase: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FetchActionDialog {
+    all_remotes: bool,
+    prune_tracking: bool,
+    fetch_tags: bool,
+    force_tags: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PushActionDialog {
+    remote: String,
+    rows: Vec<PushBranchRow>,
+    push_tags: bool,
+    force: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PushBranchRow {
+    selected: bool,
+    local_branch: String,
+    remote_branch: String,
+    track: bool,
+    upstream: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -593,9 +668,17 @@ enum BranchActionDialog {
         name: String,
         checkout: bool,
     },
+    ConfirmCheckout {
+        name: String,
+        discard_changes: bool,
+    },
     CheckoutRemote {
         remote_branch: String,
         local_branch: String,
+    },
+    Rename {
+        old_name: String,
+        new_name: String,
     },
     ConfirmDelete {
         name: String,
@@ -1459,7 +1542,11 @@ impl GitAgentApp {
             pending_commit_action: None,
             last_notice: None,
             toast_notice: None,
+            pending_toolbar_single_click: None,
             pending_worktree_action: None,
+            pending_fetch_action: None,
+            pending_pull_action: None,
+            pending_push_action: None,
             commit_message: String::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
@@ -1471,6 +1558,7 @@ impl GitAgentApp {
             branches_open: SidebarTreeState::default().branches_open,
             tags_open: SidebarTreeState::default().tags_open,
             remotes_open: SidebarTreeState::default().remotes_open,
+            local_branch_collapsed_groups: HashSet::new(),
             remote_branch_collapsed_groups: HashSet::new(),
             stashes_open: SidebarTreeState::default().stashes_open,
             sidebar_tree_states: tabs_state.sidebar_tree_states.clone(),
@@ -1722,6 +1810,7 @@ impl GitAgentApp {
         self.search_selected_commit = None;
         self.sync_active_tab_with_snapshot(&snapshot);
         self.apply_sidebar_tree_state_for_repo(&snapshot.root);
+        self.apply_merge_commit_message_default(&snapshot);
         self.snapshot = Some(snapshot);
         self.details_cache.clear();
         self.diff_cache.clear();
@@ -1738,6 +1827,14 @@ impl GitAgentApp {
         self.selected_worktree_file = None;
         self.worktree_selection = WorktreeSelectionState::default();
         self.request_selected_details();
+    }
+
+    fn apply_merge_commit_message_default(&mut self, snapshot: &RepositorySnapshot) {
+        if let Some(message) = snapshot.merge_message.as_deref() {
+            if self.commit_message.trim().is_empty() {
+                self.commit_message = message.to_owned();
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -1834,25 +1931,97 @@ impl GitAgentApp {
     }
 
     fn open_remote_url(&mut self) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let Some(remote) = snapshot.remotes.first() else {
-            self.error = Some(self.tr("repo.remote.missing").to_owned());
-            return;
-        };
-        let remote_url = if remote.fetch_url.is_empty() {
-            remote.push_url.as_str()
-        } else {
-            remote.fetch_url.as_str()
-        };
-        let Some(url) = remote_web_url(remote_url) else {
+        let Some(url) = self.default_remote_web_url() else {
             self.error = Some(self.tr("repo.remote.missing").to_owned());
             return;
         };
         if let Err(error) = open_url(&url) {
             self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
         }
+    }
+
+    fn open_branch_compare_url(&mut self, branch: &str) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(base_url) = self.default_remote_web_url() else {
+            self.error = Some(self.tr("repo.remote.missing").to_owned());
+            return;
+        };
+        let url = branch_compare_url(&base_url, &snapshot.branch, branch);
+        if let Err(error) = open_url(&url) {
+            self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
+        }
+    }
+
+    fn open_branch_pull_request_url(&mut self, branch: &str) {
+        let Some(base_url) = self.default_remote_web_url() else {
+            self.error = Some(self.tr("repo.remote.missing").to_owned());
+            return;
+        };
+        let url = branch_pull_request_url(&base_url, branch);
+        if let Err(error) = open_url(&url) {
+            self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
+        }
+    }
+
+    fn open_commit_remote_url(&mut self, hash: &str) {
+        let Some(base_url) = self.default_remote_web_url() else {
+            self.error = Some(self.tr("repo.remote.missing").to_owned());
+            return;
+        };
+        let url = commit_remote_url(&base_url, hash);
+        if let Err(error) = open_url(&url) {
+            self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
+        }
+    }
+
+    fn open_commit_diff_tool(&mut self, hash: String, short_hash: String) {
+        let title = format!("{short_hash} vs working tree");
+        let theme = merge_theme_arg(self.theme_mode).to_owned();
+        let language = merge_language_arg(self.language).to_owned();
+        self.start_remote_git_action(move |root| {
+            let diff_text = git::diff_worktree_against_commit(root, &hash)?;
+            let temp_dir = env::temp_dir()
+                .join("git-agent-diffs")
+                .join(format!("{}-{short_hash}", std::process::id()));
+            fs::create_dir_all(&temp_dir)?;
+            let diff_path = temp_dir.join("changes.patch");
+            fs::write(&diff_path, diff_text)?;
+            let diff_exe = env::current_exe()?.with_file_name(if cfg!(windows) {
+                "git-agent-diff.exe"
+            } else {
+                "git-agent-diff"
+            });
+            Command::new(&diff_exe)
+                .current_dir(root)
+                .arg("--title")
+                .arg(&title)
+                .arg("--left")
+                .arg(&short_hash)
+                .arg("--right")
+                .arg("worktree")
+                .arg("--diff")
+                .arg(&diff_path)
+                .arg("--theme")
+                .arg(&theme)
+                .arg("--language")
+                .arg(&language)
+                .spawn()
+                .map(|_| ())
+                .map_err(Into::into)
+        });
+    }
+
+    fn default_remote_web_url(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        let remote = snapshot.remotes.first()?;
+        let remote_url = if remote.fetch_url.is_empty() {
+            remote.push_url.as_str()
+        } else {
+            remote.fetch_url.as_str()
+        };
+        remote_web_url(remote_url)
     }
 
     fn open_command_mode(&mut self) {
@@ -1991,40 +2160,58 @@ impl GitAgentApp {
         self.start_repo_source_task(move || git::init_repository(PathBuf::from(path)));
     }
 
-    fn execute_git_action(&mut self, action: impl FnOnce(&std::path::Path) -> anyhow::Result<()>) {
-        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
-            return;
-        };
-
-        match action(&root) {
-            Ok(()) => {
-                self.error = None;
-                self.last_notice = None;
-                self.load_repository(root);
-            }
-            Err(error) => {
-                self.error = Some(error.to_string());
-                self.last_notice = None;
-            }
-        }
+    fn execute_git_action(
+        &mut self,
+        action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        self.start_remote_git_action(action);
     }
 
     fn branch_checkout_busy(&self) -> bool {
         self.branch_checkout_task.is_some() || self.pending_branch_checkout.is_some()
     }
 
+    fn merge_tool_busy(&self) -> bool {
+        self.merge_tool_task.is_some()
+    }
+
     fn branch_actions_busy(&self) -> bool {
-        self.loading_repo || self.branch_checkout_busy() || self.remote_git_busy()
+        self.loading_repo
+            || self.branch_checkout_busy()
+            || self.remote_git_busy()
+            || self.merge_tool_busy()
     }
 
     fn repo_toolbar_loading_busy(&self) -> bool {
         self.loading_repo
             || self.branch_checkout_busy()
             || self.remote_git_busy()
+            || self.merge_tool_busy()
             || self.repo_source_task.is_some()
     }
 
-    fn start_branch_checkout(&mut self, name: String) {
+    fn request_branch_checkout(&mut self, name: String) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        if snapshot.branch == name {
+            return;
+        }
+        if !snapshot.status.is_empty() {
+            self.pending_branch_action = Some(BranchActionDialog::ConfirmCheckout {
+                name,
+                discard_changes: false,
+            });
+            return;
+        }
+
+        self.start_branch_checkout(name, false);
+    }
+
+    fn start_branch_checkout(&mut self, name: String, discard_changes: bool) {
         if self.branch_actions_busy() {
             return;
         }
@@ -2044,7 +2231,12 @@ impl GitAgentApp {
         self.last_notice = None;
 
         thread::spawn(move || {
-            let result = git::checkout_branch(&root, &name);
+            let result = (|| {
+                if discard_changes {
+                    git::discard_all_changes(&root)?;
+                }
+                git::checkout_branch(&root, &name)
+            })();
             let _ = sender.send((root, name, result));
         });
     }
@@ -2060,12 +2252,14 @@ impl GitAgentApp {
         if self.remote_git_busy() || self.loading_repo {
             return;
         }
+        self.pending_toolbar_single_click = None;
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
             return;
         };
 
         let (sender, receiver) = mpsc::channel();
         self.remote_git_task = Some(receiver);
+        self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
 
@@ -2075,12 +2269,192 @@ impl GitAgentApp {
         });
     }
 
+    fn handle_repo_toolbar_action_response(
+        &mut self,
+        ctx: &egui::Context,
+        response: egui::Response,
+        action: RepoToolbarAction,
+    ) {
+        if response.double_clicked() {
+            self.pending_toolbar_single_click = None;
+            self.run_quick_toolbar_action(action);
+        } else if response.clicked() {
+            let now = ctx.input(|input| input.time);
+            self.pending_toolbar_single_click = Some(PendingToolbarClick {
+                action,
+                due_at: now + TOOLBAR_DOUBLE_CLICK_DELAY,
+            });
+            ctx.request_repaint_after(Duration::from_secs_f64(TOOLBAR_DOUBLE_CLICK_DELAY));
+        }
+    }
+
+    fn flush_pending_toolbar_single_click(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_toolbar_single_click else {
+            return;
+        };
+        let now = ctx.input(|input| input.time);
+        if now >= pending.due_at {
+            self.pending_toolbar_single_click = None;
+            self.open_toolbar_action_dialog(pending.action);
+        } else {
+            ctx.request_repaint_after(Duration::from_secs_f64(pending.due_at - now));
+        }
+    }
+
+    fn open_toolbar_action_dialog(&mut self, action: RepoToolbarAction) {
+        match action {
+            RepoToolbarAction::Pull => self.pull_current(),
+            RepoToolbarAction::Push => self.push_current(),
+            RepoToolbarAction::Fetch => self.fetch_all(),
+        }
+    }
+
+    fn run_quick_toolbar_action(&mut self, action: RepoToolbarAction) {
+        match action {
+            RepoToolbarAction::Pull => self.quick_pull_current(),
+            RepoToolbarAction::Push => self.quick_push_current(),
+            RepoToolbarAction::Fetch => self.quick_fetch_all(),
+        }
+    }
+
+    fn quick_fetch_all(&mut self) {
+        self.start_remote_git_action(|root| {
+            git::fetch_with_options(root, git::FetchOptions::default())
+        });
+    }
+
     fn fetch_all(&mut self) {
-        self.start_remote_git_action(|root| git::fetch(root));
+        self.open_fetch_dialog();
+    }
+
+    fn open_fetch_dialog(&mut self) {
+        self.pending_fetch_action = Some(FetchActionDialog {
+            all_remotes: true,
+            prune_tracking: true,
+            fetch_tags: false,
+            force_tags: false,
+        });
+    }
+
+    fn fetch_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_fetch_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+
+        compact_action_dialog(ctx, self.tr("fetch.title"), FETCH_DIALOG_WIDTH, |ui| {
+            ui.checkbox(&mut dialog.all_remotes, self.tr("fetch.all_remotes"));
+            ui.checkbox(&mut dialog.prune_tracking, self.tr("fetch.prune_tracking"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut dialog.fetch_tags, self.tr("fetch.tags"));
+                if !dialog.fetch_tags {
+                    dialog.force_tags = false;
+                }
+                ui.add_enabled_ui(dialog.fetch_tags, |ui| {
+                    ui.checkbox(&mut dialog.force_tags, self.tr("fetch.force_tags"));
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    if ui
+                        .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
+                        .clicked()
+                    {
+                        let options = git::FetchOptions {
+                            all_remotes: dialog.all_remotes,
+                            prune_tracking: dialog.prune_tracking,
+                            fetch_tags: dialog.fetch_tags,
+                            force_tags: dialog.force_tags,
+                        };
+                        execute =
+                            Some(Box::new(move |root| git::fetch_with_options(root, options)));
+                        close_after = true;
+                    }
+                });
+            });
+        });
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_fetch_action = Some(dialog);
+        }
     }
 
     fn pull_current(&mut self) {
+        self.open_pull_dialog(None);
+    }
+
+    fn quick_pull_current(&mut self) {
         self.start_remote_git_action(|root| git::pull(root));
+    }
+
+    fn open_pull_dialog(&mut self, local_branch: Option<String>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let local_branch = local_branch.unwrap_or_else(|| snapshot.branch.clone());
+        let target_upstream = snapshot
+            .branches
+            .iter()
+            .find(|branch| !branch.remote && branch.name == local_branch)
+            .and_then(|branch| branch.upstream.as_ref())
+            .or_else(|| {
+                (local_branch == snapshot.branch)
+                    .then_some(snapshot.upstream.as_ref())
+                    .flatten()
+            });
+        let (upstream_remote, upstream_branch) = target_upstream
+            .as_ref()
+            .and_then(|upstream| split_remote_branch_name(&upstream.name))
+            .unwrap_or_else(|| (self.default_remote_name(), String::new()));
+        let remote = if self
+            .remote_names()
+            .iter()
+            .any(|candidate| candidate == &upstream_remote)
+        {
+            upstream_remote
+        } else {
+            self.default_remote_name()
+        };
+        let remote_branches = self.remote_branch_names_for(&remote);
+        let remote_branch = if !upstream_branch.is_empty()
+            && remote_branches
+                .iter()
+                .any(|candidate| candidate == &upstream_branch)
+        {
+            upstream_branch
+        } else if remote_branches
+            .iter()
+            .any(|candidate| candidate == &local_branch)
+        {
+            local_branch.clone()
+        } else {
+            remote_branches.first().cloned().unwrap_or_default()
+        };
+        self.pending_pull_action = Some(PullActionDialog {
+            remote,
+            remote_branch,
+            local_branch,
+            commit_merge: true,
+            include_tags: false,
+            force_merge_commit: false,
+            rebase: false,
+        });
     }
 
     fn remote_names(&self) -> Vec<String> {
@@ -2103,29 +2477,148 @@ impl GitAgentApp {
             .unwrap_or_else(|| "origin".to_owned())
     }
 
+    fn remote_branch_names_for(&self, remote: &str) -> Vec<String> {
+        let prefix = format!("{remote}/");
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .branches
+                    .iter()
+                    .filter(|branch| branch.remote)
+                    .filter_map(|branch| branch.name.strip_prefix(&prefix).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remote_url_for_name(&self, remote_name: &str) -> Option<String> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .remotes
+                .iter()
+                .find(|remote| remote.name == remote_name)
+                .map(|remote| {
+                    if remote.fetch_url.is_empty() {
+                        remote.push_url.clone()
+                    } else {
+                        remote.fetch_url.clone()
+                    }
+                })
+        })
+    }
+
+    fn active_repo_display_name(&self) -> String {
+        self.active_repo_root()
+            .and_then(|root| {
+                root.file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "Repository".to_owned())
+    }
+
     fn push_current(&mut self) {
-        let Some(snapshot) = &self.snapshot else {
+        self.open_push_dialog(None, None);
+    }
+
+    fn quick_push_current(&mut self) {
+        self.start_remote_git_action(|root| git::push(root));
+    }
+
+    fn open_push_dialog(&mut self, target_branch: Option<String>, target_remote: Option<String>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let branch = snapshot.branch.clone();
-        let remote = snapshot
-            .remotes
-            .first()
-            .map(|remote| remote.name.clone())
-            .unwrap_or_else(|| "origin".to_owned());
-        let has_upstream = snapshot.upstream.is_some();
 
-        self.start_remote_git_action(move |root| {
-            if has_upstream {
-                git::push(root)
-            } else {
-                git::push_set_upstream(root, &remote, &branch)
-            }
+        let remote_names = self.remote_names();
+        let target_upstream = target_branch
+            .as_ref()
+            .and_then(|target| {
+                snapshot
+                    .branches
+                    .iter()
+                    .find(|branch| !branch.remote && branch.name == *target)
+            })
+            .and_then(|branch| branch.upstream.as_ref())
+            .or_else(|| snapshot.upstream.as_ref());
+        let upstream_remote = target_upstream
+            .as_ref()
+            .and_then(|upstream| split_remote_branch_name(&upstream.name))
+            .map(|(remote, _)| remote);
+        let mut remote = target_remote
+            .or(upstream_remote)
+            .unwrap_or_else(|| self.default_remote_name());
+        if !remote_names.iter().any(|candidate| candidate == &remote) {
+            remote = self.default_remote_name();
+        }
+
+        let remote_branches = self.remote_branch_names_for(&remote);
+        let selected_branch = target_branch.unwrap_or_else(|| snapshot.branch.clone());
+        let rows = snapshot
+            .branches
+            .iter()
+            .filter(|branch| !branch.remote)
+            .map(|branch| {
+                let selected = branch.name == selected_branch;
+                let mut remote_branch =
+                    push_remote_branch_default(branch, &remote, &remote_branches);
+                if selected && remote_branch.trim().is_empty() {
+                    remote_branch = branch.name.clone();
+                }
+                PushBranchRow {
+                    selected,
+                    local_branch: branch.name.clone(),
+                    remote_branch,
+                    track: true,
+                    upstream: branch
+                        .upstream
+                        .as_ref()
+                        .map(|upstream| upstream.name.clone()),
+                }
+            })
+            .collect();
+
+        self.pending_push_action = Some(PushActionDialog {
+            remote,
+            rows,
+            push_tags: true,
+            force: false,
         });
     }
 
+    fn selected_push_branches(dialog: &PushActionDialog) -> Vec<git::PushBranchSpec> {
+        dialog
+            .rows
+            .iter()
+            .filter(|row| row.selected)
+            .filter_map(|row| {
+                let local_branch = row.local_branch.trim();
+                let remote_branch = row.remote_branch.trim();
+                (!local_branch.is_empty() && !remote_branch.is_empty()).then(|| {
+                    git::PushBranchSpec {
+                        local_branch: local_branch.to_owned(),
+                        remote_branch: remote_branch.to_owned(),
+                        track: row.track,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn update_push_rows_for_remote(rows: &mut [PushBranchRow], remote: &str, branches: &[String]) {
+        for row in rows {
+            row.remote_branch = push_remote_branch_default_for_row(row, remote, branches);
+            if row.selected && row.remote_branch.trim().is_empty() {
+                row.remote_branch = row.local_branch.clone();
+            }
+        }
+    }
+
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
-        if shortcut_pressed(ctx, egui::Key::C, true) {
+        if stage_toggle_shortcut_pressed(ctx) {
+            self.pending_toolbar_single_click = None;
             self.active_view = MainView::Workspace;
             self.focus_commit_message = true;
             let action = self
@@ -2143,10 +2636,16 @@ impl GitAgentApp {
         }
 
         if shortcut_pressed(ctx, egui::Key::P, true) {
+            self.quick_push_current();
+        } else if shortcut_pressed(ctx, egui::Key::P, false) {
             self.push_current();
         } else if shortcut_pressed(ctx, egui::Key::L, true) {
+            self.quick_pull_current();
+        } else if shortcut_pressed(ctx, egui::Key::L, false) {
             self.pull_current();
         } else if shortcut_pressed(ctx, egui::Key::F, true) {
+            self.quick_fetch_all();
+        } else if shortcut_pressed(ctx, egui::Key::F, false) {
             self.fetch_all();
         }
     }
@@ -2221,10 +2720,11 @@ impl GitAgentApp {
                 Ok((root, Ok(()))) => {
                     self.error = None;
                     self.last_notice = None;
-                    self.load_repository(root);
+                    self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
+                    self.loading_repo = false;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -2234,6 +2734,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loading_repo = false;
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
@@ -2786,6 +3287,9 @@ impl GitAgentApp {
     }
 
     fn commit_current_message(&mut self, staged_count: usize) {
+        if self.loading_repo || self.remote_git_busy() {
+            return;
+        }
         if (staged_count == 0 && !self.commit_state.amend) || self.commit_message.trim().is_empty()
         {
             return;
@@ -2815,7 +3319,7 @@ impl GitAgentApp {
             }
         });
         self.add_commit_message_history(message.clone());
-        self.execute_git_action(move |root| {
+        self.start_remote_git_action(move |root| {
             git::commit_with_options(root, &message, options)?;
             if push_immediately {
                 if let Some((remote, branch, has_upstream)) = push_target {
@@ -2877,6 +3381,7 @@ impl App for GitAgentApp {
         self.poll_tasks(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
+        self.flush_pending_toolbar_single_click(ctx);
         if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Comma)) {
             self.settings_tab = SettingsTab::General;
             self.settings_open = true;
@@ -2898,6 +3403,9 @@ impl App for GitAgentApp {
 
         self.commit_action_modal(ctx);
         self.worktree_action_modal(ctx);
+        self.fetch_action_modal(ctx);
+        self.pull_action_modal(ctx);
+        self.push_action_modal(ctx);
         self.stash_action_modal(ctx);
         self.branch_action_modal(ctx);
         self.tag_action_modal(ctx);
@@ -3508,36 +4016,39 @@ impl GitAgentApp {
                                 {
                                     self.active_view = MainView::Workspace;
                                 }
-                                if toolbar_button(
+                                let pull_response = toolbar_button(
                                     ui,
                                     "pull",
                                     &pull_label,
                                     !repo_action_busy && has_repo && has_remote,
-                                )
-                                .clicked()
-                                {
-                                    self.pull_current();
-                                }
-                                if toolbar_button(
+                                );
+                                self.handle_repo_toolbar_action_response(
+                                    ctx,
+                                    pull_response,
+                                    RepoToolbarAction::Pull,
+                                );
+                                let push_response = toolbar_button(
                                     ui,
                                     "push",
                                     &push_label,
                                     !repo_action_busy && has_repo && has_remote,
-                                )
-                                .clicked()
-                                {
-                                    self.push_current();
-                                }
-                                if toolbar_button(
+                                );
+                                self.handle_repo_toolbar_action_response(
+                                    ctx,
+                                    push_response,
+                                    RepoToolbarAction::Push,
+                                );
+                                let fetch_response = toolbar_button(
                                     ui,
                                     "fetch",
                                     self.tr("action.fetch"),
                                     !repo_action_busy && has_repo && has_remote,
-                                )
-                                .clicked()
-                                {
-                                    self.fetch_all();
-                                }
+                                );
+                                self.handle_repo_toolbar_action_response(
+                                    ctx,
+                                    fetch_response,
+                                    RepoToolbarAction::Fetch,
+                                );
                                 ui.add_space(LAYOUT_GAP as f32);
                                 if toolbar_button(
                                     ui,
@@ -3907,6 +4418,17 @@ impl GitAgentApp {
         if let Some(snapshot) = &self.snapshot {
             ui.add_space(8.0);
 
+            let remote_branch_names = snapshot
+                .branches
+                .iter()
+                .filter(|branch| branch.remote)
+                .map(|branch| branch.name.clone())
+                .collect::<Vec<_>>();
+            let remote_names = snapshot
+                .remotes
+                .iter()
+                .map(|remote| remote.name.clone())
+                .collect::<Vec<_>>();
             let mut branch_action = None;
             let mut tag_action = None;
             let mut stash_action = None;
@@ -3930,21 +4452,26 @@ impl GitAgentApp {
                 sidebar_state_changed = true;
             }
             if branches_visible {
-                for branch in snapshot
+                let local_branches = snapshot
                     .branches
                     .iter()
                     .filter(|branch| !branch.remote)
-                    .take(18)
-                {
-                    let current =
-                        branch_current_for_display(branch, pending_branch_checkout.as_deref());
-                    branch_row(
+                    .collect::<Vec<_>>();
+                let local_branches_by_name = local_branches
+                    .iter()
+                    .map(|branch| (branch.name.as_str(), *branch))
+                    .collect::<HashMap<_, _>>();
+                for node in local_branch_tree(&local_branches).iter().take(18) {
+                    local_branch_tree_rows(
                         ui,
-                        current,
-                        branch.remote,
-                        &branch.name,
-                        upstream_sync_counts_for_branch(branch),
+                        node,
+                        0,
+                        &local_branches_by_name,
+                        pending_branch_checkout.as_deref(),
+                        &remote_branch_names,
+                        &remote_names,
                         self.language,
+                        &mut self.local_branch_collapsed_groups,
                         branch_actions_enabled,
                         &mut branch_action,
                     );
@@ -5260,6 +5787,15 @@ impl GitAgentApp {
             .filter(|branch| branch.remote)
             .cloned()
             .collect::<Vec<_>>();
+        let remote_branch_names = remote
+            .iter()
+            .map(|branch| branch.name.clone())
+            .collect::<Vec<_>>();
+        let remote_names = snapshot
+            .remotes
+            .iter()
+            .map(|remote| remote.name.clone())
+            .collect::<Vec<_>>();
         let branch_actions_enabled = !self.branch_actions_busy();
         let pending_branch_checkout = self.pending_branch_checkout.clone();
         let mut action = None;
@@ -5294,6 +5830,12 @@ impl GitAgentApp {
                             current,
                             false,
                             &branch.name,
+                            branch
+                                .upstream
+                                .as_ref()
+                                .map(|upstream| upstream.name.as_str()),
+                            &remote_branch_names,
+                            &remote_names,
                             self.language,
                             branch_actions_enabled,
                             &mut action,
@@ -5305,6 +5847,12 @@ impl GitAgentApp {
                             branch.current,
                             true,
                             &branch.name,
+                            branch
+                                .upstream
+                                .as_ref()
+                                .map(|upstream| upstream.name.as_str()),
+                            &remote_branch_names,
+                            &remote_names,
                             self.language,
                             branch_actions_enabled,
                             &mut action,
@@ -5446,19 +5994,26 @@ impl GitAgentApp {
                     mode: ResetMode::Mixed,
                 });
             }
+            CommitMenuAction::CompareWithWorktree { hash, short_hash }
+            | CommitMenuAction::ExternalDiff { hash, short_hash } => {
+                self.open_commit_diff_tool(hash, short_hash);
+            }
+            CommitMenuAction::OpenRemote { hash } => {
+                self.open_commit_remote_url(&hash);
+            }
         }
     }
 
     fn handle_worktree_action(&mut self, action: WorktreeMenuAction) {
         match action {
             WorktreeMenuAction::Stage { path } => {
-                self.execute_git_action(|root| git::stage_path(root, &path));
+                self.execute_git_action(move |root| git::stage_path(root, &path));
             }
             WorktreeMenuAction::StageAll => {
                 self.execute_git_action(|root| git::stage_all(root));
             }
             WorktreeMenuAction::Unstage { path } => {
-                self.execute_git_action(|root| git::unstage_path(root, &path));
+                self.execute_git_action(move |root| git::unstage_path(root, &path));
             }
             WorktreeMenuAction::UnstageAll => {
                 self.execute_git_action(|root| git::unstage_all(root));
@@ -5473,7 +6028,7 @@ impl GitAgentApp {
                 });
             }
             WorktreeMenuAction::AddToGitIgnore { pattern } => {
-                self.execute_git_action(|root| git::add_to_gitignore(root, &pattern));
+                self.execute_git_action(move |root| git::add_to_gitignore(root, &pattern));
             }
         }
     }
@@ -5483,7 +6038,7 @@ impl GitAgentApp {
             match receiver.try_recv() {
                 Ok((root, Ok(_success))) => {
                     self.last_notice = None;
-                    self.load_repository(root);
+                    self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
@@ -5599,10 +6154,10 @@ impl GitAgentApp {
                 });
             }
             StashMenuAction::Apply { selector } => {
-                self.execute_git_action(|root| git::stash_apply(root, &selector));
+                self.execute_git_action(move |root| git::stash_apply(root, &selector));
             }
             StashMenuAction::Pop { selector } => {
-                self.execute_git_action(|root| git::stash_pop(root, &selector));
+                self.execute_git_action(move |root| git::stash_pop(root, &selector));
             }
             StashMenuAction::Drop { selector, message } => {
                 self.pending_stash_action =
@@ -5620,7 +6175,7 @@ impl GitAgentApp {
                 });
             }
             BranchMenuAction::Checkout { name } => {
-                self.start_branch_checkout(name);
+                self.request_branch_checkout(name);
             }
             BranchMenuAction::CheckoutRemote { remote_branch } => {
                 let local_branch = remote_branch
@@ -5632,6 +6187,55 @@ impl GitAgentApp {
                     local_branch,
                 });
             }
+            BranchMenuAction::MergeIntoCurrent { name } => {
+                self.active_view = MainView::Workspace;
+                self.commit_message.clear();
+                self.start_remote_git_action(move |root| git::merge_branch(root, &name));
+            }
+            BranchMenuAction::RebaseCurrentOnto { name } => {
+                self.start_remote_git_action(move |root| git::rebase_current_onto(root, &name));
+            }
+            BranchMenuAction::FetchTracked { remote_branch } => {
+                self.start_remote_git_action(move |root| {
+                    git::fetch_remote_branch(root, &remote_branch)
+                });
+            }
+            BranchMenuAction::PullTracked { name } => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.branch == name)
+                {
+                    self.open_pull_dialog(Some(name));
+                }
+            }
+            BranchMenuAction::PushTracked { name } => {
+                self.open_push_dialog(Some(name), None);
+            }
+            BranchMenuAction::PushToRemote { name, remote } => {
+                self.open_push_dialog(Some(name), Some(remote));
+            }
+            BranchMenuAction::TrackRemote {
+                name,
+                remote_branch,
+            } => {
+                self.start_remote_git_action(move |root| {
+                    if let Some(remote_branch) = remote_branch {
+                        git::set_branch_upstream(root, &name, &remote_branch)
+                    } else {
+                        git::unset_branch_upstream(root, &name)
+                    }
+                });
+            }
+            BranchMenuAction::CompareWithCurrent { name } => {
+                self.open_branch_compare_url(&name);
+            }
+            BranchMenuAction::Rename { name } => {
+                self.pending_branch_action = Some(BranchActionDialog::Rename {
+                    old_name: name.clone(),
+                    new_name: name,
+                });
+            }
             BranchMenuAction::Delete { name } => {
                 self.pending_branch_action =
                     Some(BranchActionDialog::ConfirmDelete { name, force: false });
@@ -5639,6 +6243,9 @@ impl GitAgentApp {
             BranchMenuAction::DeleteRemote { remote_branch } => {
                 self.pending_branch_action =
                     Some(BranchActionDialog::ConfirmDeleteRemote { remote_branch });
+            }
+            BranchMenuAction::CreatePullRequest { name } => {
+                self.open_branch_pull_request_url(&name);
             }
         }
     }
@@ -5654,7 +6261,7 @@ impl GitAgentApp {
                 });
             }
             TagMenuAction::Checkout { name } => {
-                self.execute_git_action(|root| git::checkout_tag(root, &name));
+                self.execute_git_action(move |root| git::checkout_tag(root, &name));
             }
             TagMenuAction::Push { name } => {
                 let remote = self.default_remote_name();
@@ -5820,7 +6427,9 @@ impl GitAgentApp {
                         .max(COMMIT_MESSAGE_BOTTOM_GAP),
                 );
                 let can_commit = (staged_count > 0 || self.commit_state.amend)
-                    && !self.commit_message.trim().is_empty();
+                    && !self.commit_message.trim().is_empty()
+                    && !self.loading_repo
+                    && !self.remote_git_busy();
                 let commit_clicked = self.commit_action_row(ui, can_commit);
                 if commit_clicked {
                     self.commit_current_message(staged_count);
@@ -6098,6 +6707,296 @@ impl GitAgentApp {
         paint_workspace_card_inset_shadow(ui, diff_rect);
     }
 
+    fn pull_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_pull_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let remotes = self.remote_names();
+        if !remotes.iter().any(|remote| remote == &dialog.remote) {
+            dialog.remote = remotes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "origin".to_owned());
+        }
+        let remote_branches = self.remote_branch_names_for(&dialog.remote);
+        if !remote_branches
+            .iter()
+            .any(|branch| branch == &dialog.remote_branch)
+        {
+            dialog.remote_branch = remote_branches.first().cloned().unwrap_or_default();
+        }
+        let remote_url = self.remote_url_for_name(&dialog.remote).unwrap_or_default();
+
+        compact_action_dialog(ctx, self.tr("pull.title"), PULL_DIALOG_WIDTH, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.tr("pull.remote"))
+                        .small()
+                        .color(theme::muted()),
+                );
+                egui::ComboBox::from_id_salt("pull_remote_selector")
+                    .width(ui.available_width())
+                    .selected_text(dialog.remote.as_str())
+                    .show_ui(ui, |ui| {
+                        for remote in &remotes {
+                            if ui
+                                .selectable_value(&mut dialog.remote, remote.clone(), remote)
+                                .clicked()
+                            {
+                                let branches = self.remote_branch_names_for(&dialog.remote);
+                                dialog.remote_branch =
+                                    branches.first().cloned().unwrap_or_default();
+                            }
+                        }
+                    });
+            });
+            ui.add_space(4.0);
+            themed_text_edit_selection(ui);
+            let mut remote_url_display = remote_url.clone();
+            ui.add_enabled(
+                false,
+                themed_singleline_text_edit(&mut remote_url_display, ""),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.tr("pull.remote_branch"))
+                        .small()
+                        .color(theme::muted()),
+                );
+                egui::ComboBox::from_id_salt("pull_remote_branch_selector")
+                    .width((ui.available_width() - 76.0).max(180.0))
+                    .selected_text(dialog.remote_branch.as_str())
+                    .show_ui(ui, |ui| {
+                        for branch in &remote_branches {
+                            ui.selectable_value(&mut dialog.remote_branch, branch.clone(), branch);
+                        }
+                    });
+                if ui
+                    .add_enabled(actions_enabled, egui::Button::new(self.tr("pull.refresh")))
+                    .clicked()
+                    && !dialog.remote.trim().is_empty()
+                {
+                    let remote = dialog.remote.trim().to_owned();
+                    execute = Some(Box::new(move |root| git::fetch_remote(root, &remote)));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.tr("pull.local_branch"))
+                        .small()
+                        .color(theme::muted()),
+                );
+                ui.label(RichText::new(dialog.local_branch.as_str()).color(theme::text()));
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(self.tr("pull.options"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.group(|ui| {
+                ui.checkbox(&mut dialog.commit_merge, self.tr("pull.commit_merge"));
+                ui.checkbox(&mut dialog.include_tags, self.tr("pull.include_tags"));
+                ui.checkbox(
+                    &mut dialog.force_merge_commit,
+                    self.tr("pull.force_merge_commit"),
+                );
+                ui.checkbox(&mut dialog.rebase, self.tr("pull.rebase"));
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            actions_enabled
+                                && !dialog.remote.trim().is_empty()
+                                && !dialog.remote_branch.trim().is_empty(),
+                            egui::Button::new(self.tr("action.pull")),
+                        )
+                        .clicked()
+                    {
+                        let remote = dialog.remote.trim().to_owned();
+                        let remote_branch = dialog.remote_branch.trim().to_owned();
+                        let options = git::PullOptions {
+                            commit_merge: dialog.commit_merge,
+                            include_tags: dialog.include_tags,
+                            force_merge_commit: dialog.force_merge_commit,
+                            rebase: dialog.rebase,
+                        };
+                        execute = Some(Box::new(move |root| {
+                            git::pull_from_remote(root, &remote, &remote_branch, options)
+                        }));
+                        close_after = true;
+                    }
+                });
+            });
+        });
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_pull_action = Some(dialog);
+        }
+    }
+
+    fn push_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_push_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let remotes = self.remote_names();
+        if !remotes.iter().any(|remote| remote == &dialog.remote) {
+            dialog.remote = remotes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "origin".to_owned());
+            let branches = self.remote_branch_names_for(&dialog.remote);
+            Self::update_push_rows_for_remote(&mut dialog.rows, &dialog.remote, &branches);
+        }
+        let remote_branches = self.remote_branch_names_for(&dialog.remote);
+        let remote_url = self.remote_url_for_name(&dialog.remote).unwrap_or_default();
+        let title = format!(
+            "{}: {}",
+            self.tr("push.title"),
+            self.active_repo_display_name()
+        );
+
+        compact_action_dialog(ctx, &title, PUSH_DIALOG_WIDTH, |ui| {
+            let mut remote_url_display = remote_url.clone();
+            push_remote_form_row(ui, self.tr("push.remote"), &mut remote_url_display, |ui| {
+                egui::ComboBox::from_id_salt("push_remote_selector")
+                    .width(PUSH_REMOTE_FORM_SELECTOR_WIDTH)
+                    .selected_text(dialog.remote.as_str())
+                    .show_ui(ui, |ui| {
+                        for remote in &remotes {
+                            if ui
+                                .selectable_value(&mut dialog.remote, remote.clone(), remote)
+                                .clicked()
+                            {
+                                let branches = self.remote_branch_names_for(&dialog.remote);
+                                Self::update_push_rows_for_remote(
+                                    &mut dialog.rows,
+                                    &dialog.remote,
+                                    &branches,
+                                );
+                            }
+                        }
+                    });
+            });
+
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(self.tr("push.branches"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            egui::Frame::new()
+                .fill(theme::panel_soft())
+                .stroke(Stroke::new(1.0, theme::inset_shadow()))
+                .inner_margin(egui::Margin::symmetric(6, 6))
+                .show(ui, |ui| {
+                    let table_width = ui.available_width();
+                    push_branch_table_header(
+                        ui,
+                        table_width,
+                        self.tr("push.select"),
+                        self.tr("push.local_branch"),
+                        self.tr("push.remote_branch"),
+                        self.tr("push.track"),
+                    );
+                    for row in &mut dialog.rows {
+                        push_branch_table_row(ui, table_width, row, &remote_branches);
+                    }
+                });
+
+            ui.add_space(8.0);
+            let mut all_selected =
+                !dialog.rows.is_empty() && dialog.rows.iter().all(|row| row.selected);
+            if ui
+                .checkbox(&mut all_selected, self.tr("push.select_all"))
+                .changed()
+            {
+                for row in &mut dialog.rows {
+                    row.selected = all_selected;
+                    if row.selected && row.remote_branch.trim().is_empty() {
+                        row.remote_branch = row.local_branch.clone();
+                    }
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut dialog.push_tags, self.tr("push.push_tags"));
+                ui.checkbox(&mut dialog.force, self.tr("push.force"));
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    let selected_push_branches = Self::selected_push_branches(&dialog);
+                    let selected_count = dialog.rows.iter().filter(|row| row.selected).count();
+                    let has_blank_selected_branch = dialog
+                        .rows
+                        .iter()
+                        .any(|row| row.selected && row.remote_branch.trim().is_empty());
+                    if ui
+                        .add_enabled(
+                            actions_enabled
+                                && !dialog.remote.trim().is_empty()
+                                && !has_blank_selected_branch
+                                && (selected_count > 0 || dialog.push_tags),
+                            egui::Button::new(self.tr("action.push")),
+                        )
+                        .clicked()
+                    {
+                        let remote = dialog.remote.trim().to_owned();
+                        let branches = selected_push_branches;
+                        let options = git::PushOptions {
+                            push_tags: dialog.push_tags,
+                            force: dialog.force,
+                        };
+                        execute = Some(Box::new(move |root| {
+                            git::push_selected(root, &remote, &branches, options)
+                        }));
+                        close_after = true;
+                    }
+                });
+            });
+        });
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_push_action = Some(dialog);
+        }
+    }
+
     fn commit_action_modal(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.pending_commit_action.take() else {
             return;
@@ -6105,7 +7004,8 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
         let remotes = self.remote_names();
 
         let title = match &dialog {
@@ -6344,7 +7244,8 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
 
         match dialog {
             WorktreeActionDialog::ConfirmDiscard { path, untracked } => {
@@ -6506,7 +7407,8 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
 
         match &mut dialog {
             StashActionDialog::Create { message } => {
@@ -6566,7 +7468,9 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let mut checkout_requested: Option<(String, bool)> = None;
         let branch_actions_enabled = !self.branch_actions_busy();
 
         match &mut dialog {
@@ -6602,6 +7506,55 @@ impl GitAgentApp {
                     });
                 });
             }
+            BranchActionDialog::ConfirmCheckout {
+                name,
+                discard_changes,
+            } => {
+                compact_action_dialog(
+                    ctx,
+                    self.tr("branch.confirm_checkout_title"),
+                    ACTION_DIALOG_WIDTH,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            paint_ui_icon(
+                                ui,
+                                icon_rect.shrink(2.0),
+                                UiIcon::Warning,
+                                theme::warning(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} \"{}\"?",
+                                    self.tr("branch.confirm_checkout"),
+                                    name
+                                ))
+                                .color(theme::text()),
+                            );
+                        });
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(discard_changes, self.tr("branch.discard_before_checkout"));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled,
+                                        egui::Button::new(self.tr("dialog.ok")),
+                                    )
+                                    .clicked()
+                                {
+                                    checkout_requested = Some((name.clone(), *discard_changes));
+                                    close_after = true;
+                                }
+                            });
+                        });
+                    },
+                );
+            }
             BranchActionDialog::CheckoutRemote {
                 remote_branch,
                 local_branch,
@@ -6632,6 +7585,43 @@ impl GitAgentApp {
                                 let local_branch = local_branch.trim().to_owned();
                                 execute = Some(Box::new(move |root| {
                                     git::checkout_remote_branch(root, &remote_branch, &local_branch)
+                                }));
+                                close_after = true;
+                            }
+                            if ui.button(self.tr("dialog.cancel")).clicked() {
+                                close_after = true;
+                            }
+                        });
+                    },
+                );
+            }
+            BranchActionDialog::Rename { old_name, new_name } => {
+                compact_action_dialog(
+                    ctx,
+                    self.tr("branch.rename_title"),
+                    ACTION_DIALOG_WIDTH,
+                    |ui| {
+                        ui.label(RichText::new(old_name.as_str()).color(theme::text()));
+                        ui.label(
+                            RichText::new(self.tr("branch.new_name"))
+                                .small()
+                                .color(theme::muted()),
+                        );
+                        ui.add(TextEdit::singleline(new_name));
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    branch_actions_enabled,
+                                    egui::Button::new(self.tr("dialog.ok")),
+                                )
+                                .clicked()
+                                && !new_name.trim().is_empty()
+                            {
+                                let old_name = old_name.clone();
+                                let new_name = new_name.trim().to_owned();
+                                execute = Some(Box::new(move |root| {
+                                    git::rename_branch(root, &old_name, &new_name)
                                 }));
                                 close_after = true;
                             }
@@ -6703,6 +7693,9 @@ impl GitAgentApp {
             }
         }
 
+        if let Some((name, discard_changes)) = checkout_requested {
+            self.start_branch_checkout(name, discard_changes);
+        }
         if let Some(action) = execute {
             self.execute_git_action(action);
         }
@@ -6721,7 +7714,8 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()>>> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
         let remotes = self.remote_names();
 
         match &mut dialog {
@@ -7504,10 +8498,50 @@ enum StashMenuAction {
 #[derive(Clone, Debug)]
 enum BranchMenuAction {
     Create,
-    Checkout { name: String },
-    CheckoutRemote { remote_branch: String },
-    Delete { name: String },
-    DeleteRemote { remote_branch: String },
+    Checkout {
+        name: String,
+    },
+    CheckoutRemote {
+        remote_branch: String,
+    },
+    MergeIntoCurrent {
+        name: String,
+    },
+    RebaseCurrentOnto {
+        name: String,
+    },
+    FetchTracked {
+        remote_branch: String,
+    },
+    PullTracked {
+        name: String,
+    },
+    PushTracked {
+        name: String,
+    },
+    PushToRemote {
+        name: String,
+        remote: String,
+    },
+    TrackRemote {
+        name: String,
+        remote_branch: Option<String>,
+    },
+    CompareWithCurrent {
+        name: String,
+    },
+    Rename {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    DeleteRemote {
+        remote_branch: String,
+    },
+    CreatePullRequest {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -7586,9 +8620,16 @@ fn exact_panel_at_rect(
         .inner_margin(egui::Margin::symmetric(x_margin, y_margin));
 
     ui.painter().add(frame.paint(inner_rect));
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
-        ui.set_clip_rect(inner_rect);
+    allocate_clipped_ui_at_rect(ui, inner_rect, |ui| {
         safe_set_min_size(ui, inner_rect.size());
+        add_contents(ui);
+    });
+}
+
+fn allocate_clipped_ui_at_rect(ui: &mut Ui, rect: Rect, add_contents: impl FnOnce(&mut Ui)) {
+    let clip_rect = rect.intersect(ui.clip_rect());
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.set_clip_rect(clip_rect);
         add_contents(ui);
     });
 }
@@ -8848,6 +9889,13 @@ fn draw_ui_icon(ui: &mut Ui, rect: Rect, icon: UiIcon, color: Color32) {
     });
 }
 
+fn paint_ui_icon(ui: &Ui, rect: Rect, icon: UiIcon, color: Color32) {
+    egui::Image::new(icon_source(icon))
+        .fit_to_exact_size(rect.size())
+        .tint(color)
+        .paint_at(ui, rect);
+}
+
 fn app_title_logo(ui: &mut Ui) {
     ui.add(
         egui::Image::new(egui::include_image!("../assets/icons/logo-ga.svg"))
@@ -9939,10 +10987,22 @@ fn draw_history_description(
     let painter = ui.painter().with_clip_rect(rect);
     let mut x = rect.left();
     let refs = commit_refs_for_display(commit, show_remote_refs);
+    let badge_font = FontId::monospace(11.0);
+    let badge_text_color = Color32::from_rgb(26, 65, 112);
     for name in refs.iter().take(3) {
-        let label = truncate_middle(name, 22);
-        let width = (label.chars().count() as f32 * 6.6 + 18.0).clamp(34.0, 142.0);
-        if x + width + 6.0 > rect.right() {
+        let label = history_ref_badge_label_for_width(
+            ui,
+            name,
+            badge_font.clone(),
+            badge_text_color,
+            HISTORY_REF_BADGE_MAX_WIDTH - HISTORY_REF_BADGE_X_PADDING * 2.0,
+        );
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label, badge_font.clone(), badge_text_color);
+        let width = (galley.size().x + HISTORY_REF_BADGE_X_PADDING * 2.0)
+            .clamp(HISTORY_REF_BADGE_MIN_WIDTH, HISTORY_REF_BADGE_MAX_WIDTH);
+        if x + width + HISTORY_REF_BADGE_GAP > rect.right() {
             break;
         }
         let badge_rect =
@@ -9957,14 +11017,16 @@ fn draw_history_description(
             Color32::from_rgb(218, 236, 255)
         };
         painter.rect_filled(badge_rect, CornerRadius::same(3), fill);
-        painter.text(
-            badge_rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::monospace(11.0),
-            Color32::from_rgb(26, 65, 112),
+        let text_rect = badge_rect.shrink2(Vec2::new(HISTORY_REF_BADGE_X_PADDING, 0.0));
+        let text_pos = Pos2::new(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y / 2.0,
         );
-        x += width + 6.0;
+        let text_clip = text_rect.intersect(rect).intersect(ui.clip_rect());
+        painter
+            .with_clip_rect(text_clip)
+            .galley(text_pos, galley, badge_text_color);
+        x += width + HISTORY_REF_BADGE_GAP;
     }
 
     let subject_x = x.max(rect.left()) + 2.0;
@@ -9979,6 +11041,29 @@ fn draw_history_description(
             theme::text()
         },
     );
+}
+
+fn history_ref_badge_label_for_width(
+    ui: &Ui,
+    value: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> String {
+    let original_chars = value.chars().count();
+    let mut max_chars = original_chars.min(22);
+    loop {
+        let label = truncate_middle(value, max_chars);
+        let width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), font.clone(), color)
+            .size()
+            .x;
+        if width <= max_width || max_chars <= 3 {
+            return label;
+        }
+        max_chars -= 1;
+    }
 }
 
 fn commit_refs_for_display(commit: &Commit, show_remote_refs: bool) -> Vec<String> {
@@ -11157,7 +12242,7 @@ fn repo_settings_tab_button(
         Pos2::new(rect.left() + 15.0, rect.center().y),
         Vec2::splat(13.0),
     );
-    draw_ui_icon(
+    paint_ui_icon(
         ui,
         icon_rect,
         icon,
@@ -11167,7 +12252,12 @@ fn repo_settings_tab_button(
             theme::muted()
         },
     );
-    ui.painter().text(
+    let text_clip = Rect::from_min_max(
+        Pos2::new(icon_rect.right() + 5.0, rect.top()),
+        Pos2::new(rect.right() - 6.0, rect.bottom()),
+    )
+    .intersect(ui.clip_rect());
+    ui.painter().with_clip_rect(text_clip).text(
         Pos2::new(icon_rect.right() + 5.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
@@ -11350,8 +12440,7 @@ fn tree_header_inner(
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let response = pointing_hand_cursor(response);
     let mut action_clicked = false;
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        ui.set_clip_rect(rect);
+    allocate_clipped_ui_at_rect(ui, rect, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(10.0);
             let (arrow_rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 18.0), Sense::hover());
@@ -11798,6 +12887,9 @@ fn branch_table_row(
     current: bool,
     remote: bool,
     name: &str,
+    upstream: Option<&str>,
+    remote_branch_names: &[String],
+    remotes: &[String],
     language: Language,
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
@@ -11842,7 +12934,18 @@ fn branch_table_row(
             );
         });
     });
-    branch_context_menu(response, current, remote, name, language, enabled, action)
+    branch_context_menu(
+        response,
+        current,
+        remote,
+        name,
+        upstream,
+        remote_branch_names,
+        remotes,
+        language,
+        enabled,
+        action,
+    )
 }
 
 fn branch_context_menu(
@@ -11850,15 +12953,18 @@ fn branch_context_menu(
     current: bool,
     remote: bool,
     name: &str,
+    upstream: Option<&str>,
+    remote_branch_names: &[String],
+    remotes: &[String],
     language: Language,
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
 ) -> egui::Response {
     response.context_menu(|ui| {
-        ui.set_min_width(200.0);
-        ui.label(RichText::new(name).color(theme::text()));
-        ui.separator();
+        ui.set_min_width(if remote { 220.0 } else { 270.0 });
         if remote {
+            ui.label(RichText::new(name).color(theme::text()));
+            ui.separator();
             if ui
                 .add_enabled(
                     enabled,
@@ -11887,7 +12993,7 @@ fn branch_context_menu(
             if ui
                 .add_enabled(
                     enabled && !current,
-                    egui::Button::new(i18n::t(language, "branch.checkout")),
+                    egui::Button::new(branch_checkout_menu_label(language, name)),
                 )
                 .clicked()
             {
@@ -11899,7 +13005,160 @@ fn branch_context_menu(
             if ui
                 .add_enabled(
                     enabled && !current,
-                    egui::Button::new(i18n::t(language, "branch.delete")),
+                    egui::Button::new(branch_merge_menu_label(language, name)),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::MergeIntoCurrent {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    enabled && !current,
+                    egui::Button::new(branch_rebase_menu_label(language, name)),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::RebaseCurrentOnto {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    enabled && upstream.is_some(),
+                    egui::Button::new(branch_fetch_menu_label(language, name)),
+                )
+                .clicked()
+            {
+                if let Some(remote_branch) = upstream {
+                    *action = Some(BranchMenuAction::FetchTracked {
+                        remote_branch: remote_branch.to_owned(),
+                    });
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    enabled && current && upstream.is_some(),
+                    egui::Button::new(i18n::t(language, "branch.pull_tracked")),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::PullTracked {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    enabled && current && upstream.is_some(),
+                    egui::Button::new(i18n::t(language, "branch.push_tracked")),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::PushTracked {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            ui.add_enabled_ui(enabled && !remotes.is_empty(), |ui| {
+                ui.menu_button(i18n::t(language, "branch.push_to"), |ui| {
+                    if remotes.is_empty() {
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(i18n::t(language, "branch.no_remotes")),
+                        );
+                    } else {
+                        for remote in remotes {
+                            if ui.button(remote).clicked() {
+                                *action = Some(BranchMenuAction::PushToRemote {
+                                    name: name.to_owned(),
+                                    remote: remote.clone(),
+                                });
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                });
+            });
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.menu_button(i18n::t(language, "branch.track_remote"), |ui| {
+                    for remote_branch in remote_branch_names {
+                        let selected = upstream == Some(remote_branch.as_str());
+                        if ui
+                            .add_enabled(
+                                !selected,
+                                egui::Button::new(branch_tracking_menu_label(
+                                    selected,
+                                    remote_branch,
+                                )),
+                            )
+                            .clicked()
+                        {
+                            *action = Some(BranchMenuAction::TrackRemote {
+                                name: name.to_owned(),
+                                remote_branch: Some(remote_branch.clone()),
+                            });
+                            ui.close_menu();
+                        }
+                    }
+                    if !remote_branch_names.is_empty() {
+                        ui.separator();
+                    }
+                    let selected = upstream.is_none();
+                    if ui
+                        .add_enabled(
+                            !selected,
+                            egui::Button::new(branch_tracking_menu_label(
+                                selected,
+                                i18n::t(language, "branch.no_remote_tracking"),
+                            )),
+                        )
+                        .clicked()
+                    {
+                        *action = Some(BranchMenuAction::TrackRemote {
+                            name: name.to_owned(),
+                            remote_branch: None,
+                        });
+                        ui.close_menu();
+                    }
+                });
+            });
+            ui.separator();
+            if ui
+                .add_enabled(
+                    enabled && !current,
+                    egui::Button::new(i18n::t(language, "branch.compare_with_current")),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::CompareWithCurrent {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    enabled && !current,
+                    egui::Button::new(branch_rename_menu_label(language, name)),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::Rename {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    enabled && !current,
+                    egui::Button::new(branch_delete_menu_label(language, name)),
                 )
                 .clicked()
             {
@@ -11908,9 +13167,76 @@ fn branch_context_menu(
                 });
                 ui.close_menu();
             }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    enabled && !remotes.is_empty(),
+                    egui::Button::new(i18n::t(language, "branch.create_pull_request")),
+                )
+                .clicked()
+            {
+                *action = Some(BranchMenuAction::CreatePullRequest {
+                    name: name.to_owned(),
+                });
+                ui.close_menu();
+            }
         }
     });
     response
+}
+
+fn branch_checkout_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => format!("\u{68c0}\u{51fa} {name}..."),
+        Language::English => format!("Checkout {name}..."),
+    }
+}
+
+fn branch_merge_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => {
+            format!("\u{5408}\u{5e76} {name} \u{81f3}\u{5f53}\u{524d}\u{5206}\u{652f}")
+        }
+        Language::English => format!("Merge {name} into current branch"),
+    }
+}
+
+fn branch_rebase_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => {
+            format!("\u{5c06}\u{5f53}\u{524d}\u{53d8}\u{66f4}\u{53d8}\u{57fa}\u{5230} {name}")
+        }
+        Language::English => format!("Rebase current changes onto {name}"),
+    }
+}
+
+fn branch_fetch_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => format!("\u{83b7}\u{53d6} {name}"),
+        Language::English => format!("Fetch {name}"),
+    }
+}
+
+fn branch_rename_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => format!("\u{91cd}\u{547d}\u{540d} {name}..."),
+        Language::English => format!("Rename {name}..."),
+    }
+}
+
+fn branch_delete_menu_label(language: Language, name: &str) -> String {
+    match language {
+        Language::Chinese => format!("\u{5220}\u{9664} {name}"),
+        Language::English => format!("Delete {name}"),
+    }
+}
+
+fn branch_tracking_menu_label(selected: bool, name: &str) -> String {
+    if selected {
+        format!("\u{2713} {name}")
+    } else {
+        format!("  {name}")
+    }
 }
 
 fn tag_table_row(
@@ -12090,7 +13416,12 @@ fn branch_row(
     current: bool,
     remote: bool,
     name: &str,
+    display_name: &str,
+    depth: usize,
+    upstream: Option<&str>,
     sync_counts: Option<UpstreamSyncCounts>,
+    remote_branch_names: &[String],
+    remotes: &[String],
     language: Language,
     enabled: bool,
     action: &mut Option<BranchMenuAction>,
@@ -12120,13 +13451,13 @@ fn branch_row(
     let badge_left =
         paint_branch_row_badges(ui, row_rect, current, remote, sync_counts, language, color)
             .unwrap_or(row_rect.right());
-    let name_left = rect.left() + if current { 22.0 } else { 16.0 };
+    let name_left = rect.left() + if current { 22.0 } else { 16.0 } + depth as f32 * 14.0;
     let name_right = (badge_left - 6.0).max(name_left);
     let name_rect = Rect::from_min_max(
         Pos2::new(name_left, rect.top()),
         Pos2::new(name_right, rect.bottom()),
     );
-    let mut name_text = RichText::new(name).color(if current {
+    let mut name_text = RichText::new(display_name).color(if current {
         theme::text()
     } else {
         theme::muted()
@@ -12149,52 +13480,18 @@ fn branch_row(
         }
     }
 
-    response.context_menu(|ui| {
-        ui.set_min_width(200.0);
-        ui.label(RichText::new(name).color(theme::text()));
-        ui.separator();
-        if remote {
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(i18n::t(language, "branch.checkout_remote")),
-                )
-                .clicked()
-            {
-                *action = Some(BranchMenuAction::CheckoutRemote {
-                    remote_branch: name.to_owned(),
-                });
-                ui.close_menu();
-            }
-        } else {
-            if ui
-                .add_enabled(
-                    enabled && !current,
-                    egui::Button::new(i18n::t(language, "branch.checkout")),
-                )
-                .clicked()
-            {
-                *action = Some(BranchMenuAction::Checkout {
-                    name: name.to_owned(),
-                });
-                ui.close_menu();
-            }
-            if ui
-                .add_enabled(
-                    enabled && !current,
-                    egui::Button::new(i18n::t(language, "branch.delete")),
-                )
-                .clicked()
-            {
-                *action = Some(BranchMenuAction::Delete {
-                    name: name.to_owned(),
-                });
-                ui.close_menu();
-            }
-        }
-    });
-
-    response
+    branch_context_menu(
+        response,
+        current,
+        remote,
+        name,
+        upstream,
+        remote_branch_names,
+        remotes,
+        language,
+        enabled,
+        action,
+    )
 }
 
 fn branch_current_indicator_rect(row_rect: Rect) -> Rect {
@@ -12331,14 +13628,14 @@ fn paint_branch_text_badge_at(
 }
 
 #[derive(Clone, Debug, Default)]
-struct RemoteBranchTreeNode {
+struct BranchTreeNode {
     name: String,
     path: String,
     full_name: Option<String>,
-    children: BTreeMap<String, RemoteBranchTreeNode>,
+    children: BTreeMap<String, BranchTreeNode>,
 }
 
-impl RemoteBranchTreeNode {
+impl BranchTreeNode {
     fn new(name: String, path: String) -> Self {
         Self {
             name,
@@ -12349,8 +13646,24 @@ impl RemoteBranchTreeNode {
     }
 }
 
-fn remote_branch_tree(branches: &[&git::Branch]) -> Vec<RemoteBranchTreeNode> {
-    let mut roots = BTreeMap::<String, RemoteBranchTreeNode>::new();
+fn local_branch_tree(branches: &[&git::Branch]) -> Vec<BranchTreeNode> {
+    let mut roots = BTreeMap::<String, BranchTreeNode>::new();
+    for branch in branches.iter().filter(|branch| !branch.remote) {
+        let segments = branch
+            .name
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+        insert_branch_node(&mut roots, &segments, &branch.name, String::new());
+    }
+    roots.into_values().collect()
+}
+
+fn remote_branch_tree(branches: &[&git::Branch]) -> Vec<BranchTreeNode> {
+    let mut roots = BTreeMap::<String, BranchTreeNode>::new();
     for branch in branches.iter().filter(|branch| branch.remote) {
         let segments = branch
             .name
@@ -12360,13 +13673,13 @@ fn remote_branch_tree(branches: &[&git::Branch]) -> Vec<RemoteBranchTreeNode> {
         if segments.len() < 2 {
             continue;
         }
-        insert_remote_branch_node(&mut roots, &segments, &branch.name, String::new());
+        insert_branch_node(&mut roots, &segments, &branch.name, String::new());
     }
     roots.into_values().collect()
 }
 
-fn insert_remote_branch_node(
-    nodes: &mut BTreeMap<String, RemoteBranchTreeNode>,
+fn insert_branch_node(
+    nodes: &mut BTreeMap<String, BranchTreeNode>,
     segments: &[&str],
     full_name: &str,
     parent_path: String,
@@ -12381,17 +13694,105 @@ fn insert_remote_branch_node(
     };
     let node = nodes
         .entry((*segment).to_owned())
-        .or_insert_with(|| RemoteBranchTreeNode::new((*segment).to_owned(), path.clone()));
+        .or_insert_with(|| BranchTreeNode::new((*segment).to_owned(), path.clone()));
     if rest.is_empty() {
         node.full_name = Some(full_name.to_owned());
     } else {
-        insert_remote_branch_node(&mut node.children, rest, full_name, path);
+        insert_branch_node(&mut node.children, rest, full_name, path);
+    }
+}
+
+fn local_branch_tree_rows(
+    ui: &mut Ui,
+    node: &BranchTreeNode,
+    depth: usize,
+    branches_by_name: &HashMap<&str, &git::Branch>,
+    pending_checkout: Option<&str>,
+    remote_branch_names: &[String],
+    remotes: &[String],
+    language: Language,
+    collapsed_groups: &mut HashSet<String>,
+    enabled: bool,
+    action: &mut Option<BranchMenuAction>,
+) {
+    if node.children.is_empty() {
+        if let Some(full_name) = &node.full_name
+            && let Some(branch) = branches_by_name.get(full_name.as_str())
+        {
+            branch_row(
+                ui,
+                branch_current_for_display(branch, pending_checkout),
+                false,
+                full_name,
+                &node.name,
+                depth,
+                branch
+                    .upstream
+                    .as_ref()
+                    .map(|upstream| upstream.name.as_str()),
+                upstream_sync_counts_for_branch(branch),
+                remote_branch_names,
+                remotes,
+                language,
+                enabled,
+                action,
+            );
+        }
+        return;
+    }
+
+    let collapsed = collapsed_groups.contains(&node.path);
+    if remote_branch_group_row(ui, node, depth, collapsed).clicked() {
+        if collapsed {
+            collapsed_groups.remove(&node.path);
+        } else {
+            collapsed_groups.insert(node.path.clone());
+        }
+    }
+    if !collapsed {
+        if let Some(full_name) = &node.full_name
+            && let Some(branch) = branches_by_name.get(full_name.as_str())
+        {
+            branch_row(
+                ui,
+                branch_current_for_display(branch, pending_checkout),
+                false,
+                full_name,
+                &node.name,
+                depth + 1,
+                branch
+                    .upstream
+                    .as_ref()
+                    .map(|upstream| upstream.name.as_str()),
+                upstream_sync_counts_for_branch(branch),
+                remote_branch_names,
+                remotes,
+                language,
+                enabled,
+                action,
+            );
+        }
+        for child in node.children.values() {
+            local_branch_tree_rows(
+                ui,
+                child,
+                depth + 1,
+                branches_by_name,
+                pending_checkout,
+                remote_branch_names,
+                remotes,
+                language,
+                collapsed_groups,
+                enabled,
+                action,
+            );
+        }
     }
 }
 
 fn remote_branch_tree_rows(
     ui: &mut Ui,
-    node: &RemoteBranchTreeNode,
+    node: &BranchTreeNode,
     depth: usize,
     language: Language,
     collapsed_groups: &mut HashSet<String>,
@@ -12430,7 +13831,7 @@ fn remote_branch_tree_rows(
 
 fn remote_branch_group_row(
     ui: &mut Ui,
-    node: &RemoteBranchTreeNode,
+    node: &BranchTreeNode,
     depth: usize,
     collapsed: bool,
 ) -> egui::Response {
@@ -12443,7 +13844,7 @@ fn remote_branch_group_row(
         );
     }
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+    allocate_clipped_ui_at_rect(ui, rect, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(12.0 + depth as f32 * 14.0);
             let (arrow_rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 18.0), Sense::hover());
@@ -12474,7 +13875,7 @@ fn remote_branch_row(
         );
     }
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+    allocate_clipped_ui_at_rect(ui, rect, |ui| {
         ui.horizontal(|ui| {
             ui.add_space(34.0 + depth as f32 * 14.0);
             ui.label(RichText::new(display_name).color(theme::muted()));
@@ -12548,7 +13949,7 @@ fn stash_row(
         );
     }
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+    allocate_clipped_ui_at_rect(ui, rect, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
@@ -12620,7 +14021,7 @@ fn tag_row(
         );
     }
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+    allocate_clipped_ui_at_rect(ui, rect, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
@@ -13050,14 +14451,31 @@ fn commit_context_menu(
         ui.close_menu();
     }
     ui.add_space(6.0);
-    ui.add_enabled(
-        false,
-        egui::Button::new(i18n::t(language, "menu.compare_worktree")),
-    );
-    ui.add_enabled(
-        false,
-        egui::Button::new(i18n::t(language, "menu.open_remote")),
-    );
+    ui.menu_button(i18n::t(language, "menu.compare"), |ui| {
+        if ui
+            .button(i18n::t(language, "menu.compare_worktree"))
+            .clicked()
+        {
+            action = Some(CommitMenuAction::CompareWithWorktree {
+                hash: commit.hash.clone(),
+                short_hash: commit.short_hash.clone(),
+            });
+            ui.close_menu();
+        }
+        if ui.button(i18n::t(language, "menu.external_diff")).clicked() {
+            action = Some(CommitMenuAction::ExternalDiff {
+                hash: commit.hash.clone(),
+                short_hash: commit.short_hash.clone(),
+            });
+            ui.close_menu();
+        }
+        if ui.button(i18n::t(language, "menu.open_remote")).clicked() {
+            action = Some(CommitMenuAction::OpenRemote {
+                hash: commit.hash.clone(),
+            });
+            ui.close_menu();
+        }
+    });
     action
 }
 
@@ -13648,6 +15066,21 @@ fn shortcut_pressed(ctx: &egui::Context, key: egui::Key, shift: bool) -> bool {
     })
 }
 
+fn stage_toggle_shortcut_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        let stage_toggle_modifiers = input.modifiers.shift
+            && (input.modifiers.ctrl || input.modifiers.command)
+            && !input.modifiers.alt;
+        let c_key_pressed = input.key_pressed(egui::Key::C);
+        let copy_event = input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Copy));
+
+        stage_toggle_modifiers && (c_key_pressed || copy_event)
+    })
+}
+
 fn shortcut_stage_toggle_action(snapshot: &RepositorySnapshot) -> Option<WorktreeMenuAction> {
     if !snapshot.unstaged.is_empty() {
         Some(WorktreeMenuAction::StageAll)
@@ -13876,6 +15309,328 @@ fn remote_web_url(remote_url: &str) -> Option<String> {
     }
 
     Some(strip_git_suffix(remote_url).to_owned())
+}
+
+fn branch_compare_url(base_url: &str, current_branch: &str, target_branch: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let current_branch = url_path_component(current_branch);
+    let target_branch = url_path_component(target_branch);
+    if base_url.contains("gitlab.") || base_url.contains("gitlab.com") {
+        format!("{base_url}/-/compare/{current_branch}...{target_branch}")
+    } else {
+        format!("{base_url}/compare/{current_branch}...{target_branch}")
+    }
+}
+
+fn branch_pull_request_url(base_url: &str, branch: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.contains("gitlab.") || base_url.contains("gitlab.com") {
+        return format!(
+            "{base_url}/-/merge_requests/new?merge_request%5Bsource_branch%5D={}",
+            url_query_component(branch)
+        );
+    }
+    format!("{base_url}/compare/{}?expand=1", url_path_component(branch))
+}
+
+fn split_remote_branch_name(name: &str) -> Option<(String, String)> {
+    let (remote, branch) = name.split_once('/')?;
+    if remote.trim().is_empty() || branch.trim().is_empty() {
+        return None;
+    }
+    Some((remote.to_owned(), branch.to_owned()))
+}
+
+fn push_remote_branch_default(
+    branch: &git::Branch,
+    remote: &str,
+    remote_branches: &[String],
+) -> String {
+    if let Some(upstream_branch) = branch
+        .upstream
+        .as_ref()
+        .and_then(|upstream| split_remote_branch_name(&upstream.name))
+        .and_then(|(upstream_remote, upstream_branch)| {
+            (upstream_remote == remote).then_some(upstream_branch)
+        })
+    {
+        return upstream_branch;
+    }
+    if remote_branches
+        .iter()
+        .any(|candidate| candidate == &branch.name)
+    {
+        return branch.name.clone();
+    }
+    String::new()
+}
+
+fn push_remote_branch_default_for_row(
+    row: &PushBranchRow,
+    remote: &str,
+    remote_branches: &[String],
+) -> String {
+    if let Some(upstream_branch) = row
+        .upstream
+        .as_deref()
+        .and_then(split_remote_branch_name)
+        .and_then(|(upstream_remote, upstream_branch)| {
+            (upstream_remote == remote).then_some(upstream_branch)
+        })
+    {
+        return upstream_branch;
+    }
+    if remote_branches
+        .iter()
+        .any(|candidate| candidate == &row.local_branch)
+    {
+        return row.local_branch.clone();
+    }
+    String::new()
+}
+
+fn push_remote_branch_choices(
+    local_branch: &str,
+    selected_branch: &str,
+    remote_branches: &[String],
+) -> Vec<String> {
+    let mut choices = Vec::new();
+    for branch in remote_branches {
+        if !choices.iter().any(|candidate| candidate == branch) {
+            choices.push(branch.clone());
+        }
+    }
+    for branch in [selected_branch, local_branch] {
+        if !branch.trim().is_empty() && !choices.iter().any(|candidate| candidate == branch) {
+            choices.push(branch.to_owned());
+        }
+    }
+    choices
+}
+
+fn push_remote_branch_column_width(table_width: f32) -> f32 {
+    (table_width
+        - PUSH_SELECT_COLUMN_WIDTH
+        - PUSH_LOCAL_BRANCH_COLUMN_WIDTH
+        - PUSH_TRACK_COLUMN_WIDTH
+        - PUSH_TABLE_COLUMN_GAP * 3.0)
+        .max(180.0)
+}
+
+fn push_remote_form_row(
+    ui: &mut Ui,
+    label: &str,
+    remote_url_display: &mut String,
+    add_remote_selector: impl FnOnce(&mut Ui),
+) {
+    let width = ui.available_width();
+    let (row_rect, _) = ui.allocate_exact_size(
+        Vec2::new(width, PUSH_REMOTE_FORM_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let label_rect = Rect::from_min_size(
+        row_rect.min,
+        Vec2::new(PUSH_REMOTE_FORM_LABEL_WIDTH, PUSH_REMOTE_FORM_ROW_HEIGHT),
+    );
+    paint_push_form_label(ui, label_rect, label);
+
+    let selector_rect = Rect::from_center_size(
+        Pos2::new(
+            label_rect.right() + PUSH_TABLE_COLUMN_GAP + PUSH_REMOTE_FORM_SELECTOR_WIDTH / 2.0,
+            row_rect.center().y,
+        ),
+        Vec2::new(
+            PUSH_REMOTE_FORM_SELECTOR_WIDTH,
+            PUSH_REMOTE_FORM_CONTROL_HEIGHT,
+        ),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(selector_rect),
+        |selector_ui| {
+            selector_ui.set_width(PUSH_REMOTE_FORM_SELECTOR_WIDTH);
+            selector_ui.spacing_mut().interact_size.y = PUSH_REMOTE_FORM_CONTROL_HEIGHT;
+            add_remote_selector(selector_ui);
+        },
+    );
+
+    let url_left = selector_rect.right() + PUSH_TABLE_COLUMN_GAP;
+    let url_width = (row_rect.right() - url_left).max(120.0);
+    let url_rect = Rect::from_center_size(
+        Pos2::new(url_left + url_width / 2.0, row_rect.center().y),
+        Vec2::new(url_width, PUSH_REMOTE_FORM_CONTROL_HEIGHT),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(url_rect), |url_ui| {
+        themed_text_edit_selection(url_ui);
+        url_ui.add_enabled_ui(false, |url_ui| {
+            url_ui.add_sized(
+                [url_width, PUSH_REMOTE_FORM_CONTROL_HEIGHT],
+                themed_singleline_text_edit(remote_url_display, "").desired_width(url_width),
+            );
+        });
+    });
+}
+
+fn paint_push_form_label(ui: &mut Ui, rect: Rect, label: &str) {
+    ui.painter().with_clip_rect(rect).text(
+        Pos2::new(rect.left(), rect.center().y + 1.0),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        theme::muted(),
+    );
+}
+
+fn push_branch_table_header(
+    ui: &mut Ui,
+    table_width: f32,
+    select_label: &str,
+    local_branch_label: &str,
+    remote_branch_label: &str,
+    track_label: &str,
+) {
+    let remote_width = push_remote_branch_column_width(table_width);
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(table_width, 24.0), Sense::hover());
+    let (select_rect, local_rect, remote_rect, track_rect) =
+        push_branch_cell_rects(row_rect, remote_width);
+    paint_push_branch_text_cell(ui, select_rect, select_label, theme::muted(), 12.0);
+    paint_push_branch_text_cell(ui, local_rect, local_branch_label, theme::muted(), 12.0);
+    paint_push_branch_text_cell(ui, remote_rect, remote_branch_label, theme::muted(), 12.0);
+    paint_push_branch_text_cell(ui, track_rect, track_label, theme::muted(), 12.0);
+}
+
+fn push_branch_cell_rects(row_rect: Rect, remote_width: f32) -> (Rect, Rect, Rect, Rect) {
+    let select_rect = Rect::from_min_size(
+        row_rect.min,
+        Vec2::new(PUSH_SELECT_COLUMN_WIDTH, row_rect.height()),
+    );
+    let local_rect = Rect::from_min_size(
+        Pos2::new(select_rect.right() + PUSH_TABLE_COLUMN_GAP, row_rect.top()),
+        Vec2::new(PUSH_LOCAL_BRANCH_COLUMN_WIDTH, row_rect.height()),
+    );
+    let remote_rect = Rect::from_min_size(
+        Pos2::new(local_rect.right() + PUSH_TABLE_COLUMN_GAP, row_rect.top()),
+        Vec2::new(remote_width, row_rect.height()),
+    );
+    let track_rect = Rect::from_min_size(
+        Pos2::new(remote_rect.right() + PUSH_TABLE_COLUMN_GAP, row_rect.top()),
+        Vec2::new(PUSH_TRACK_COLUMN_WIDTH, row_rect.height()),
+    );
+    (select_rect, local_rect, remote_rect, track_rect)
+}
+
+fn paint_push_branch_text_cell(ui: &mut Ui, rect: Rect, text: &str, color: Color32, size: f32) {
+    ui.painter().with_clip_rect(rect).text(
+        Pos2::new(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(size),
+        color,
+    );
+}
+
+fn paint_push_branch_body_text_cell(
+    ui: &mut Ui,
+    rect: Rect,
+    text: &str,
+    color: Color32,
+    size: f32,
+) {
+    ui.painter().with_clip_rect(rect).text(
+        Pos2::new(rect.left(), rect.center().y + PUSH_TABLE_BODY_TEXT_Y_OFFSET),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(size),
+        color,
+    );
+}
+
+fn push_branch_table_row(
+    ui: &mut Ui,
+    table_width: f32,
+    row: &mut PushBranchRow,
+    remote_branches: &[String],
+) {
+    let remote_width = push_remote_branch_column_width(table_width);
+    let (row_rect, _) = ui.allocate_exact_size(
+        Vec2::new(table_width, PUSH_TABLE_ROW_HEIGHT),
+        Sense::hover(),
+    );
+    let (select_rect, local_rect, remote_rect, track_rect) =
+        push_branch_cell_rects(row_rect, remote_width);
+
+    let was_selected = row.selected;
+    ui.put(
+        Rect::from_center_size(select_rect.center(), Vec2::splat(20.0)),
+        egui::Checkbox::new(&mut row.selected, ""),
+    );
+    if row.selected && !was_selected && row.remote_branch.trim().is_empty() {
+        row.remote_branch = row.local_branch.clone();
+    }
+
+    paint_push_branch_body_text_cell(
+        ui,
+        local_rect,
+        row.local_branch.as_str(),
+        theme::text(),
+        14.0,
+    );
+
+    let choices =
+        push_remote_branch_choices(&row.local_branch, &row.remote_branch, remote_branches);
+    let combo_rect = Rect::from_center_size(
+        remote_rect.center(),
+        Vec2::new(remote_rect.width(), PUSH_REMOTE_FORM_CONTROL_HEIGHT),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
+        ui.set_width(remote_rect.width());
+        egui::ComboBox::from_id_salt(("push_remote_branch_selector", row.local_branch.as_str()))
+            .width(remote_rect.width())
+            .selected_text(row.remote_branch.as_str())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut row.remote_branch, String::new(), "");
+                for branch in choices {
+                    ui.selectable_value(&mut row.remote_branch, branch.clone(), branch);
+                }
+            });
+    });
+
+    ui.put(
+        Rect::from_center_size(track_rect.center(), Vec2::splat(20.0)),
+        egui::Checkbox::new(&mut row.track, ""),
+    );
+}
+
+fn commit_remote_url(base_url: &str, hash: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let hash = url_path_component(hash);
+    if base_url.contains("gitlab.") || base_url.contains("gitlab.com") {
+        format!("{base_url}/-/commit/{hash}")
+    } else {
+        format!("{base_url}/commit/{hash}")
+    }
+}
+
+fn url_path_component(value: &str) -> String {
+    url_component(value, true)
+}
+
+fn url_query_component(value: &str) -> String {
+    url_component(value, false)
+}
+
+fn url_component(value: &str, keep_slash: bool) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        let safe = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && byte == b'/');
+        if safe {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn strip_git_suffix(value: &str) -> &str {
@@ -14331,6 +16086,46 @@ mod ui_tests {
     }
 
     #[test]
+    fn sidebar_scroll_children_preserve_parent_clip_rect() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("fn allocate_clipped_ui_at_rect("));
+        assert!(implementation_source.contains("rect.intersect(ui.clip_rect())"));
+
+        for (start_marker, end_marker) in [
+            ("fn tree_header_inner(", "fn tree_empty("),
+            ("fn remote_branch_group_row(", "fn remote_branch_row("),
+            ("fn remote_branch_row(", "fn remote_empty_label("),
+            ("fn stash_row(", "fn tag_row("),
+            ("fn tag_row(", "enum WorktreeTreeRow"),
+        ] {
+            let start = implementation_source
+                .find(start_marker)
+                .unwrap_or_else(|| panic!("{start_marker}"));
+            let end = implementation_source[start..]
+                .find(end_marker)
+                .unwrap_or_else(|| panic!("{end_marker}"));
+            let block = &implementation_source[start..start + end];
+            assert!(
+                block.contains("allocate_clipped_ui_at_rect(ui, rect"),
+                "{start_marker} must keep row rendering clipped to the parent ScrollArea"
+            );
+            assert!(!block.contains("ui.set_clip_rect(rect)"));
+            assert!(!block.contains("egui::UiBuilder::new().max_rect(rect)"));
+        }
+
+        let panel_start = implementation_source
+            .find("fn exact_panel_at_rect(")
+            .unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn panel_shadow(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        assert!(panel_source.contains("allocate_clipped_ui_at_rect(ui, inner_rect"));
+    }
+
+    #[test]
     fn sidebar_branch_tree_owns_current_branch_state() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -14548,6 +16343,52 @@ mod ui_tests {
         let source = include_str!("app.rs");
         assert!(source.contains("remote_branch_collapsed_groups: HashSet<String>"));
         assert!(source.contains("remote_branch_tree_rows("));
+    }
+
+    #[test]
+    fn local_branch_tree_groups_slash_separated_paths() {
+        let branches = [
+            git::Branch {
+                name: "f/UI-2.1".to_owned(),
+                remote: false,
+                current: true,
+                upstream: None,
+            },
+            git::Branch {
+                name: "f/amp-chat".to_owned(),
+                remote: false,
+                current: false,
+                upstream: None,
+            },
+            git::Branch {
+                name: "master".to_owned(),
+                remote: false,
+                current: false,
+                upstream: None,
+            },
+        ];
+        let branch_refs = branches.iter().collect::<Vec<_>>();
+
+        let tree = local_branch_tree(&branch_refs);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].name, "f");
+        assert!(tree[0].children.contains_key("UI-2.1"));
+        assert_eq!(
+            tree[0].children["UI-2.1"].full_name.as_deref(),
+            Some("f/UI-2.1")
+        );
+        assert_eq!(
+            tree[0].children["amp-chat"].full_name.as_deref(),
+            Some("f/amp-chat")
+        );
+        assert_eq!(tree[1].full_name.as_deref(), Some("master"));
+
+        let source = include_str!("app.rs");
+        assert!(source.contains("local_branch_collapsed_groups: HashSet<String>"));
+        assert!(source.contains("local_branch_tree_rows("));
+        assert!(source.contains("branch_row("));
+        assert!(source.contains("display_name"));
     }
 
     #[test]
@@ -14825,6 +16666,26 @@ mod ui_tests {
     }
 
     #[test]
+    fn history_ref_badges_use_measured_text_and_inner_clip() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation_source
+            .find("fn draw_history_description(")
+            .unwrap();
+        let end = implementation_source[start..]
+            .find("fn commit_refs_for_display(")
+            .unwrap();
+        let desc_source = &implementation_source[start..start + end];
+
+        assert!(desc_source.contains("history_ref_badge_label_for_width("));
+        assert!(desc_source.contains("layout_no_wrap("));
+        assert!(desc_source.contains("galley.size().x"));
+        assert!(desc_source.contains("with_clip_rect(text_clip"));
+        assert!(!desc_source.contains("label.chars().count() as f32 * 6.6"));
+        assert!(!desc_source.contains("Align2::CENTER_CENTER"));
+    }
+
+    #[test]
     fn history_sort_dropdown_offers_date_and_topology_order() {
         assert_eq!(
             history_sort_order_label(Language::Chinese, HistorySortOrder::Date),
@@ -14967,6 +16828,99 @@ mod ui_tests {
         assert!(panel_source.contains("self.tr(\"commit.button.short\")"));
         assert!(panel_source.contains("commit_history_menu("));
         assert!(panel_source.contains("commit_options_menu("));
+    }
+
+    #[test]
+    fn commit_context_menu_groups_compare_actions_in_submenu() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source
+            .find("fn commit_context_menu(")
+            .unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn detail_line(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+
+        assert!(menu_source.contains("ui.menu_button(i18n::t(language, \"menu.compare\")"));
+        assert!(menu_source.contains("CommitMenuAction::CompareWithWorktree"));
+        assert!(menu_source.contains("CommitMenuAction::ExternalDiff"));
+        assert!(menu_source.contains("CommitMenuAction::OpenRemote"));
+        assert!(!menu_source.contains("ui.add_enabled(\n        false"));
+        assert!(
+            !menu_source
+                .contains("egui::Button::new(i18n::t(language, \"menu.compare_worktree\"))")
+        );
+        assert!(
+            !menu_source.contains("egui::Button::new(i18n::t(language, \"menu.open_remote\"))")
+        );
+
+        let handler_start = implementation_source
+            .find("fn handle_commit_menu_action(")
+            .unwrap();
+        let handler_end = implementation_source[handler_start..]
+            .find("fn handle_worktree_action(")
+            .unwrap();
+        let handler_source = &implementation_source[handler_start..handler_start + handler_end];
+        assert!(handler_source.contains("CommitMenuAction::CompareWithWorktree"));
+        assert!(handler_source.contains("CommitMenuAction::ExternalDiff"));
+        assert!(handler_source.contains("CommitMenuAction::OpenRemote"));
+        assert!(handler_source.contains("self.open_commit_diff_tool("));
+        assert!(handler_source.contains("self.open_commit_remote_url("));
+
+        let diff_tool_start = implementation_source
+            .find("fn open_commit_diff_tool(")
+            .unwrap();
+        let diff_tool_end = implementation_source[diff_tool_start..]
+            .find("fn default_remote_web_url(")
+            .unwrap();
+        let diff_tool_source =
+            &implementation_source[diff_tool_start..diff_tool_start + diff_tool_end];
+        assert!(diff_tool_source.contains(".arg(\"worktree\")"));
+        assert!(!diff_tool_source.contains(".arg(\"working tree\")"));
+    }
+
+    #[test]
+    fn commit_submission_uses_async_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let commit_start = implementation_source
+            .find("fn commit_current_message(&mut self")
+            .unwrap();
+        let commit_end = implementation_source[commit_start..]
+            .find("fn show_toast(")
+            .unwrap();
+        let commit_source = &implementation_source[commit_start..commit_start + commit_end];
+        assert!(commit_source.contains("self.loading_repo || self.remote_git_busy()"));
+        assert!(commit_source.contains("self.start_remote_git_action(move |root|"));
+        assert!(!commit_source.contains("self.execute_git_action(move |root|"));
+
+        let panel_start = implementation_source.find("fn commit_panel(").unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn commit_action_row(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        assert!(panel_source.contains("&& !self.loading_repo"));
+        assert!(panel_source.contains("&& !self.remote_git_busy()"));
+    }
+
+    #[test]
+    fn generic_git_actions_use_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let action_start = implementation_source
+            .find("fn execute_git_action(")
+            .unwrap();
+        let action_end = implementation_source[action_start..]
+            .find("fn branch_checkout_busy(")
+            .unwrap();
+        let action_source = &implementation_source[action_start..action_start + action_end];
+        assert!(action_source.contains("Send + 'static"));
+        assert!(action_source.contains("self.start_remote_git_action(action);"));
+        assert!(!action_source.contains("match action(&root)"));
+        assert!(!action_source.contains("self.load_repository(root)"));
     }
 
     #[test]
@@ -15671,13 +17625,16 @@ mod ui_tests {
         assert!(toolbar_source.contains("let pull_label = toolbar_sync_label("));
         assert!(toolbar_source.contains("let push_label = toolbar_sync_label("));
 
-        let sidebar_start = implementation_source.find("fn sidebar(").unwrap();
-        let sidebar_end = implementation_source[sidebar_start..]
-            .find("fn workspace_view(")
+        let local_branch_tree_start = implementation_source
+            .find("fn local_branch_tree_rows(")
             .unwrap();
-        let sidebar_source = &implementation_source[sidebar_start..sidebar_start + sidebar_end];
-        assert!(!sidebar_source.contains("branch.current.then_some(upstream_counts)"));
-        assert!(sidebar_source.contains("upstream_sync_counts_for_branch(branch)"));
+        let local_branch_tree_end = implementation_source[local_branch_tree_start..]
+            .find("fn remote_branch_tree_rows(")
+            .unwrap();
+        let local_branch_tree_source = &implementation_source
+            [local_branch_tree_start..local_branch_tree_start + local_branch_tree_end];
+        assert!(!local_branch_tree_source.contains("branch.current.then_some(upstream_counts)"));
+        assert!(local_branch_tree_source.contains("upstream_sync_counts_for_branch(branch)"));
 
         let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
         let branch_row_end = implementation_source[branch_row_start..]
@@ -15745,6 +17702,76 @@ mod ui_tests {
         snapshot.staged = Vec::new();
         snapshot.unstaged = Vec::new();
         assert!(shortcut_stage_toggle_action(&snapshot).is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_c_stage_toggle_uses_reserved_shortcut_path() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let helper_start = implementation_source
+            .find("fn stage_toggle_shortcut_pressed(")
+            .unwrap();
+        let helper_end = implementation_source[helper_start..]
+            .find("fn shortcut_stage_toggle_action(")
+            .unwrap();
+        let helper_source = &implementation_source[helper_start..helper_start + helper_end];
+        assert!(helper_source.contains("input.key_pressed(egui::Key::C)"));
+        assert!(helper_source.contains("egui::Event::Copy"));
+        assert!(helper_source.contains("input.modifiers.shift"));
+        assert!(helper_source.contains("input.modifiers.ctrl || input.modifiers.command"));
+        assert!(helper_source.contains("!input.modifiers.alt"));
+
+        let shortcuts_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcuts_end = implementation_source[shortcuts_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcuts_source =
+            &implementation_source[shortcuts_start..shortcuts_start + shortcuts_end];
+        let stage_shortcut_index = shortcuts_source
+            .find("stage_toggle_shortcut_pressed(ctx)")
+            .unwrap();
+        let text_input_guard_index = shortcuts_source.find("ctx.wants_keyboard_input()").unwrap();
+        assert!(stage_shortcut_index < text_input_guard_index);
+
+        let stage_shortcut_block = &shortcuts_source[stage_shortcut_index..text_input_guard_index];
+        assert!(stage_shortcut_block.contains("self.pending_toolbar_single_click = None;"));
+        assert!(stage_shortcut_block.contains("shortcut_stage_toggle_action"));
+        assert!(stage_shortcut_block.contains("self.handle_worktree_action(action);"));
+    }
+
+    #[test]
+    fn ctrl_shift_c_stage_toggle_accepts_egui_copy_event() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..Default::default()
+            },
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+
+        assert!(stage_toggle_shortcut_pressed(&ctx));
+        let _ = ctx.end_pass();
+
+        let plain_copy_ctx = egui::Context::default();
+        plain_copy_ctx.begin_pass(egui::RawInput {
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        });
+
+        assert!(!stage_toggle_shortcut_pressed(&plain_copy_ctx));
+        let _ = plain_copy_ctx.end_pass();
     }
 
     #[test]
@@ -16223,7 +18250,7 @@ diff --git a/file.txt b/file.txt
             ("fn remote_branch_group_row(", "fn remote_branch_row("),
             ("fn remote_branch_row(", "fn remote_empty_label("),
             ("fn stash_row(", "fn tag_row("),
-            ("fn tag_row(", "fn remote_settings_table("),
+            ("fn tag_row(", "enum WorktreeTreeRow"),
         ] {
             let start = source
                 .find(start_marker)
@@ -16258,6 +18285,16 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("!repo_action_busy && has_repo && has_remote"));
         assert!(implementation_source.contains("if self.remote_git_busy()"));
 
+        let remote_action_start = implementation_source
+            .find("fn start_remote_git_action(")
+            .unwrap();
+        let remote_action_end = implementation_source[remote_action_start..]
+            .find("fn fetch_all(")
+            .unwrap();
+        let remote_action_source =
+            &implementation_source[remote_action_start..remote_action_start + remote_action_end];
+        assert!(remote_action_source.contains("self.loading_repo = true;"));
+
         let remote_task_start = implementation_source
             .find("if let Some(receiver) = self.remote_git_task.take()")
             .unwrap();
@@ -16266,7 +18303,8 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let remote_task_source =
             &implementation_source[remote_task_start..remote_task_start + remote_task_end];
-        assert!(remote_task_source.contains("self.load_repository(root)"));
+        assert!(remote_task_source.contains("self.load_repository_uncached(root)"));
+        assert!(remote_task_source.contains("self.loading_repo = false"));
         assert!(
             !remote_task_source.contains("self.show_toast(self.tr(\"status.action_completed\"))")
         );
@@ -16274,6 +18312,333 @@ diff --git a/file.txt b/file.txt
             !remote_task_source.contains(
                 "self.last_notice = Some(self.tr(\"status.action_completed\").to_owned())"
             )
+        );
+    }
+
+    #[test]
+    fn pull_action_uses_dialog_with_remote_branch_and_options() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("pending_pull_action: Option<PullActionDialog>"));
+        assert!(implementation_source.contains("struct PullActionDialog"));
+        assert!(implementation_source.contains("fn open_pull_dialog("));
+        assert!(implementation_source.contains("fn pull_action_modal("));
+        assert!(implementation_source.contains("git::pull_from_remote("));
+        assert!(implementation_source.contains("git::fetch_remote("));
+
+        let pull_current_start = implementation_source.find("fn pull_current(").unwrap();
+        let pull_current_end = implementation_source[pull_current_start..]
+            .find("fn quick_pull_current(")
+            .unwrap();
+        let pull_current_source =
+            &implementation_source[pull_current_start..pull_current_start + pull_current_end];
+        assert!(pull_current_source.contains("self.open_pull_dialog(None);"));
+
+        let pull_dialog_start = implementation_source.find("fn open_pull_dialog(").unwrap();
+        let pull_dialog_end = implementation_source[pull_dialog_start..]
+            .find("fn remote_names(")
+            .unwrap();
+        let pull_dialog_source =
+            &implementation_source[pull_dialog_start..pull_dialog_start + pull_dialog_end];
+        assert!(!pull_dialog_source.contains("git::pull(root)"));
+        assert!(
+            pull_dialog_source
+                .contains(".find(|branch| !branch.remote && branch.name == local_branch)")
+        );
+        assert!(pull_dialog_source.contains("split_remote_branch_name(&upstream.name)"));
+
+        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_end = implementation_source[toolbar_start..]
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        assert!(toolbar_source.contains("RepoToolbarAction::Pull"));
+
+        let branch_handler_start = implementation_source
+            .find("fn handle_branch_action(&mut self, action: BranchMenuAction)")
+            .unwrap();
+        let branch_handler_end = implementation_source[branch_handler_start..]
+            .find("fn handle_tag_action(")
+            .unwrap();
+        let branch_handler_source =
+            &implementation_source[branch_handler_start..branch_handler_start + branch_handler_end];
+        assert!(branch_handler_source.contains("self.open_pull_dialog(Some(name));"));
+
+        let modal_start = implementation_source.find("fn pull_action_modal(").unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn commit_action_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        for needle in [
+            "pull.remote",
+            "pull.remote_branch",
+            "pull.local_branch",
+            "pull.commit_merge",
+            "pull.include_tags",
+            "pull.force_merge_commit",
+            "pull.rebase",
+            "pull.refresh",
+        ] {
+            assert!(modal_source.contains(needle));
+        }
+    }
+
+    #[test]
+    fn fetch_action_uses_dialog_with_options_icon_and_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("pending_fetch_action: Option<FetchActionDialog>"));
+        assert!(implementation_source.contains("struct FetchActionDialog"));
+        assert!(implementation_source.contains("fn open_fetch_dialog("));
+        assert!(implementation_source.contains("fn fetch_action_modal("));
+        assert!(implementation_source.contains("git::fetch_with_options("));
+
+        let fetch_start = implementation_source.find("fn fetch_all(").unwrap();
+        let fetch_end = implementation_source[fetch_start..]
+            .find("fn pull_current(")
+            .unwrap();
+        let fetch_source = &implementation_source[fetch_start..fetch_start + fetch_end];
+        assert!(fetch_source.contains("self.open_fetch_dialog();"));
+        assert!(!fetch_source.contains("git::fetch(root)"));
+
+        let modal_start = implementation_source
+            .find("fn fetch_action_modal(")
+            .unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn pull_action_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        for needle in [
+            "fetch.title",
+            "fetch.all_remotes",
+            "fetch.prune_tracking",
+            "fetch.tags",
+            "fetch.force_tags",
+            "dialog.ok",
+            "dialog.cancel",
+            "FetchOptions",
+        ] {
+            assert!(modal_source.contains(needle), "{needle}");
+        }
+        assert!(modal_source.contains("add_enabled_ui(dialog.fetch_tags"));
+
+        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_end = implementation_source[toolbar_start..]
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        assert!(toolbar_source.contains("RepoToolbarAction::Fetch"));
+
+        let update_start = implementation_source
+            .find("impl App for GitAgentApp")
+            .unwrap();
+        let update_end = implementation_source[update_start..]
+            .find("impl GitAgentApp")
+            .unwrap();
+        let update_source = &implementation_source[update_start..update_start + update_end];
+        assert!(update_source.contains("self.fetch_action_modal(ctx);"));
+
+        let icon_source = include_str!("../assets/icons/fetch.svg");
+        assert!(icon_source.contains("stroke-dasharray"));
+        assert!(icon_source.contains("M12"));
+        assert!(!icon_source.contains("M3 12a9 9"));
+    }
+
+    #[test]
+    fn repo_toolbar_actions_support_double_click_and_shift_shortcut_quick_paths() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("const TOOLBAR_DOUBLE_CLICK_DELAY"));
+        assert!(
+            implementation_source
+                .contains("pending_toolbar_single_click: Option<PendingToolbarClick>")
+        );
+        assert!(implementation_source.contains("struct PendingToolbarClick"));
+        assert!(implementation_source.contains("enum RepoToolbarAction"));
+        assert!(implementation_source.contains("fn handle_repo_toolbar_action_response("));
+        assert!(implementation_source.contains("fn flush_pending_toolbar_single_click("));
+        assert!(implementation_source.contains("fn run_quick_toolbar_action("));
+        assert!(implementation_source.contains("fn open_toolbar_action_dialog("));
+        assert!(implementation_source.contains("self.flush_pending_toolbar_single_click(ctx);"));
+
+        let handler_start = implementation_source
+            .find("fn handle_repo_toolbar_action_response(")
+            .unwrap();
+        let handler_end = implementation_source[handler_start..]
+            .find("fn flush_pending_toolbar_single_click(")
+            .unwrap();
+        let handler_source = &implementation_source[handler_start..handler_start + handler_end];
+        assert!(handler_source.contains("response.double_clicked()"));
+        assert!(handler_source.contains("self.run_quick_toolbar_action(action);"));
+        assert!(handler_source.contains("response.clicked()"));
+        assert!(
+            handler_source.contains("self.pending_toolbar_single_click = Some(PendingToolbarClick")
+        );
+
+        let flush_start = implementation_source
+            .find("fn flush_pending_toolbar_single_click(")
+            .unwrap();
+        let flush_end = implementation_source[flush_start..]
+            .find("fn open_toolbar_action_dialog(")
+            .unwrap();
+        let flush_source = &implementation_source[flush_start..flush_start + flush_end];
+        assert!(flush_source.contains("self.open_toolbar_action_dialog(pending.action);"));
+
+        let dialog_start = implementation_source
+            .find("fn open_toolbar_action_dialog(")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn run_quick_toolbar_action(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for needle in [
+            "self.pull_current()",
+            "self.push_current()",
+            "self.fetch_all()",
+        ] {
+            assert!(dialog_source.contains(needle), "{needle}");
+        }
+
+        let quick_start = implementation_source
+            .find("fn run_quick_toolbar_action(")
+            .unwrap();
+        let quick_end = implementation_source[quick_start..]
+            .find("fn open_push_dialog(")
+            .unwrap();
+        let quick_source = &implementation_source[quick_start..quick_start + quick_end];
+        for needle in [
+            "self.quick_pull_current()",
+            "self.quick_push_current()",
+            "self.quick_fetch_all()",
+            "git::pull(root)",
+            "git::push(root)",
+            "git::fetch_with_options(root, git::FetchOptions::default())",
+        ] {
+            assert!(quick_source.contains(needle), "{needle}");
+        }
+
+        let shortcuts_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcuts_end = implementation_source[shortcuts_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcuts_source =
+            &implementation_source[shortcuts_start..shortcuts_start + shortcuts_end];
+        for needle in [
+            "shortcut_pressed(ctx, egui::Key::P, true)",
+            "self.quick_push_current();",
+            "shortcut_pressed(ctx, egui::Key::P, false)",
+            "self.push_current();",
+            "shortcut_pressed(ctx, egui::Key::L, true)",
+            "self.quick_pull_current();",
+            "shortcut_pressed(ctx, egui::Key::L, false)",
+            "self.pull_current();",
+            "shortcut_pressed(ctx, egui::Key::F, true)",
+            "self.quick_fetch_all();",
+            "shortcut_pressed(ctx, egui::Key::F, false)",
+            "self.fetch_all();",
+        ] {
+            assert!(shortcuts_source.contains(needle), "{needle}");
+        }
+
+        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_end = implementation_source[toolbar_start..]
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        for needle in [
+            "let pull_response = toolbar_button(",
+            "RepoToolbarAction::Pull",
+            "let push_response = toolbar_button(",
+            "RepoToolbarAction::Push",
+            "let fetch_response = toolbar_button(",
+            "RepoToolbarAction::Fetch",
+        ] {
+            assert!(toolbar_source.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn push_action_uses_dialog_with_branch_rows_options_and_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("pending_push_action: Option<PushActionDialog>"));
+        assert!(implementation_source.contains("struct PushActionDialog"));
+        assert!(implementation_source.contains("struct PushBranchRow"));
+        assert!(implementation_source.contains("fn open_push_dialog("));
+        assert!(implementation_source.contains("fn push_action_modal("));
+        assert!(implementation_source.contains("git::push_selected("));
+
+        let push_start = implementation_source.find("fn push_current(").unwrap();
+        let push_end = implementation_source[push_start..]
+            .find("fn quick_push_current(")
+            .unwrap();
+        let push_source = &implementation_source[push_start..push_start + push_end];
+        assert!(push_source.contains("self.open_push_dialog(None, None);"));
+        assert!(!push_source.contains("git::push(root)"));
+        assert!(!push_source.contains("git::push_set_upstream(root"));
+
+        let branch_handler_start = implementation_source
+            .find("fn handle_branch_action(&mut self, action: BranchMenuAction)")
+            .unwrap();
+        let branch_handler_end = implementation_source[branch_handler_start..]
+            .find("fn handle_tag_action(")
+            .unwrap();
+        let branch_handler_source =
+            &implementation_source[branch_handler_start..branch_handler_start + branch_handler_end];
+        assert!(branch_handler_source.contains("self.open_push_dialog(Some(name), None);"));
+        assert!(branch_handler_source.contains("self.open_push_dialog(Some(name), Some(remote));"));
+        assert!(!branch_handler_source.contains("git::push_branch_to_remote(root"));
+
+        let modal_start = implementation_source.find("fn push_action_modal(").unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn commit_action_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        for needle in [
+            "push.remote",
+            "push.local_branch",
+            "push.remote_branch",
+            "push.track",
+            "push.select",
+            "push.select_all",
+            "push.push_tags",
+            "push.force",
+            "selected_push_branches",
+        ] {
+            assert!(modal_source.contains(needle), "{needle}");
+        }
+        assert!(modal_source.contains("push_remote_form_row("));
+        assert!(modal_source.contains("push_branch_table_header("));
+        assert!(modal_source.contains("push_branch_table_row("));
+        assert!(!modal_source.contains("egui::Grid::new(\"push_branch_grid\")"));
+        assert!(implementation_source.contains(".desired_width(url_width)"));
+        assert!(implementation_source.contains("PUSH_SELECT_COLUMN_WIDTH"));
+        assert!(implementation_source.contains("PUSH_LOCAL_BRANCH_COLUMN_WIDTH"));
+        assert!(implementation_source.contains("PUSH_TRACK_COLUMN_WIDTH"));
+        assert!(implementation_source.contains("const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;"));
+        assert!(implementation_source.contains("PUSH_TABLE_BODY_TEXT_Y_OFFSET"));
+        assert!(implementation_source.contains("fn push_branch_cell_rects("));
+        assert!(implementation_source.contains("fn paint_push_branch_text_cell("));
+        assert!(implementation_source.contains("fn push_remote_form_row("));
+        assert!(implementation_source.contains("fn paint_push_form_label("));
+        assert!(implementation_source.contains("paint_push_branch_body_text_cell("));
+        assert!(implementation_source.contains(
+            "selector_ui.spacing_mut().interact_size.y = PUSH_REMOTE_FORM_CONTROL_HEIGHT"
+        ));
+        assert!(implementation_source.contains("url_ui.add_sized("));
+        assert!(implementation_source.contains("[url_width, PUSH_REMOTE_FORM_CONTROL_HEIGHT]"));
+        assert!(implementation_source.contains("Rect::from_center_size"));
+        assert!(implementation_source.contains("Align2::LEFT_CENTER"));
+
+        let i18n_source = include_str!("i18n.rs");
+        assert!(
+            i18n_source.contains("(\"push.select\", \"\\u{662f}\\u{5426}\\u{63a8}\\u{9001}\")")
         );
     }
 
@@ -16325,9 +18690,14 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("pending_branch_checkout: Option<String>"));
         assert!(implementation_source.contains("fn branch_checkout_busy(&self) -> bool"));
         assert!(
-            implementation_source.contains("fn start_branch_checkout(&mut self, name: String)")
+            implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
         );
-        assert!(implementation_source.contains("self.start_branch_checkout(name);"));
+        assert!(
+            implementation_source.contains(
+                "fn start_branch_checkout(&mut self, name: String, discard_changes: bool)"
+            )
+        );
+        assert!(implementation_source.contains("self.request_branch_checkout(name);"));
         assert!(
             implementation_source.contains("fn load_repository_uncached(&mut self, path: PathBuf)")
         );
@@ -16345,12 +18715,78 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
+    fn dirty_local_branch_checkout_prompts_before_checkout_and_can_discard() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains(
+            "ConfirmCheckout {\n        name: String,\n        discard_changes: bool,\n    }"
+        ));
+        assert!(
+            implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
+        );
+        assert!(
+            implementation_source.contains(
+                "fn start_branch_checkout(&mut self, name: String, discard_changes: bool)"
+            )
+        );
+
+        let request_start = implementation_source
+            .find("fn request_branch_checkout(&mut self, name: String)")
+            .unwrap();
+        let request_end = implementation_source[request_start..]
+            .find("fn start_branch_checkout(")
+            .unwrap();
+        let request_source = &implementation_source[request_start..request_start + request_end];
+        assert!(request_source.contains("!snapshot.status.is_empty()"));
+        assert!(
+            request_source
+                .contains("self.pending_branch_action = Some(BranchActionDialog::ConfirmCheckout")
+        );
+        assert!(request_source.contains("self.start_branch_checkout(name, false);"));
+
+        let checkout_start = implementation_source
+            .find("fn start_branch_checkout(&mut self, name: String, discard_changes: bool)")
+            .unwrap();
+        let checkout_end = implementation_source[checkout_start..]
+            .find("fn remote_git_busy(&self)")
+            .unwrap();
+        let checkout_source = &implementation_source[checkout_start..checkout_start + checkout_end];
+        assert!(checkout_source.contains("if discard_changes {"));
+        assert!(checkout_source.contains("git::discard_all_changes(&root)?;"));
+        assert!(checkout_source.contains("git::checkout_branch(&root, &name)"));
+
+        let dialog_start = implementation_source
+            .find("fn branch_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn tag_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(dialog_source.contains("BranchActionDialog::ConfirmCheckout"));
+        assert!(dialog_source.contains("branch.confirm_checkout"));
+        assert!(dialog_source.contains("branch.discard_before_checkout"));
+        assert!(dialog_source.contains("ui.checkbox(discard_changes"));
+        assert!(dialog_source.contains("self.start_branch_checkout(name, discard_changes);"));
+    }
+
+    #[test]
     fn branch_rows_disable_branch_actions_while_checkout_or_reload_is_busy() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn branch_actions_busy(&self) -> bool"));
-        assert!(implementation_source.contains("self.loading_repo || self.branch_checkout_busy()"));
+        let busy_start = implementation_source
+            .find("fn branch_actions_busy(&self) -> bool")
+            .unwrap();
+        let busy_end = implementation_source[busy_start..]
+            .find("fn repo_toolbar_loading_busy(")
+            .unwrap();
+        let busy_source = &implementation_source[busy_start..busy_start + busy_end];
+        assert!(busy_source.contains("self.loading_repo"));
+        assert!(busy_source.contains("self.branch_checkout_busy()"));
+        assert!(busy_source.contains("self.remote_git_busy()"));
+        assert!(busy_source.contains("self.merge_tool_busy()"));
         assert!(
             implementation_source
                 .contains("let branch_actions_enabled = !self.branch_actions_busy();")
@@ -16365,7 +18801,17 @@ diff --git a/file.txt b/file.txt
         assert!(branch_row_source.contains("enabled: bool"));
         assert!(branch_row_source.contains("full_row_click_response_enabled("));
         assert!(branch_row_source.contains("if enabled && response.double_clicked()"));
-        assert!(branch_row_source.contains("enabled && !current"));
+        assert!(branch_row_source.contains("branch_context_menu("));
+
+        let context_menu_start = implementation_source
+            .find("fn branch_context_menu(")
+            .unwrap();
+        let context_menu_end = implementation_source[context_menu_start..]
+            .find("fn branch_checkout_menu_label(")
+            .unwrap();
+        let context_menu_source =
+            &implementation_source[context_menu_start..context_menu_start + context_menu_end];
+        assert!(context_menu_source.contains("enabled && !current"));
 
         let table_row_start = implementation_source.find("fn branch_table_row(").unwrap();
         let table_row_end = implementation_source[table_row_start..]
@@ -16384,6 +18830,139 @@ diff --git a/file.txt b/file.txt
             &implementation_source[remote_row_start..remote_row_start + remote_row_end];
         assert!(remote_row_source.contains("enabled: bool"));
         assert!(remote_row_source.contains("if enabled && response.double_clicked()"));
+    }
+
+    #[test]
+    fn local_branch_context_menu_exposes_sourcetree_style_actions() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let menu_start = implementation_source
+            .find("fn branch_context_menu(")
+            .unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn branch_checkout_menu_label(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+
+        for required in [
+            "BranchMenuAction::Checkout",
+            "BranchMenuAction::MergeIntoCurrent",
+            "BranchMenuAction::RebaseCurrentOnto",
+            "BranchMenuAction::FetchTracked",
+            "BranchMenuAction::PullTracked",
+            "BranchMenuAction::PushTracked",
+            "BranchMenuAction::PushToRemote",
+            "BranchMenuAction::TrackRemote",
+            "BranchMenuAction::CompareWithCurrent",
+            "BranchMenuAction::Rename",
+            "BranchMenuAction::Delete",
+            "BranchMenuAction::CreatePullRequest",
+            "branch.push_to",
+            "branch.track_remote",
+            "branch.no_remote_tracking",
+            "branch.compare_with_current",
+            "branch.create_pull_request",
+            "remote_branch_names",
+            "remotes",
+        ] {
+            assert!(menu_source.contains(required), "{required}");
+        }
+
+        assert!(menu_source.contains("branch_checkout_menu_label(language, name)"));
+        assert!(menu_source.contains("branch_merge_menu_label(language, name)"));
+        assert!(menu_source.contains("branch_rebase_menu_label(language, name)"));
+        assert!(menu_source.contains("branch_rename_menu_label(language, name)"));
+        assert!(menu_source.contains("branch_delete_menu_label(language, name)"));
+    }
+
+    #[test]
+    fn local_branch_context_menu_is_shared_by_sidebar_and_table_rows() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
+        let branch_row_end = implementation_source[branch_row_start..]
+            .find("fn branch_current_indicator_rect(")
+            .unwrap();
+        let branch_row_source =
+            &implementation_source[branch_row_start..branch_row_start + branch_row_end];
+        let table_row_start = implementation_source.find("fn branch_table_row(").unwrap();
+        let table_row_end = implementation_source[table_row_start..]
+            .find("fn branch_context_menu(")
+            .unwrap();
+        let table_row_source =
+            &implementation_source[table_row_start..table_row_start + table_row_end];
+
+        assert!(branch_row_source.contains("branch_context_menu("));
+        assert!(branch_row_source.contains("remote_branch_names"));
+        assert!(branch_row_source.contains("remotes"));
+        assert!(branch_row_source.contains("upstream"));
+        assert!(table_row_source.contains("branch_context_menu("));
+        assert!(table_row_source.contains("remote_branch_names"));
+        assert!(table_row_source.contains("remotes"));
+        assert!(table_row_source.contains("upstream"));
+    }
+
+    #[test]
+    fn branch_menu_actions_wire_to_async_git_operations_and_dialogs() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let handler_start = implementation_source
+            .find("fn handle_branch_action(&mut self, action: BranchMenuAction)")
+            .unwrap();
+        let handler_end = implementation_source[handler_start..]
+            .find("fn handle_tag_action(")
+            .unwrap();
+        let handler_source = &implementation_source[handler_start..handler_start + handler_end];
+
+        for required in [
+            "git::merge_branch(root, &name)",
+            "git::rebase_current_onto(root, &name)",
+            "git::fetch_remote_branch(root, &remote_branch)",
+            "git::set_branch_upstream(root, &name, &remote_branch)",
+            "git::unset_branch_upstream(root, &name)",
+            "self.commit_message.clear();",
+            "self.start_remote_git_action(move |root|",
+            "self.active_view = MainView::Workspace;",
+            "self.open_pull_dialog(Some(name));",
+            "self.open_push_dialog(Some(name), None);",
+            "self.open_push_dialog(Some(name), Some(remote));",
+            "self.open_branch_compare_url(&name);",
+            "self.open_branch_pull_request_url(&name);",
+            "BranchActionDialog::Rename",
+        ] {
+            assert!(handler_source.contains(required), "{required}");
+        }
+
+        let dialog_start = implementation_source
+            .find("fn branch_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn tag_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(dialog_source.contains("BranchActionDialog::Rename"));
+        assert!(dialog_source.contains("branch.rename_title"));
+        assert!(dialog_source.contains("branch.new_name"));
+        assert!(dialog_source.contains("git::rename_branch(root, &old_name, &new_name)"));
+    }
+
+    #[test]
+    fn merge_snapshot_message_becomes_default_commit_message() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("fn apply_merge_commit_message_default("));
+        let apply_start = implementation_source
+            .find("fn apply_repository_snapshot(&mut self")
+            .unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn refresh(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+        assert!(apply_source.contains("self.apply_merge_commit_message_default(&snapshot);"));
     }
 
     #[test]
@@ -16507,6 +19086,34 @@ diff --git a/file.txt b/file.txt
             Some("https://gitlab.com/owner/repo".to_owned())
         );
         assert_eq!(remote_web_url(""), None);
+    }
+
+    #[test]
+    fn branch_remote_urls_target_compare_and_pull_request_pages() {
+        assert_eq!(
+            branch_compare_url("https://github.com/owner/repo", "main", "feature/batch"),
+            "https://github.com/owner/repo/compare/main...feature/batch"
+        );
+        assert_eq!(
+            branch_pull_request_url("https://github.com/owner/repo", "feature/batch"),
+            "https://github.com/owner/repo/compare/feature/batch?expand=1"
+        );
+        assert_eq!(
+            branch_compare_url("https://gitlab.com/owner/repo", "main", "feature/batch"),
+            "https://gitlab.com/owner/repo/-/compare/main...feature/batch"
+        );
+        assert_eq!(
+            branch_pull_request_url("https://gitlab.com/owner/repo", "feature/batch"),
+            "https://gitlab.com/owner/repo/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fbatch"
+        );
+        assert_eq!(
+            commit_remote_url("https://github.com/owner/repo", "abc123"),
+            "https://github.com/owner/repo/commit/abc123"
+        );
+        assert_eq!(
+            commit_remote_url("https://gitlab.com/owner/repo", "abc123"),
+            "https://gitlab.com/owner/repo/-/commit/abc123"
+        );
     }
 
     #[test]
@@ -16942,8 +19549,10 @@ diff --git a/file.txt b/file.txt
                 .contains("merge_tool_task: Option<Receiver<MergeToolTaskResult>>")
         );
         assert!(implementation_source.contains("fn poll_merge_tool_task("));
+        assert!(implementation_source.contains("fn merge_tool_busy(&self) -> bool"));
+        assert!(implementation_source.contains("self.merge_tool_busy()"));
         assert!(implementation_source.contains(".wait()"));
-        assert!(implementation_source.contains("self.load_repository(root)"));
+        assert!(implementation_source.contains("self.load_repository_uncached(root)"));
         assert!(implementation_source.contains("self.merge_tool_task = Some(receiver)"));
         assert!(implementation_source.contains(".arg(\"--repo-root\")"));
         assert!(implementation_source.contains(".arg(\"--stage\")"));
@@ -17099,6 +19708,26 @@ diff --git a/file.txt b/file.txt
         assert!(!tabs_source.contains("ui.add_space(12.0);"));
         assert!(tab_button_source.contains("Align2::LEFT_CENTER"));
         assert!(!tab_button_source.contains("rect.bottom() - 13.0"));
+    }
+
+    #[test]
+    fn repo_settings_tabs_do_not_overlap_from_nested_icon_ui() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let tab_button_start = implementation_source
+            .find("fn repo_settings_tab_button(")
+            .unwrap();
+        let tab_button_end = implementation_source[tab_button_start..]
+            .find("fn settings_section_title(")
+            .unwrap();
+        let tab_button_source =
+            &implementation_source[tab_button_start..tab_button_start + tab_button_end];
+
+        assert!(!tab_button_source.contains("draw_ui_icon("));
+        assert!(!tab_button_source.contains("allocate_new_ui("));
+        assert!(tab_button_source.contains("paint_ui_icon("));
+        assert!(tab_button_source.contains("ui.painter().with_clip_rect("));
+        assert!(tab_button_source.contains("text_clip"));
     }
 
     #[test]

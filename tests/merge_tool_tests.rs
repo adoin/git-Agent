@@ -101,6 +101,10 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("toggle_theme("));
     assert!(source.contains("toggle_language("));
     assert!(source.contains("side_conflict_nav("));
+    assert!(source.contains("fn nav_icon_button("));
+    assert!(source.contains("fn paint_nav_chevron("));
+    assert!(source.contains("NavDirection::Previous"));
+    assert!(source.contains("NavDirection::Next"));
     assert!(source.contains("MergeLineAction::Take"));
     assert!(source.contains("MergeLineAction::Drop"));
     assert!(source.contains("egui::Button::new(\"X\")"));
@@ -114,6 +118,9 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("merge_theme_label(app.language, app.theme)"));
     assert!(source.contains("merge_language_label(app.language)"));
     assert!(source.contains("ui.add_space(14.0);"));
+    assert!(source.contains(".corner_radius(egui::CornerRadius::same(MERGE_PANEL_RADIUS))"));
+    assert!(!source.contains("egui::Button::new(\"^\")"));
+    assert!(!source.contains("egui::Button::new(\"v\")"));
     assert!(source.contains("\"使用我的版本\""));
     assert!(source.contains("\"使用他的版本\""));
     assert!(!source.contains(".stroke("));
@@ -162,6 +169,19 @@ fn write_merge_output_can_stage_resolved_file() {
     assert_eq!(cached.trim(), "story.txt");
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn merge_tool_apply_uses_background_write_task() {
+    let source = include_str!("../src/merge_tool.rs");
+    assert!(source.contains("write_task: Option<Receiver<anyhow::Result<()>>>"));
+    assert!(source.contains("fn poll_write_task(&mut self, ctx: &egui::Context)"));
+    assert!(source.contains("thread::spawn(move ||"));
+    assert!(source.contains("self.write_task = Some(receiver);"));
+    assert!(source.contains("ctx.request_repaint_after("));
+    assert!(source.contains("mt(self.language, \"applying\")"));
+    assert!(source.contains(".add_enabled("));
+    assert!(source.contains("!writing"));
 }
 
 #[test]

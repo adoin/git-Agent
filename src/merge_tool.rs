@@ -2,6 +2,9 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, anyhow};
@@ -84,6 +87,15 @@ enum MergeLineAction {
     Take,
     Drop,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavDirection {
+    Previous,
+    Next,
+}
+
+const MERGE_NAV_BUTTON_SIZE: f32 = 18.0;
+const MERGE_PANEL_RADIUS: u8 = 6;
 
 #[derive(Clone, Copy)]
 struct MergePalette {
@@ -371,6 +383,7 @@ pub struct MergeToolApp {
     theme: MergeTheme,
     language: MergeLanguage,
     status: Option<String>,
+    write_task: Option<Receiver<anyhow::Result<()>>>,
 }
 
 impl MergeToolApp {
@@ -393,6 +406,7 @@ impl MergeToolApp {
             local_conflict_cursor: 0,
             remote_conflict_cursor: 0,
             status: None,
+            write_task: None,
         }
     }
 
@@ -478,14 +492,38 @@ impl MergeToolApp {
     }
 
     fn write_output(&mut self) {
-        match write_merge_output(&self.args, &self.result_text) {
-            Ok(()) => std::process::exit(0),
-            Err(error) => {
+        if self.write_task.is_some() {
+            return;
+        }
+        let args = self.args.clone();
+        let result_text = self.result_text.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.write_task = Some(receiver);
+        self.status = Some(mt(self.language, "applying").to_owned());
+        thread::spawn(move || {
+            let _ = sender.send(write_merge_output(&args, &result_text));
+        });
+    }
+
+    fn poll_write_task(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.write_task.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => std::process::exit(0),
+            Ok(Err(error)) => {
                 self.status = Some(format!(
                     "{} {}: {error}",
                     mt(self.language, "write_failed"),
                     self.args.output.display()
-                ))
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.write_task = Some(receiver);
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = Some(mt(self.language, "write_stopped").to_owned());
             }
         }
     }
@@ -523,6 +561,7 @@ fn stage_merge_output(repo_root: &Path, output: &Path) -> anyhow::Result<()> {
 
 impl App for MergeToolApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_write_task(ctx);
         let palette = merge_palette(self.theme);
         apply_merge_theme(ctx, self.theme);
 
@@ -635,6 +674,7 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
 }
 
 fn merge_footer(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
+    let writing = app.write_task.is_some();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
@@ -647,20 +687,25 @@ fn merge_footer(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
             if ui
-                .add_sized([88.0, 30.0], egui::Button::new(mt(app.language, "cancel")))
+                .add_enabled(
+                    !writing,
+                    egui::Button::new(mt(app.language, "cancel")).min_size(Vec2::new(88.0, 30.0)),
+                )
                 .clicked()
             {
                 std::process::exit(1);
             }
+            let apply_label = if writing {
+                mt(app.language, "applying")
+            } else {
+                mt(app.language, "apply")
+            };
             if ui
-                .add_sized(
-                    [88.0, 30.0],
-                    egui::Button::new(
-                        RichText::new(mt(app.language, "apply"))
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(palette.accent),
+                .add_enabled(
+                    !writing,
+                    egui::Button::new(RichText::new(apply_label).strong().color(Color32::WHITE))
+                        .min_size(Vec2::new(88.0, 30.0))
+                        .fill(palette.accent),
                 )
                 .clicked()
             {
@@ -810,10 +855,10 @@ fn side_conflict_nav(ui: &mut Ui, app: &mut MergeToolApp, side: MergeSide, palet
             MergeSide::Remote => app.remote_conflict_cursor,
         };
         let enabled = conflict_count > 0;
-        if ui.add_enabled(enabled, egui::Button::new("^")).clicked() {
+        if nav_icon_button(ui, enabled, NavDirection::Previous, palette) {
             previous_unresolved_conflict(&app.document, side, &mut cursor);
         }
-        if ui.add_enabled(enabled, egui::Button::new("v")).clicked() {
+        if nav_icon_button(ui, enabled, NavDirection::Next, palette) {
             next_unresolved_conflict(&app.document, side, &mut cursor);
         }
         match side {
@@ -829,6 +874,58 @@ fn side_conflict_nav(ui: &mut Ui, app: &mut MergeToolApp, side: MergeSide, palet
             .color(palette.muted),
         );
     });
+}
+
+fn nav_icon_button(
+    ui: &mut Ui,
+    enabled: bool,
+    direction: NavDirection,
+    palette: MergePalette,
+) -> bool {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(MERGE_NAV_BUTTON_SIZE), sense);
+    let fill = if !enabled {
+        ui.visuals().widgets.noninteractive.bg_fill
+    } else if response.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    let color = if enabled {
+        palette.muted
+    } else {
+        palette.muted.gamma_multiply(0.45)
+    };
+
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(3), fill);
+    paint_nav_chevron(ui, rect, direction, color);
+    enabled && response.clicked()
+}
+
+fn paint_nav_chevron(ui: &mut Ui, rect: Rect, direction: NavDirection, color: Color32) {
+    let center = rect.center();
+    let half_width = 4.5;
+    let half_height = 2.8;
+    let stroke = egui::Stroke::new(1.5, color);
+    let (left, middle, right) = match direction {
+        NavDirection::Previous => (
+            Pos2::new(center.x - half_width, center.y + half_height),
+            Pos2::new(center.x, center.y - half_height),
+            Pos2::new(center.x + half_width, center.y + half_height),
+        ),
+        NavDirection::Next => (
+            Pos2::new(center.x - half_width, center.y - half_height),
+            Pos2::new(center.x, center.y + half_height),
+            Pos2::new(center.x + half_width, center.y - half_height),
+        ),
+    };
+    ui.painter().line_segment([left, middle], stroke);
+    ui.painter().line_segment([middle, right], stroke);
 }
 
 fn merge_code_row(
@@ -939,6 +1036,7 @@ fn merge_panel_frame(ui: &mut Ui, palette: MergePalette, body: impl FnOnce(&mut 
     egui::Frame::new()
         .fill(palette.panel)
         .shadow(palette.shadow)
+        .corner_radius(egui::CornerRadius::same(MERGE_PANEL_RADIUS))
         .inner_margin(egui::Margin::symmetric(6, 6))
         .show(ui, body);
 }
@@ -1032,7 +1130,9 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "cancel") => "取消",
         (MergeLanguage::Chinese, "light") => "白天",
         (MergeLanguage::Chinese, "dark") => "黑夜",
+        (MergeLanguage::Chinese, "applying") => "应用中...",
         (MergeLanguage::Chinese, "write_failed") => "写入失败",
+        (MergeLanguage::Chinese, "write_stopped") => "写入已停止",
         (_, "title") => "Merge Revisions",
         (_, "conflicts") => "conflict(s)",
         (_, "auto_applied") => "Non-conflicting changes auto-applied",
@@ -1047,7 +1147,9 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "cancel") => "Cancel",
         (_, "light") => "Light",
         (_, "dark") => "Dark",
+        (_, "applying") => "Applying...",
         (_, "write_failed") => "Failed to write",
+        (_, "write_stopped") => "Write stopped",
         _ => "",
     }
 }

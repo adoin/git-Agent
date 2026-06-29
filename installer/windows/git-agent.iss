@@ -35,6 +35,7 @@ Name: "{app}\data"
 [Files]
 Source: "{#SourceDir}\git-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\git-agent-merge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\git-agent-diff.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Git Agent"; Filename: "{app}\git-agent.exe"; WorkingDir: "{app}"
