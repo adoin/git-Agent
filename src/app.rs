@@ -1340,6 +1340,9 @@ impl RepoTabsState {
         let mut tabs = Vec::new();
         for raw in &self.tabs {
             let root = PathBuf::from(raw);
+            if !is_git_repository_dir(&root) {
+                continue;
+            }
             if tabs
                 .iter()
                 .any(|tab: &RepoTab| paths_equal(&tab.root, &root))
@@ -1639,7 +1642,13 @@ impl GitAgentApp {
             }
         } else if !has_saved_tabs {
             if let Ok(cwd) = env::current_dir() {
-                app.load_repository(cwd);
+                if is_git_repository_dir(&cwd) {
+                    app.load_repository(cwd);
+                } else {
+                    app.open_repository_source_tab();
+                }
+            } else {
+                app.open_repository_source_tab();
             }
         } else {
             if app.repo_tabs.is_empty() && !app.source_tab_open {
@@ -19420,11 +19429,13 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_tabs_state_deduplicates_paths_and_keeps_active_source_state() {
+        let base =
+            env::temp_dir().join(format!("git-agent-tabs-dedupe-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_path = repo.display().to_string();
         let state = RepoTabsState {
-            tabs: vec![
-                "D:/workspace/git-Agent".to_owned(),
-                "D:/workspace/git-Agent".to_owned(),
-            ],
+            tabs: vec![repo_path.clone(), repo_path],
             active_repo_tab: Some(0),
             source_tab_open: true,
             source_tab_active: true,
@@ -19434,6 +19445,50 @@ diff --git a/file.txt b/file.txt
         assert_eq!(state.repo_tabs().len(), 1);
         assert!(state.source_tab_open);
         assert!(state.source_tab_active);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn repo_tabs_state_drops_non_repository_paths() {
+        let base = env::temp_dir().join(format!("git-agent-tabs-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        let install_dir = base.join("GitAgent");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&install_dir).unwrap();
+
+        let state = RepoTabsState {
+            tabs: vec![
+                install_dir.display().to_string(),
+                repo.display().to_string(),
+                repo.display().to_string(),
+            ],
+            active_repo_tab: Some(0),
+            source_tab_open: true,
+            source_tab_active: true,
+            sidebar_tree_states: HashMap::new(),
+        };
+
+        let tabs = state.repo_tabs();
+
+        assert_eq!(tabs.len(), 1);
+        assert!(paths_equal(&tabs[0].root, &repo));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn first_launch_only_opens_cwd_when_it_is_git_repository() {
+        let source = include_str!("app.rs");
+        let startup_start = source.find("app.refresh_known_repositories();").unwrap();
+        let startup_end = source[startup_start..]
+            .find("app.save_app_settings();")
+            .unwrap();
+        let startup_source = &source[startup_start..startup_start + startup_end];
+
+        assert!(startup_source.contains("is_git_repository_dir(&cwd)"));
+        assert!(startup_source.contains("app.load_repository(cwd);"));
+        assert!(startup_source.contains("app.open_repository_source_tab();"));
     }
 
     #[test]
