@@ -2366,9 +2366,11 @@ impl GitAgentApp {
                     if ui.button(self.tr("dialog.cancel")).clicked() {
                         close_after = true;
                     }
+                    let submit_requested = dialog_default_submit_requested(ui);
                     if ui
                         .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
                         .clicked()
+                        || (submit_requested && actions_enabled)
                     {
                         let options = git::FetchOptions {
                             all_remotes: dialog.all_remotes,
@@ -6816,14 +6818,17 @@ impl GitAgentApp {
                     if ui.button(self.tr("dialog.cancel")).clicked() {
                         close_after = true;
                     }
+                    let default_action_enabled = actions_enabled
+                        && !dialog.remote.trim().is_empty()
+                        && !dialog.remote_branch.trim().is_empty();
+                    let submit_requested = dialog_default_submit_requested(ui);
                     if ui
                         .add_enabled(
-                            actions_enabled
-                                && !dialog.remote.trim().is_empty()
-                                && !dialog.remote_branch.trim().is_empty(),
+                            default_action_enabled,
                             egui::Button::new(self.tr("action.pull")),
                         )
                         .clicked()
+                        || (submit_requested && default_action_enabled)
                     {
                         let remote = dialog.remote.trim().to_owned();
                         let remote_branch = dialog.remote_branch.trim().to_owned();
@@ -6961,15 +6966,18 @@ impl GitAgentApp {
                         .rows
                         .iter()
                         .any(|row| row.selected && row.remote_branch.trim().is_empty());
+                    let default_action_enabled = actions_enabled
+                        && !dialog.remote.trim().is_empty()
+                        && !has_blank_selected_branch
+                        && (selected_count > 0 || dialog.push_tags);
+                    let submit_requested = dialog_default_submit_requested(ui);
                     if ui
                         .add_enabled(
-                            actions_enabled
-                                && !dialog.remote.trim().is_empty()
-                                && !has_blank_selected_branch
-                                && (selected_count > 0 || dialog.push_tags),
+                            default_action_enabled,
                             egui::Button::new(self.tr("action.push")),
                         )
                         .clicked()
+                        || (submit_requested && default_action_enabled)
                     {
                         let remote = dialog.remote.trim().to_owned();
                         let branches = selected_push_branches;
@@ -7041,7 +7049,10 @@ impl GitAgentApp {
                 ui.checkbox(checkout, self.tr("branch.checkout"));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("dialog.create")).clicked() && !name.trim().is_empty() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if (ui.button(self.tr("dialog.create")).clicked() || submit_requested)
+                        && !name.trim().is_empty()
+                    {
                         let branch_name = name.trim().to_owned();
                         let hash = hash.clone();
                         let checkout = *checkout;
@@ -7080,7 +7091,10 @@ impl GitAgentApp {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("dialog.create")).clicked() && !name.trim().is_empty() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if (ui.button(self.tr("dialog.create")).clicked() || submit_requested)
+                        && !name.trim().is_empty()
+                    {
                         let tag_name = name.trim().to_owned();
                         let hash = hash.clone();
                         let push_after_create = *push_after_create;
@@ -7110,7 +7124,8 @@ impl GitAgentApp {
                 ui.label(RichText::new(self.tr("commit.detached_warning")).color(theme::warning()));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("dialog.checkout")).clicked() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui.button(self.tr("dialog.checkout")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::checkout_commit(root, &hash)));
                         close_after = true;
@@ -7129,7 +7144,8 @@ impl GitAgentApp {
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("menu.cherry_pick")).clicked() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui.button(self.tr("menu.cherry_pick")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::cherry_pick_commit(root, &hash)));
                         close_after = true;
@@ -7161,7 +7177,8 @@ impl GitAgentApp {
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("menu.cherry_pick")).clicked() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui.button(self.tr("menu.cherry_pick")).clicked() || submit_requested {
                         let hashes = hashes.clone();
                         execute = Some(Box::new(move |root| {
                             git::cherry_pick_commits(root, &hashes)
@@ -7182,7 +7199,8 @@ impl GitAgentApp {
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("menu.revert")).clicked() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui.button(self.tr("menu.revert")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::revert_commit(root, &hash)));
                         close_after = true;
@@ -7209,7 +7227,8 @@ impl GitAgentApp {
                 ui.radio_value(mode, ResetMode::Hard, self.tr("reset.hard"));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui.button(self.tr("menu.reset")).clicked() {
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui.button(self.tr("menu.reset")).clicked() || submit_requested {
                         let hash = hash.clone();
                         let mode = *mode;
                         execute = Some(Box::new(move |root| {
@@ -7261,7 +7280,8 @@ impl GitAgentApp {
                     );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Discard").clicked() {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui.button("Discard").clicked() || submit_requested {
                             let path = path.clone();
                             execute = Some(Box::new(move |root| {
                                 if untracked {
@@ -7420,7 +7440,8 @@ impl GitAgentApp {
                     );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("stash.create")).clicked() {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui.button(self.tr("stash.create")).clicked() || submit_requested {
                             let message = message.trim().to_owned();
                             execute = Some(Box::new(move |root| git::stash_push(root, &message)));
                             close_after = true;
@@ -7437,7 +7458,8 @@ impl GitAgentApp {
                     ui.label(RichText::new(message.as_str()).color(theme::muted()));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("stash.drop")).clicked() {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui.button(self.tr("stash.drop")).clicked() || submit_requested {
                             let selector = selector.clone();
                             execute = Some(Box::new(move |root| git::stash_drop(root, &selector)));
                             close_after = true;
@@ -7485,13 +7507,16 @@ impl GitAgentApp {
                     ui.checkbox(checkout, self.tr("branch.checkout"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
+                        let default_action_enabled =
+                            branch_actions_enabled && !name.trim().is_empty();
+                        let submit_requested = dialog_default_submit_requested(ui);
                         if ui
                             .add_enabled(
-                                branch_actions_enabled,
+                                default_action_enabled,
                                 egui::Button::new(self.tr("dialog.create")),
                             )
                             .clicked()
-                            && !name.trim().is_empty()
+                            || (submit_requested && default_action_enabled)
                         {
                             let branch_name = name.trim().to_owned();
                             let checkout = *checkout;
@@ -7540,12 +7565,14 @@ impl GitAgentApp {
                                 if ui.button(self.tr("dialog.cancel")).clicked() {
                                     close_after = true;
                                 }
+                                let submit_requested = dialog_default_submit_requested(ui);
                                 if ui
                                     .add_enabled(
                                         branch_actions_enabled,
                                         egui::Button::new(self.tr("dialog.ok")),
                                     )
                                     .clicked()
+                                    || (submit_requested && branch_actions_enabled)
                                 {
                                     checkout_requested = Some((name.clone(), *discard_changes));
                                     close_after = true;
@@ -7573,13 +7600,16 @@ impl GitAgentApp {
                         ui.add(TextEdit::singleline(local_branch));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
+                            let default_action_enabled =
+                                branch_actions_enabled && !local_branch.trim().is_empty();
+                            let submit_requested = dialog_default_submit_requested(ui);
                             if ui
                                 .add_enabled(
-                                    branch_actions_enabled,
+                                    default_action_enabled,
                                     egui::Button::new(self.tr("dialog.checkout")),
                                 )
                                 .clicked()
-                                && !local_branch.trim().is_empty()
+                                || (submit_requested && default_action_enabled)
                             {
                                 let remote_branch = remote_branch.clone();
                                 let local_branch = local_branch.trim().to_owned();
@@ -7610,13 +7640,16 @@ impl GitAgentApp {
                         ui.add(TextEdit::singleline(new_name));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
+                            let default_action_enabled =
+                                branch_actions_enabled && !new_name.trim().is_empty();
+                            let submit_requested = dialog_default_submit_requested(ui);
                             if ui
                                 .add_enabled(
-                                    branch_actions_enabled,
+                                    default_action_enabled,
                                     egui::Button::new(self.tr("dialog.ok")),
                                 )
                                 .clicked()
-                                && !new_name.trim().is_empty()
+                                || (submit_requested && default_action_enabled)
                             {
                                 let old_name = old_name.clone();
                                 let new_name = new_name.trim().to_owned();
@@ -7639,12 +7672,14 @@ impl GitAgentApp {
                     ui.checkbox(force, self.tr("branch.force_delete"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
+                        let submit_requested = dialog_default_submit_requested(ui);
                         if ui
                             .add_enabled(
                                 branch_actions_enabled,
                                 egui::Button::new(self.tr("branch.delete")),
                             )
                             .clicked()
+                            || (submit_requested && branch_actions_enabled)
                         {
                             let name = name.clone();
                             let force = *force;
@@ -7671,12 +7706,14 @@ impl GitAgentApp {
                         ui.label(RichText::new(remote_branch.as_str()).color(theme::warning()));
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
+                            let submit_requested = dialog_default_submit_requested(ui);
                             if ui
                                 .add_enabled(
                                     branch_actions_enabled,
                                     egui::Button::new(self.tr("branch.delete_remote")),
                                 )
                                 .clicked()
+                                || (submit_requested && branch_actions_enabled)
                             {
                                 let remote_branch = remote_branch.clone();
                                 execute = Some(Box::new(move |root| {
@@ -7738,7 +7775,9 @@ impl GitAgentApp {
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("dialog.create")).clicked() && !name.trim().is_empty()
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if (ui.button(self.tr("dialog.create")).clicked() || submit_requested)
+                            && !name.trim().is_empty()
                         {
                             let name = name.trim().to_owned();
                             let push_after_create = *push_after_create;
@@ -7765,7 +7804,10 @@ impl GitAgentApp {
                     tag_remote_selector(ui, self.language, &remotes, remote);
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("tag.push")).clicked() && !remote.trim().is_empty() {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if (ui.button(self.tr("tag.push")).clicked() || submit_requested)
+                            && !remote.trim().is_empty()
+                        {
                             let name = name.clone();
                             let remote = remote.trim().to_owned();
                             execute =
@@ -7784,7 +7826,8 @@ impl GitAgentApp {
                     ui.label(RichText::new(name.as_str()).color(theme::warning()));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(self.tr("tag.delete")).clicked() {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui.button(self.tr("tag.delete")).clicked() || submit_requested {
                             let name = name.clone();
                             execute = Some(Box::new(move |root| git::delete_tag(root, &name)));
                             close_after = true;
@@ -8248,7 +8291,8 @@ impl GitAgentApp {
             }
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button(i18n::t(language, "dialog.ok")).clicked() {
+                let submit_requested = dialog_default_submit_requested(ui);
+                if ui.button(i18n::t(language, "dialog.ok")).clicked() || submit_requested {
                     match validate_repo_remote_action_dialog(name, url) {
                         Ok(()) => {
                             close_after = true;
@@ -8943,6 +8987,10 @@ fn dialog_window_frame() -> egui::Frame {
         .fill(Color32::TRANSPARENT)
         .stroke(Stroke::NONE)
         .inner_margin(egui::Margin::same(0))
+}
+
+fn dialog_default_submit_requested(ui: &mut Ui) -> bool {
+    ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
 }
 
 fn compact_action_dialog(
@@ -17921,6 +17969,53 @@ mod ui_tests {
             assert!(modal_source.contains("compact_action_dialog("));
             assert!(!modal_source.contains(".anchor(Align2::CENTER_CENTER"));
         }
+    }
+
+    #[test]
+    fn action_modals_submit_default_action_on_enter() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation_source.contains("fn dialog_default_submit_requested("));
+        assert!(
+            implementation_source
+                .contains("input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)")
+        );
+
+        for (start, end) in [
+            ("fn fetch_action_modal(", "fn pull_current("),
+            ("fn pull_action_modal(", "fn push_action_modal("),
+            ("fn push_action_modal(", "fn commit_action_modal("),
+            ("fn commit_action_modal(", "fn worktree_action_modal("),
+            (
+                "WorktreeActionDialog::ConfirmDiscard { path, untracked } =>",
+                "WorktreeActionDialog::ResolveConflicts",
+            ),
+            ("fn stash_action_modal(", "fn branch_action_modal("),
+            ("fn branch_action_modal(", "fn tag_action_modal("),
+            ("fn tag_action_modal(", "fn settings_modal("),
+            ("fn repo_remote_action_modal(", "fn remote_settings_table("),
+        ] {
+            let modal_start = implementation_source
+                .find(start)
+                .unwrap_or_else(|| panic!("{start}"));
+            let modal_end = implementation_source[modal_start..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end}"));
+            let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+            assert!(
+                modal_source.contains("dialog_default_submit_requested(ui)"),
+                "{start} should submit its default action on Enter"
+            );
+        }
+
+        let conflict_start = implementation_source
+            .find("WorktreeActionDialog::ResolveConflicts { selected_path } =>")
+            .unwrap();
+        let conflict_end = implementation_source[conflict_start..]
+            .find("fn stash_action_modal(")
+            .unwrap();
+        let conflict_source = &implementation_source[conflict_start..conflict_start + conflict_end];
+        assert!(!conflict_source.contains("dialog_default_submit_requested(ui)"));
     }
 
     #[test]
