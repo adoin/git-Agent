@@ -8,13 +8,14 @@ use std::{
 use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Commit {
     pub hash: String,
     pub short_hash: String,
@@ -26,14 +27,14 @@ pub struct Commit {
     pub refs: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileChange {
     pub status: String,
     pub path: String,
     pub diff_path: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Branch {
     pub name: String,
     pub current: bool,
@@ -41,14 +42,14 @@ pub struct Branch {
     pub upstream: Option<UpstreamStatus>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Remote {
     pub name: String,
     pub fetch_url: String,
     pub push_url: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RepositoryConfig {
     pub config_path: PathBuf,
     pub gitignore_path: PathBuf,
@@ -58,28 +59,28 @@ pub struct RepositoryConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UpstreamStatus {
     pub name: String,
     pub ahead: usize,
     pub behind: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StashEntry {
     pub selector: String,
     pub relative_time: String,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Tag {
     pub name: String,
     pub target: String,
     pub subject: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WorktreeFile {
     pub index_status: char,
     pub worktree_status: char,
@@ -96,7 +97,7 @@ impl WorktreeFile {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: String,
@@ -129,13 +130,13 @@ enum CommitScope {
     AllBranches,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CommitDetails {
     pub hash: String,
     pub files: Vec<FileChange>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileDiff {
     pub key: String,
     pub text: String,

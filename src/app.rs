@@ -38,6 +38,10 @@ const TOP_BAR_HEIGHT: f32 =
 const TOP_BAR_ROW_HEIGHT: f32 = 40.0;
 const TOP_BAR_GLOBAL_WIDTH: f32 = 480.0;
 const TOP_BAR_GLOBAL_ACTION_Y_OFFSET: f32 = -1.0;
+
+fn background_repo_refresh_interval() -> Duration {
+    Duration::from_secs(60)
+}
 const TOP_BAR_MIN_TABS_WIDTH: f32 = 420.0;
 const TOP_BAR_PANEL_X_INSET: f32 = 8.0;
 const REPO_TAB_STRIP_LEFT_PADDING: f32 = TOP_BAR_PANEL_X_INSET;
@@ -333,7 +337,9 @@ pub struct GitAgentApp {
     clone_url_last_edited: Option<Instant>,
     clone_url_task: Option<Receiver<(String, anyhow::Result<()>)>>,
     search_dimension: SearchDimension,
-    repo_task: Option<Receiver<RepoTaskResult>>,
+    repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
+    foreground_repo_loads: HashSet<String>,
+    next_background_repo_refresh_at: Instant,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
@@ -1201,15 +1207,60 @@ fn app_data_dir() -> Option<PathBuf> {
 }
 
 fn app_settings_path() -> Option<PathBuf> {
-    app_data_dir().map(|base| base.join("settings.json"))
+    app_data_dir().map(|base| base.join("config.json"))
 }
 
 fn repo_tabs_path() -> Option<PathBuf> {
     app_data_dir().map(|base| base.join("tabs.json"))
 }
 
-fn repo_commit_state_path() -> Option<PathBuf> {
-    app_data_dir().map(|base| base.join("commit-options.json"))
+fn repo_store_hash(path: &Path) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut key = path.display().to_string().replace('\\', "/");
+    while key.ends_with('/') {
+        key.pop();
+    }
+    key.make_ascii_lowercase();
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn repo_store_dir(path: &Path) -> Option<PathBuf> {
+    app_data_dir().map(|base| base.join("stores").join(repo_store_hash(path)))
+}
+
+fn repo_commit_state_path_for(path: &Path) -> Option<PathBuf> {
+    repo_store_dir(path).map(|store_dir| store_dir.join("commit-options.json"))
+}
+
+fn repo_snapshot_cache_path_for(path: &Path) -> Option<PathBuf> {
+    repo_store_dir(path).map(|store_dir| store_dir.join("snapshot.json"))
+}
+
+fn save_cached_repository_snapshot(snapshot: &RepositorySnapshot) {
+    let Some(path) = repo_snapshot_cache_path_for(&snapshot.root) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string(snapshot) {
+        let _ = fs::write(path, raw);
+    }
+}
+
+fn load_cached_repository_snapshot(path: &Path) -> Option<RepositorySnapshot> {
+    let cache_path = repo_snapshot_cache_path_for(path)?;
+    fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
 fn repo_state_key(path: &Path) -> String {
@@ -1217,42 +1268,34 @@ fn repo_state_key(path: &Path) -> String {
 }
 
 impl RepoCommitStateStore {
-    fn load() -> Self {
-        let Some(path) = repo_commit_state_path() else {
-            return Self::default();
-        };
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
-    }
-
-    fn save(&self) {
-        let Some(path) = repo_commit_state_path() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(raw) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, raw);
-        }
-    }
-
     fn state_for(path: &Path) -> RepoCommitState {
-        Self::load()
-            .repositories
-            .get(&repo_state_key(path))
-            .cloned()
+        let Some(state_path) = repo_commit_state_path_for(path) else {
+            return RepoCommitState::default();
+        };
+        let Some(raw) = fs::read_to_string(state_path).ok() else {
+            return RepoCommitState::default();
+        };
+
+        serde_json::from_str::<RepoCommitState>(&raw)
+            .ok()
+            .or_else(|| {
+                serde_json::from_str::<Self>(&raw)
+                    .ok()
+                    .and_then(|store| store.repositories.get(&repo_state_key(path)).cloned())
+            })
             .unwrap_or_default()
     }
 
     fn save_for(path: &Path, state: &RepoCommitState) {
-        let mut store = Self::load();
-        store
-            .repositories
-            .insert(repo_state_key(path), state.clone());
-        store.save();
+        let Some(state_path) = repo_commit_state_path_for(path) else {
+            return;
+        };
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(raw) = serde_json::to_string_pretty(state) {
+            let _ = fs::write(state_path, raw);
+        }
     }
 }
 
@@ -1510,7 +1553,9 @@ impl GitAgentApp {
             clone_url_last_edited: None,
             clone_url_task: None,
             search_dimension: SearchDimension::Message,
-            repo_task: None,
+            repo_tasks: HashMap::new(),
+            foreground_repo_loads: HashSet::new(),
+            next_background_repo_refresh_at: Instant::now() + background_repo_refresh_interval(),
             remote_git_task: None,
             branch_checkout_task: None,
             merge_tool_task: None,
@@ -1622,22 +1667,86 @@ impl GitAgentApp {
             .is_some_and(|snapshot| paths_equal(&snapshot.root, &path));
         self.ensure_repo_tab(path.clone());
         self.load_commit_state_for_active_repo();
+        let applied_cached_snapshot = use_cache && self.apply_cached_snapshot_for(&path);
         if use_cache {
-            if !self.apply_cached_snapshot_for(&path) {
+            if !applied_cached_snapshot {
                 self.clear_repository_snapshot_view();
             }
         } else if !can_keep_current_snapshot {
             self.clear_repository_snapshot_view();
         }
-        let (sender, receiver) = mpsc::channel();
-        self.repo_task = Some(receiver);
-        self.loading_repo = true;
+        if use_cache {
+            if applied_cached_snapshot {
+                self.start_repository_snapshot_load(path);
+            } else {
+                self.start_foreground_repository_snapshot_load(path);
+            }
+        } else {
+            self.restart_repository_snapshot_load(path);
+        }
+        self.loading_repo = self.active_repo_has_pending_load();
         self.error = None;
+    }
+
+    fn spawn_repository_snapshot_load(&mut self, path: PathBuf, repo_task_key: String) {
+        let (sender, receiver) = mpsc::channel();
+        self.repo_tasks.insert(repo_task_key, receiver);
 
         thread::spawn(move || {
             let requested_root = path.clone();
             let _ = sender.send((requested_root, git::open_repository(path)));
         });
+    }
+
+    fn start_repository_snapshot_load(&mut self, path: PathBuf) {
+        self.start_repository_snapshot_load_with_priority(path, false, false);
+    }
+
+    fn start_foreground_repository_snapshot_load(&mut self, path: PathBuf) {
+        self.start_repository_snapshot_load_with_priority(path, false, true);
+    }
+
+    fn restart_repository_snapshot_load(&mut self, path: PathBuf) {
+        self.start_repository_snapshot_load_with_priority(path, true, true);
+    }
+
+    fn start_repository_snapshot_load_with_priority(
+        &mut self,
+        path: PathBuf,
+        restart: bool,
+        foreground: bool,
+    ) {
+        let repo_task_key = repo_state_key(&path);
+        if foreground {
+            self.foreground_repo_loads.insert(repo_task_key.clone());
+        }
+        if restart {
+            self.repo_tasks.remove(&repo_task_key);
+        } else if self.repo_tasks.contains_key(&repo_task_key) {
+            return;
+        }
+        self.spawn_repository_snapshot_load(path, repo_task_key);
+    }
+
+    fn maybe_refresh_inactive_repositories(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if now < self.next_background_repo_refresh_at {
+            ctx.request_repaint_after(self.next_background_repo_refresh_at - now);
+            return;
+        }
+
+        self.next_background_repo_refresh_at = now + background_repo_refresh_interval();
+        let inactive_tabs = self
+            .repo_tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.active_repo_tab != Some(*index))
+            .map(|(_, tab)| tab.clone())
+            .collect::<Vec<_>>();
+        for tab in inactive_tabs {
+            self.start_repository_snapshot_load(tab.root.clone());
+        }
+        ctx.request_repaint_after(background_repo_refresh_interval());
     }
 
     fn open_repository_source_tab(&mut self) {
@@ -1757,7 +1866,19 @@ impl GitAgentApp {
             .is_some_and(|tab| paths_equal(&tab.root, root))
     }
 
+    fn active_repo_key_matches(&self, key: &str) -> bool {
+        self.active_repo_root()
+            .is_some_and(|root| repo_state_key(&root) == key)
+    }
+
+    fn active_repo_has_pending_load(&self) -> bool {
+        self.active_repo_root()
+            .map(|root| repo_state_key(&root))
+            .is_some_and(|key| self.foreground_repo_loads.contains(&key))
+    }
+
     fn cache_repository_snapshot(&mut self, snapshot: &RepositorySnapshot) {
+        save_cached_repository_snapshot(snapshot);
         self.snapshot_cache
             .insert(repo_state_key(&snapshot.root), snapshot.clone());
     }
@@ -1772,6 +1893,7 @@ impl GitAgentApp {
                     .find(|snapshot| paths_equal(&snapshot.root, path))
                     .cloned()
             })
+            .or_else(|| load_cached_repository_snapshot(path))
     }
 
     fn apply_cached_snapshot_for(&mut self, path: &Path) -> bool {
@@ -2653,38 +2775,64 @@ impl GitAgentApp {
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
-        if let Some(receiver) = self.repo_task.take() {
-            match receiver.try_recv() {
-                Ok((requested_root, Ok(snapshot))) => {
-                    self.cache_repository_snapshot(&snapshot);
-                    if self.active_repo_root_matches(&requested_root) {
-                        self.apply_repository_snapshot(snapshot);
-                        self.pending_branch_checkout = None;
-                        self.loading_repo = false;
-                        self.error = None;
+        if !self.repo_tasks.is_empty() {
+            let mut repo_results = Vec::new();
+            let mut disconnected_repo_keys = Vec::new();
+            let mut waiting_for_repo = false;
+            self.repo_tasks
+                .retain(|key, receiver| match receiver.try_recv() {
+                    Ok(result) => {
+                        repo_results.push(result);
+                        false
                     }
-                    ctx.request_repaint();
-                }
-                Ok((requested_root, Err(error))) => {
-                    if self.active_repo_root_matches(&requested_root) {
-                        self.pending_branch_checkout = None;
-                        self.clear_repository_snapshot_view();
-                        self.loading_repo = false;
-                        self.error = Some(error.to_string());
+                    Err(mpsc::TryRecvError::Empty) => {
+                        waiting_for_repo = true;
+                        true
                     }
-                    ctx.request_repaint();
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected_repo_keys.push(key.clone());
+                        false
+                    }
+                });
+
+            for (requested_root, result) in repo_results {
+                let was_foreground = self
+                    .foreground_repo_loads
+                    .remove(&repo_state_key(&requested_root));
+                match result {
+                    Ok(snapshot) => {
+                        self.cache_repository_snapshot(&snapshot);
+                        if self.active_repo_root_matches(&requested_root) {
+                            self.apply_repository_snapshot(snapshot);
+                            self.pending_branch_checkout = None;
+                            self.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if was_foreground && self.active_repo_root_matches(&requested_root) {
+                            self.pending_branch_checkout = None;
+                            self.clear_repository_snapshot_view();
+                            self.error = Some(error.to_string());
+                        }
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.repo_task = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending_branch_checkout = None;
-                    self.loading_repo = false;
-                    self.error = Some("Repository loader stopped unexpectedly".to_owned());
-                    ctx.request_repaint();
-                }
+                ctx.request_repaint();
             }
+
+            for key in disconnected_repo_keys {
+                let was_foreground = self.foreground_repo_loads.remove(&key);
+                if was_foreground && self.active_repo_key_matches(&key) {
+                    self.pending_branch_checkout = None;
+                    self.clear_repository_snapshot_view();
+                    self.error = Some("Repository loader stopped unexpectedly".to_owned());
+                }
+                ctx.request_repaint();
+            }
+
+            if waiting_for_repo {
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            }
+            self.loading_repo = self.active_repo_has_pending_load();
         }
 
         if let Some(receiver) = self.branch_checkout_task.take() {
@@ -3381,6 +3529,7 @@ impl App for GitAgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
+        self.maybe_refresh_inactive_repositories(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
@@ -16105,6 +16254,52 @@ mod ui_tests {
     }
 
     #[test]
+    fn data_layout_uses_global_config_and_per_repo_store_dirs() {
+        let source = include_str!("app.rs");
+        let app_config_start = source.find("fn app_settings_path()").unwrap();
+        let app_config_end = source[app_config_start..]
+            .find("fn repo_tabs_path()")
+            .unwrap();
+        let app_config_source = &source[app_config_start..app_config_start + app_config_end];
+        assert!(app_config_source.contains("base.join(\"config.json\")"));
+        assert!(!app_config_source.contains("settings.json"));
+
+        assert!(source.contains("fn repo_store_hash(path: &Path) -> String"));
+        assert!(source.contains("fn repo_store_dir(path: &Path) -> Option<PathBuf>"));
+        assert!(source.contains(".join(\"stores\").join(repo_store_hash(path))"));
+        assert!(source.contains("fn repo_commit_state_path_for(path: &Path) -> Option<PathBuf>"));
+        assert!(!source.contains("base.join(\"commit-options.json\")"));
+    }
+
+    #[test]
+    fn repository_snapshots_persist_to_per_repo_store_cache() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation_source.contains("fn repo_snapshot_cache_path_for("));
+        assert!(implementation_source.contains("store_dir.join(\"snapshot.json\")"));
+        assert!(implementation_source.contains("fn save_cached_repository_snapshot("));
+        assert!(implementation_source.contains("fn load_cached_repository_snapshot("));
+
+        let cache_start = implementation_source
+            .find("fn cache_repository_snapshot(&mut self")
+            .unwrap();
+        let cache_end = implementation_source[cache_start..]
+            .find("fn cached_snapshot_for(")
+            .unwrap();
+        let cache_source = &implementation_source[cache_start..cache_start + cache_end];
+        assert!(cache_source.contains("save_cached_repository_snapshot(snapshot)"));
+
+        let cached_start = implementation_source
+            .find("fn cached_snapshot_for(&self")
+            .unwrap();
+        let cached_end = implementation_source[cached_start..]
+            .find("fn apply_cached_snapshot_for(")
+            .unwrap();
+        let cached_source = &implementation_source[cached_start..cached_start + cached_end];
+        assert!(cached_source.contains("load_cached_repository_snapshot(path)"));
+    }
+
+    #[test]
     fn sidebar_cards_fit_three_items_without_overlap() {
         let available = 212.0;
         let width = sidebar_nav_card_width(available, 3);
@@ -19448,8 +19643,8 @@ diff --git a/file.txt b/file.txt
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
         assert!(fields_source.contains("snapshot_cache: HashMap<String, RepositorySnapshot>"));
         assert!(
-            fields_source.contains("repo_task: Option<Receiver<RepoTaskResult>>"),
-            "repo task must carry the requested root so stale async refreshes cannot repaint old repos"
+            fields_source.contains("repo_tasks: HashMap<String, Receiver<RepoTaskResult>>"),
+            "repo loads must be keyed per repository so A/B quick switches keep both refreshes alive"
         );
 
         let load_start = implementation_source
@@ -19461,6 +19656,9 @@ diff --git a/file.txt b/file.txt
         let load_source = &implementation_source[load_start..load_start + load_end];
         assert!(load_source.contains("self.apply_cached_snapshot_for(&path)"));
         assert!(load_source.contains("self.clear_repository_snapshot_view()"));
+        assert!(load_source.contains("self.start_repository_snapshot_load(path)"));
+        assert!(load_source.contains("self.restart_repository_snapshot_load(path)"));
+        assert!(load_source.contains("self.repo_tasks.insert(repo_task_key, receiver)"));
         assert!(load_source.contains("let requested_root = path.clone();"));
         assert!(load_source.contains("sender.send((requested_root, git::open_repository(path)))"));
 
@@ -19478,10 +19676,107 @@ diff --git a/file.txt b/file.txt
             .find("fn poll_merge_tool_task(")
             .unwrap();
         let poll_source = &implementation_source[poll_start..poll_start + poll_end];
-        assert!(poll_source.contains("Ok((requested_root, Ok(snapshot)))"));
+        let compact_poll_source = poll_source.split_whitespace().collect::<String>();
+        assert!(compact_poll_source.contains("self.repo_tasks.retain("));
+        assert!(poll_source.contains("for (requested_root, result) in repo_results"));
+        assert!(poll_source.contains("Ok(snapshot)"));
         assert!(poll_source.contains("self.cache_repository_snapshot(&snapshot)"));
         assert!(poll_source.contains("if self.active_repo_root_matches(&requested_root)"));
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
+        assert!(poll_source.contains("self.loading_repo = self.active_repo_has_pending_load()"));
+    }
+
+    #[test]
+    fn inactive_repo_tabs_refresh_in_background_every_minute() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let fields_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let fields_end = implementation_source[fields_start..]
+            .find("struct RepoTab")
+            .unwrap();
+        let fields_source = &implementation_source[fields_start..fields_start + fields_end];
+        assert!(fields_source.contains("next_background_repo_refresh_at: Instant"));
+        assert!(
+            implementation_source.contains("fn background_repo_refresh_interval() -> Duration")
+        );
+        assert!(implementation_source.contains("Duration::from_secs(60)"));
+        assert!(implementation_source.contains("fn maybe_refresh_inactive_repositories("));
+
+        let update_start = implementation_source
+            .find("fn update(&mut self, ctx: &egui::Context")
+            .unwrap();
+        let update_end = implementation_source[update_start..]
+            .find("fn error_modal(")
+            .unwrap();
+        let update_source = &implementation_source[update_start..update_start + update_end];
+        assert!(update_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
+
+        let refresh_start = implementation_source
+            .find("fn maybe_refresh_inactive_repositories(")
+            .unwrap();
+        let refresh_end = implementation_source[refresh_start..]
+            .find("fn open_repository_source_tab")
+            .unwrap();
+        let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
+        assert!(refresh_source.contains("Instant::now()"));
+        assert!(refresh_source.contains("self.next_background_repo_refresh_at"));
+        assert!(refresh_source.contains("background_repo_refresh_interval()"));
+        assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
+        assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
+        assert!(!refresh_source.contains("self.ensure_repo_tab"));
+        assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
+        assert!(!refresh_source.contains("self.loading_repo = true"));
+    }
+
+    #[test]
+    fn cached_repo_refresh_does_not_trigger_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let fields_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let fields_end = implementation_source[fields_start..]
+            .find("struct RepoTab")
+            .unwrap();
+        let fields_source = &implementation_source[fields_start..fields_start + fields_end];
+        assert!(
+            fields_source.contains("foreground_repo_loads: HashSet<String>"),
+            "foreground repository loads must be tracked separately from background refreshes"
+        );
+
+        let load_start = implementation_source
+            .find("fn load_repository_with_cache_mode(")
+            .unwrap();
+        let load_end = implementation_source[load_start..]
+            .find("fn spawn_repository_snapshot_load")
+            .unwrap();
+        let load_source = &implementation_source[load_start..load_start + load_end];
+        assert!(load_source.contains("let applied_cached_snapshot ="));
+        assert!(load_source.contains("if applied_cached_snapshot {"));
+        assert!(load_source.contains("self.start_repository_snapshot_load(path)"));
+        assert!(load_source.contains("self.start_foreground_repository_snapshot_load(path)"));
+
+        let active_pending_start = implementation_source
+            .find("fn active_repo_has_pending_load(")
+            .unwrap();
+        let active_pending_end = implementation_source[active_pending_start..]
+            .find("fn cache_repository_snapshot(")
+            .unwrap();
+        let active_pending_source =
+            &implementation_source[active_pending_start..active_pending_start + active_pending_end];
+        assert!(active_pending_source.contains("self.foreground_repo_loads.contains"));
+        assert!(!active_pending_source.contains("self.repo_tasks.keys().any"));
+
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation_source[poll_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let poll_source = &implementation_source[poll_start..poll_start + poll_end];
+        assert!(poll_source.contains("let was_foreground ="));
+        assert!(poll_source.contains("self.foreground_repo_loads.remove"));
+        assert!(poll_source.contains("if was_foreground && self.active_repo_root_matches"));
     }
 
     #[test]

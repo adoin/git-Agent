@@ -21,10 +21,11 @@ Windows releases are published as `GitAgentSetup-<version>.exe`. The setup wizar
 User data is stored relative to the executable in `data/`, for example:
 
 ```text
-<install path>/data/settings.json
+<install path>/data/config.json
 <install path>/data/tabs.json
-<install path>/data/commit-options.json
 <install path>/data/layout.json
+<install path>/data/stores/<repository-hash>/snapshot.json
+<install path>/data/stores/<repository-hash>/commit-options.json
 ```
 
 The workflow keeps only the latest 3 build runs and sets uploaded installer artifacts to expire after 3 days, which helps limit GitHub Actions storage usage.
