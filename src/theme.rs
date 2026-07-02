@@ -4,8 +4,8 @@ use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
 
-static THEME_MODE: AtomicU8 = AtomicU8::new(0);
-static THEME_ACCENT: AtomicU8 = AtomicU8::new(0);
+static THEME_MODE: AtomicU8 = AtomicU8::new(1);
+static THEME_ACCENT: AtomicU8 = AtomicU8::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThemeMode {
@@ -25,6 +25,7 @@ pub enum ThemeAccent {
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub bg: Color32,
+    pub chrome_bg: Color32,
     pub panel: Color32,
     pub panel_soft: Color32,
     pub panel_recessed: Color32,
@@ -63,7 +64,7 @@ pub const LANES: [Color32; 8] = [
 
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
-    apply(ctx, ThemeMode::Dark, ThemeAccent::Green);
+    apply(ctx, ThemeMode::Light, ThemeAccent::Blue);
 }
 
 pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
@@ -83,14 +84,18 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     visuals.panel_fill = palette.bg;
     visuals.window_fill = palette.panel;
     visuals.window_stroke = Stroke::NONE;
-    visuals.extreme_bg_color = palette.scroll_track;
+    visuals.extreme_bg_color = palette.panel_recessed;
     visuals.faint_bg_color = palette.panel_soft;
     visuals.widgets.noninteractive.bg_fill = palette.panel;
     visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.bg_fill = palette.panel_soft;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.weak_bg_fill = palette.panel_soft;
-    visuals.widgets.inactive.fg_stroke.color = palette.text;
+    visuals.widgets.inactive.fg_stroke.color = if mode == ThemeMode::Dark {
+        palette.muted
+    } else {
+        palette.text
+    };
     visuals.widgets.hovered.bg_fill = palette.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
     visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
@@ -144,6 +149,14 @@ pub fn apply(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) {
     ctx.set_style(style);
 }
 
+pub fn apply_if_needed(ctx: &egui::Context, mode: ThemeMode, accent: ThemeAccent) -> bool {
+    if current_mode() == mode && current_accent() == accent {
+        return false;
+    }
+    apply(ctx, mode, accent);
+    true
+}
+
 pub fn current_mode() -> ThemeMode {
     if THEME_MODE.load(Ordering::Relaxed) == 1 {
         ThemeMode::Light
@@ -190,10 +203,21 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
         ThemeMode::Dark => 0.36,
         ThemeMode::Light => 0.28,
     });
+    let accent_shadow_base = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.52).clamp(0.25, 0.58), 0.24),
+        ThemeMode::Light => shadow_base,
+    };
+    let inset_shadow_base = match mode {
+        ThemeMode::Dark => hsl_to_rgb(hsl.h, (hsl.s * 0.42).clamp(0.22, 0.38), 0.065),
+        ThemeMode::Light => shadow_base,
+    };
     let accent_shadow = match mode {
-        ThemeMode::Dark => {
-            Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 42)
-        }
+        ThemeMode::Dark => Color32::from_rgba_unmultiplied(
+            accent_shadow_base.r(),
+            accent_shadow_base.g(),
+            accent_shadow_base.b(),
+            72,
+        ),
         ThemeMode::Light => {
             Color32::from_rgba_unmultiplied(shadow_base.r(), shadow_base.g(), shadow_base.b(), 58)
         }
@@ -201,6 +225,7 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
     match mode {
         ThemeMode::Dark => Palette {
             bg: neutral(0.085),
+            chrome_bg: neutral(0.055),
             panel: neutral(0.115),
             panel_soft: neutral(0.155),
             panel_recessed: neutral(0.125),
@@ -212,18 +237,19 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
             accent_shadow,
             hover,
             scroll_track,
-            inset_highlight: Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            inset_highlight: Color32::TRANSPARENT,
             inset_shadow: Color32::from_rgba_unmultiplied(
-                shadow_base.r(),
-                shadow_base.g(),
-                shadow_base.b(),
-                98,
+                inset_shadow_base.r(),
+                inset_shadow_base.g(),
+                inset_shadow_base.b(),
+                118,
             ),
             info: Color32::from_rgb(120, 164, 255),
             warning: WARNING,
         },
         ThemeMode::Light => Palette {
             bg: neutral(0.948),
+            chrome_bg: neutral(0.91),
             panel: neutral(0.982),
             panel_soft: neutral(0.91),
             panel_recessed: recessed_neutral(0.985),
@@ -250,6 +276,10 @@ pub fn palette_for(mode: ThemeMode, accent: ThemeAccent) -> Palette {
 
 pub fn bg() -> Color32 {
     palette(current_mode()).bg
+}
+
+pub fn chrome_bg() -> Color32 {
+    palette(current_mode()).chrome_bg
 }
 
 pub fn panel() -> Color32 {
@@ -310,8 +340,8 @@ pub fn warning() -> Color32 {
 
 pub fn all_accents() -> [ThemeAccent; 5] {
     [
-        ThemeAccent::Green,
         ThemeAccent::Blue,
+        ThemeAccent::Green,
         ThemeAccent::Purple,
         ThemeAccent::Rose,
         ThemeAccent::Orange,
@@ -446,6 +476,61 @@ mod tests {
         assert!(green.panel_recessed.b() >= green.panel.b());
         assert_ne!(dark_green.panel, dark_blue.panel);
         assert_ne!(dark_green.panel_recessed, dark_blue.panel_recessed);
+    }
+
+    #[test]
+    fn dark_theme_avoids_white_inset_and_uses_colored_shadow() {
+        let palette = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
+        let shadow_hsl = rgb_to_hsl(Color32::from_rgb(
+            palette.accent_shadow.r(),
+            palette.accent_shadow.g(),
+            palette.accent_shadow.b(),
+        ));
+        let inset_hsl = rgb_to_hsl(Color32::from_rgb(
+            palette.inset_shadow.r(),
+            palette.inset_shadow.g(),
+            palette.inset_shadow.b(),
+        ));
+        let recessed_hsl = rgb_to_hsl(palette.panel_recessed);
+
+        assert_eq!(palette.inset_highlight.a(), 0);
+        assert!(palette.accent_shadow.a() >= 64);
+        assert!(shadow_hsl.s >= 0.25);
+        assert!(palette.inset_shadow.a() >= 108);
+        assert!(inset_hsl.l <= 0.10);
+        assert!(inset_hsl.s >= 0.22);
+        assert!(
+            recessed_hsl.s <= 0.14,
+            "dark text edit background should stay near neutral, got {recessed_hsl:?}"
+        );
+    }
+
+    #[test]
+    fn dark_chrome_background_is_deeper_than_main_background() {
+        let dark = palette_for(ThemeMode::Dark, ThemeAccent::Blue);
+        let light = palette_for(ThemeMode::Light, ThemeAccent::Blue);
+        let dark_bg_hsl = rgb_to_hsl(dark.bg);
+        let dark_chrome_hsl = rgb_to_hsl(dark.chrome_bg);
+
+        assert!(dark_chrome_hsl.l < dark_bg_hsl.l);
+        assert!(dark_chrome_hsl.s <= 0.12);
+        assert_eq!(light.chrome_bg, light.panel_soft);
+    }
+
+    #[test]
+    fn blue_theme_accent_is_first_option() {
+        assert_eq!(all_accents()[0], ThemeAccent::Blue);
+    }
+
+    #[test]
+    fn apply_if_needed_skips_unchanged_theme() {
+        let ctx = egui::Context::default();
+
+        apply(&ctx, ThemeMode::Light, ThemeAccent::Blue);
+        assert!(!apply_if_needed(&ctx, ThemeMode::Light, ThemeAccent::Blue));
+        assert!(apply_if_needed(&ctx, ThemeMode::Dark, ThemeAccent::Blue));
+        assert!(!apply_if_needed(&ctx, ThemeMode::Dark, ThemeAccent::Blue));
+        assert!(apply_if_needed(&ctx, ThemeMode::Dark, ThemeAccent::Orange));
     }
 }
 

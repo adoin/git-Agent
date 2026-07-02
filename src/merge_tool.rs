@@ -816,6 +816,10 @@ fn merge_result_panel(
                         .font(FontId::monospace(13.0))
                         .desired_width(ui.available_width())
                         .desired_rows(32)
+                        .hint_text(
+                            RichText::new(mt(app.language, "result_placeholder"))
+                                .color(palette.muted),
+                        )
                         .text_color(palette.text)
                         .background_color(palette.result_fill)
                         .frame(false),
@@ -1133,6 +1137,9 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "applying") => "应用中...",
         (MergeLanguage::Chinese, "write_failed") => "写入失败",
         (MergeLanguage::Chinese, "write_stopped") => "写入已停止",
+        (MergeLanguage::Chinese, "result_placeholder") => {
+            "\u{8bf7}\u{8f93}\u{5165}\u{5408}\u{5e76}\u{7ed3}\u{679c}"
+        }
         (_, "title") => "Merge Revisions",
         (_, "conflicts") => "conflict(s)",
         (_, "auto_applied") => "Non-conflicting changes auto-applied",
@@ -1150,6 +1157,27 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "applying") => "Applying...",
         (_, "write_failed") => "Failed to write",
         (_, "write_stopped") => "Write stopped",
+        (_, "result_placeholder") => "Enter merge result",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn result_editor_has_localized_placeholder() {
+        let source = include_str!("merge_tool.rs");
+
+        assert!(source.contains("mt(app.language, \"result_placeholder\")"));
+        assert_eq!(
+            mt(MergeLanguage::Chinese, "result_placeholder"),
+            "\u{8bf7}\u{8f93}\u{5165}\u{5408}\u{5e76}\u{7ed3}\u{679c}"
+        );
+        assert_eq!(
+            mt(MergeLanguage::English, "result_placeholder"),
+            "Enter merge result"
+        );
     }
 }

@@ -1,9 +1,12 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -102,6 +105,8 @@ pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: String,
     pub merge_message: Option<String>,
+    #[serde(default)]
+    pub rebase_in_progress: bool,
     pub upstream: Option<UpstreamStatus>,
     pub branches: Vec<Branch>,
     pub remotes: Vec<Remote>,
@@ -173,6 +178,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     let remotes = load_remotes(&root).unwrap_or_default();
     let config = load_repository_config(&root);
     let merge_message = load_merge_message(&root, &branch);
+    let rebase_in_progress = rebase_in_progress(&root);
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
@@ -206,6 +212,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         root,
         branch,
         merge_message,
+        rebase_in_progress,
         upstream,
         branches,
         remotes,
@@ -575,8 +582,309 @@ pub fn merge_branch(root: impl AsRef<Path>, name: &str) -> Result<()> {
     git_output_allowing_new_conflicts(root, &["merge", name])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MergeOptions {
+    pub commit_merge: bool,
+    pub include_messages: bool,
+    pub force_merge_commit: bool,
+    pub rebase: bool,
+    pub detect_renames: bool,
+    pub rename_threshold: u8,
+}
+
+impl Default for MergeOptions {
+    fn default() -> Self {
+        Self {
+            commit_merge: true,
+            include_messages: false,
+            force_merge_commit: false,
+            rebase: false,
+            detect_renames: false,
+            rename_threshold: 90,
+        }
+    }
+}
+
+fn merge_commit_args(target: &str, options: MergeOptions) -> Vec<String> {
+    if options.rebase {
+        return vec!["rebase".to_owned(), target.to_owned()];
+    }
+
+    let mut args = vec!["merge".to_owned()];
+    if !options.commit_merge {
+        args.push("--no-commit".to_owned());
+    }
+    if options.include_messages {
+        args.push("--log".to_owned());
+    }
+    if options.force_merge_commit {
+        args.push("--no-ff".to_owned());
+    }
+    if options.detect_renames {
+        args.push("-X".to_owned());
+        args.push(format!(
+            "find-renames={}%",
+            options.rename_threshold.clamp(1, 100)
+        ));
+    }
+    args.push(target.to_owned());
+    args
+}
+
+pub fn merge_commit(root: impl AsRef<Path>, target: &str, options: MergeOptions) -> Result<()> {
+    let root = root.as_ref();
+    let args = merge_commit_args(target, options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if options.rebase {
+        return git_output(root, &refs).map(|_| ());
+    }
+    if merge_in_progress(root) {
+        return Ok(());
+    }
+    git_output_allowing_new_conflicts(root, &refs)
+}
+
+fn archive_args(output_path: &Path, folder_prefix: &str, target: &str) -> Vec<String> {
+    let format = if output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        "zip"
+    } else {
+        "tar"
+    };
+    let mut args = vec![
+        "archive".to_owned(),
+        format!("--format={format}"),
+        "--output".to_owned(),
+        output_path.to_string_lossy().to_string(),
+    ];
+    let folder_prefix = folder_prefix.trim();
+    if !folder_prefix.is_empty() {
+        let normalized_prefix = if folder_prefix.ends_with('/') || folder_prefix.ends_with('\\') {
+            folder_prefix.replace('\\', "/")
+        } else {
+            format!("{}/", folder_prefix.replace('\\', "/"))
+        };
+        args.push(format!("--prefix={normalized_prefix}"));
+    }
+    args.push(target.trim().to_owned());
+    args
+}
+
+pub fn archive(
+    root: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    folder_prefix: &str,
+    target: &str,
+) -> Result<()> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(anyhow!("archive target is required"));
+    }
+    let output_path = output_path.as_ref();
+    if output_path.as_os_str().is_empty() {
+        return Err(anyhow!("archive output path is required"));
+    }
+    let args = archive_args(output_path, folder_prefix, target);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
 pub fn rebase_current_onto(root: impl AsRef<Path>, name: &str) -> Result<()> {
     git_output(root.as_ref(), &["rebase", name]).map(|_| ())
+}
+
+pub fn rebase_continue(root: impl AsRef<Path>) -> Result<()> {
+    rebase_control(root.as_ref(), "--continue")
+}
+
+pub fn rebase_skip(root: impl AsRef<Path>) -> Result<()> {
+    rebase_control(root.as_ref(), "--skip")
+}
+
+pub fn rebase_abort(root: impl AsRef<Path>) -> Result<()> {
+    rebase_control(root.as_ref(), "--abort")
+}
+
+fn rebase_control(root: &Path, action: &str) -> Result<()> {
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .args(["rebase", action])
+        .output()
+        .with_context(|| format!("failed to run git rebase {action}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(anyhow!("git rebase {action} failed: {detail}"));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractiveRebaseAction {
+    Pick,
+    Squash,
+    Drop,
+}
+
+impl InteractiveRebaseAction {
+    fn todo_command(self) -> &'static str {
+        match self {
+            Self::Pick => "pick",
+            Self::Squash => "squash",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InteractiveRebaseTodoItem {
+    pub action: InteractiveRebaseAction,
+    pub hash: String,
+    pub subject: String,
+}
+
+fn interactive_rebase_todo(items: &[InteractiveRebaseTodoItem]) -> String {
+    let mut todo = String::new();
+    for item in items {
+        let subject = item.subject.replace(['\r', '\n'], " ");
+        todo.push_str(item.action.todo_command());
+        todo.push(' ');
+        todo.push_str(item.hash.trim());
+        if !subject.trim().is_empty() {
+            todo.push(' ');
+            todo.push_str(subject.trim());
+        }
+        todo.push('\n');
+    }
+    todo
+}
+
+pub fn interactive_rebase(
+    root: impl AsRef<Path>,
+    base: &str,
+    items: &[InteractiveRebaseTodoItem],
+) -> Result<()> {
+    let root = root.as_ref();
+    if rebase_in_progress(root) {
+        return Err(anyhow!(
+            "interactive rebase is already in progress; run git rebase --continue, --abort, or --skip first"
+        ));
+    }
+
+    let base = base.trim();
+    if base.is_empty() {
+        return Err(anyhow!("interactive rebase base is required"));
+    }
+    if items.is_empty() {
+        return Err(anyhow!("interactive rebase requires at least one commit"));
+    }
+    if items
+        .first()
+        .is_some_and(|item| item.action == InteractiveRebaseAction::Squash)
+    {
+        return Err(anyhow!("first interactive rebase commit cannot be squash"));
+    }
+
+    let temp_dir = interactive_rebase_temp_dir();
+    fs::create_dir_all(&temp_dir).context("failed to create interactive rebase temp dir")?;
+    let todo_path = temp_dir.join("git-rebase-todo");
+    fs::write(&todo_path, interactive_rebase_todo(items))
+        .context("failed to write interactive rebase todo")?;
+    let sequence_editor = write_rebase_sequence_editor(&temp_dir, &todo_path)?;
+    let editor = write_rebase_noop_editor(&temp_dir)?;
+
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(root)
+        .env("GIT_SEQUENCE_EDITOR", sequence_editor)
+        .env("GIT_EDITOR", editor)
+        .args(["rebase", "-i", "--autosquash"]);
+    if base == "--root" {
+        command.arg("--root");
+    } else {
+        command.arg(base);
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run git rebase -i --autosquash {base}"))?;
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(anyhow!(
+            "git rebase -i --autosquash {} failed: {}",
+            base,
+            detail
+        ));
+    }
+
+    Ok(())
+}
+
+fn interactive_rebase_temp_dir() -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    env::temp_dir().join(format!("git-agent-rebase-{}-{stamp}", std::process::id()))
+}
+
+#[cfg(target_os = "windows")]
+fn write_rebase_sequence_editor(dir: &Path, todo_path: &Path) -> Result<String> {
+    let script_path = dir.join("sequence-editor.cmd");
+    fs::write(
+        &script_path,
+        format!(
+            "@echo off\r\ncopy /Y \"{}\" \"%~1\" >NUL\r\n",
+            todo_path.display()
+        ),
+    )
+    .context("failed to write interactive rebase sequence editor")?;
+    Ok(format!("\"{}\"", script_path.display()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_rebase_sequence_editor(dir: &Path, todo_path: &Path) -> Result<String> {
+    let script_path = dir.join("sequence-editor.sh");
+    fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncp '{}' \"$1\"\n", todo_path.display()),
+    )
+    .context("failed to write interactive rebase sequence editor")?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .context("failed to mark interactive rebase sequence editor executable")?;
+    Ok(script_path.to_string_lossy().to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn write_rebase_noop_editor(dir: &Path) -> Result<String> {
+    let script_path = dir.join("noop-editor.cmd");
+    fs::write(&script_path, "@echo off\r\nexit /b 0\r\n")
+        .context("failed to write interactive rebase noop editor")?;
+    Ok(format!("\"{}\"", script_path.display()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_rebase_noop_editor(dir: &Path) -> Result<String> {
+    let script_path = dir.join("noop-editor.sh");
+    fs::write(&script_path, "#!/bin/sh\nexit 0\n")
+        .context("failed to write interactive rebase noop editor")?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .context("failed to mark interactive rebase noop editor executable")?;
+    Ok(script_path.to_string_lossy().to_string())
 }
 
 pub fn rename_branch(root: impl AsRef<Path>, old_name: &str, new_name: &str) -> Result<()> {
@@ -618,6 +926,203 @@ pub fn delete_branch(root: impl AsRef<Path>, name: &str, force: bool) -> Result<
 pub fn delete_remote_branch(root: impl AsRef<Path>, remote_branch: &str) -> Result<()> {
     let (remote, branch) = split_remote_branch(remote_branch)?;
     git_output(root.as_ref(), &["push", remote, "--delete", branch]).map(|_| ())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmoduleAddOptions {
+    pub source: String,
+    pub local_path: String,
+    pub source_branch: String,
+    pub recursive: bool,
+}
+
+fn add_submodule_args(options: &SubmoduleAddOptions) -> Vec<String> {
+    let mut args = vec!["submodule".to_owned(), "add".to_owned()];
+    let source_branch = options.source_branch.trim();
+    if !source_branch.is_empty() {
+        args.push("-b".to_owned());
+        args.push(source_branch.to_owned());
+    }
+    args.push(options.source.trim().to_owned());
+    args.push(options.local_path.trim().replace('\\', "/"));
+    args
+}
+
+fn submodule_recursive_update_args(local_path: &str) -> Vec<String> {
+    vec![
+        "submodule".to_owned(),
+        "update".to_owned(),
+        "--init".to_owned(),
+        "--recursive".to_owned(),
+        "--".to_owned(),
+        local_path.trim().replace('\\', "/"),
+    ]
+}
+
+pub fn add_submodule(root: impl AsRef<Path>, options: SubmoduleAddOptions) -> Result<()> {
+    if options.source.trim().is_empty() {
+        return Err(anyhow!("submodule source is required"));
+    }
+    if options.local_path.trim().is_empty() {
+        return Err(anyhow!("submodule local path is required"));
+    }
+    let args = add_submodule_args(&options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs)?;
+    if options.recursive {
+        let update_args = submodule_recursive_update_args(&options.local_path);
+        let refs = update_args.iter().map(String::as_str).collect::<Vec<_>>();
+        git_output(root.as_ref(), &refs)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtreeAddOptions {
+    pub source: String,
+    pub local_path: String,
+    pub ref_name: String,
+    pub squash: bool,
+}
+
+fn add_subtree_args(options: &SubtreeAddOptions) -> Vec<String> {
+    let mut args = vec![
+        "subtree".to_owned(),
+        "add".to_owned(),
+        "--prefix".to_owned(),
+        options.local_path.trim().replace('\\', "/"),
+        options.source.trim().to_owned(),
+        options.ref_name.trim().to_owned(),
+    ];
+    if options.squash {
+        args.push("--squash".to_owned());
+    }
+    args
+}
+
+pub fn add_subtree(root: impl AsRef<Path>, options: SubtreeAddOptions) -> Result<()> {
+    if options.source.trim().is_empty() {
+        return Err(anyhow!("subtree source is required"));
+    }
+    if options.local_path.trim().is_empty() {
+        return Err(anyhow!("subtree local path is required"));
+    }
+    if options.ref_name.trim().is_empty() {
+        return Err(anyhow!("subtree ref is required"));
+    }
+    let args = add_subtree_args(&options);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LfsTrackOptions {
+    pub original_patterns: Vec<String>,
+    pub patterns: Vec<String>,
+}
+
+fn lfs_install_args() -> Vec<String> {
+    vec!["lfs".to_owned(), "install".to_owned(), "--local".to_owned()]
+}
+
+fn lfs_track_args(pattern: &str) -> Vec<String> {
+    vec![
+        "lfs".to_owned(),
+        "track".to_owned(),
+        pattern.trim().to_owned(),
+    ]
+}
+
+fn lfs_untrack_args(pattern: &str) -> Vec<String> {
+    vec![
+        "lfs".to_owned(),
+        "untrack".to_owned(),
+        pattern.trim().to_owned(),
+    ]
+}
+
+fn lfs_simple_args(action: &str) -> Vec<String> {
+    vec!["lfs".to_owned(), action.to_owned()]
+}
+
+fn run_git_args(root: &Path, args: Vec<String>) -> Result<String> {
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root, &refs)
+}
+
+pub fn lfs_tracked_patterns(root: impl AsRef<Path>) -> Result<Vec<String>> {
+    let attributes_path = root.as_ref().join(".gitattributes");
+    let text = fs::read_to_string(attributes_path).unwrap_or_default();
+    Ok(parse_lfs_gitattributes_patterns(&text))
+}
+
+fn parse_lfs_gitattributes_patterns(text: &str) -> Vec<String> {
+    normalized_lfs_patterns(
+        &text
+            .lines()
+            .filter(|line| line.contains("filter=lfs"))
+            .filter_map(|line| line.split_whitespace().next())
+            .map(unquote_gitattributes_pattern)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn unquote_gitattributes_pattern(pattern: &str) -> String {
+    pattern
+        .trim()
+        .trim_matches('"')
+        .replace("\\ ", " ")
+        .to_owned()
+}
+
+fn normalized_lfs_patterns(patterns: &[String]) -> Vec<String> {
+    let mut normalized = Vec::<String>::new();
+    for pattern in patterns {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || normalized.iter().any(|existing| existing == pattern) {
+            continue;
+        }
+        normalized.push(pattern.to_owned());
+    }
+    normalized
+}
+
+pub fn configure_lfs_patterns(root: impl AsRef<Path>, options: LfsTrackOptions) -> Result<()> {
+    let root = root.as_ref();
+    let original = normalized_lfs_patterns(&options.original_patterns);
+    let patterns = normalized_lfs_patterns(&options.patterns);
+    run_git_args(root, lfs_install_args())?;
+
+    for pattern in original
+        .iter()
+        .filter(|pattern| !patterns.iter().any(|candidate| candidate == *pattern))
+    {
+        run_git_args(root, lfs_untrack_args(pattern))?;
+    }
+    for pattern in patterns
+        .iter()
+        .filter(|pattern| !original.iter().any(|candidate| candidate == *pattern))
+    {
+        run_git_args(root, lfs_track_args(pattern))?;
+    }
+
+    Ok(())
+}
+
+pub fn lfs_pull(root: impl AsRef<Path>) -> Result<()> {
+    run_git_args(root.as_ref(), lfs_simple_args("pull")).map(|_| ())
+}
+
+pub fn lfs_fetch(root: impl AsRef<Path>) -> Result<()> {
+    run_git_args(root.as_ref(), lfs_simple_args("fetch")).map(|_| ())
+}
+
+pub fn lfs_checkout(root: impl AsRef<Path>) -> Result<()> {
+    run_git_args(root.as_ref(), lfs_simple_args("checkout")).map(|_| ())
+}
+
+pub fn lfs_prune(root: impl AsRef<Path>) -> Result<()> {
+    run_git_args(root.as_ref(), lfs_simple_args("prune")).map(|_| ())
 }
 
 fn rename_branch_args(old_name: &str, new_name: &str) -> Vec<String> {
@@ -947,7 +1452,10 @@ fn push_branch_args(remote: &str, branch: &PushBranchSpec, force: bool) -> Vec<S
         args.push("-u".to_owned());
     }
     args.push(remote.to_owned());
-    args.push(format!("{}:{}", branch.local_branch, branch.remote_branch));
+    args.push(format!(
+        "{}:refs/heads/{}",
+        branch.local_branch, branch.remote_branch
+    ));
     args
 }
 
@@ -969,16 +1477,58 @@ pub fn push_tag(root: impl AsRef<Path>, remote: &str, tag: &str) -> Result<()> {
     git_output(root.as_ref(), &["push", remote, &tag_ref]).map(|_| ())
 }
 
-pub fn stash_push(root: impl AsRef<Path>, message: &str) -> Result<()> {
-    if message.trim().is_empty() {
-        git_output(root.as_ref(), &["stash", "push", "--include-untracked"]).map(|_| ())
-    } else {
-        git_output(
-            root.as_ref(),
-            &["stash", "push", "--include-untracked", "-m", message],
-        )
-        .map(|_| ())
+pub fn github_credential_manager_login() -> Result<()> {
+    let output = git_command()
+        .args(["credential-manager", "github", "login"])
+        .output()
+        .context("failed to run git credential-manager github login")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        return Err(anyhow!(
+            "git credential-manager github login failed: {}",
+            message
+        ));
     }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StashOptions {
+    pub staged_files: bool,
+    pub keep_staged: bool,
+    pub include_untracked: bool,
+    pub include_ignored: bool,
+}
+
+fn stash_push_args(message: &str, options: StashOptions) -> Vec<String> {
+    let mut args = vec!["stash".to_owned(), "push".to_owned()];
+    if options.staged_files {
+        args.push("--staged".to_owned());
+    }
+    if options.keep_staged {
+        args.push("--keep-index".to_owned());
+    }
+    if options.include_ignored {
+        args.push("--all".to_owned());
+    } else if options.include_untracked {
+        args.push("--include-untracked".to_owned());
+    }
+    let message = message.trim();
+    if !message.is_empty() {
+        args.push("-m".to_owned());
+        args.push(message.to_owned());
+    }
+    args
+}
+
+pub fn stash_push(root: impl AsRef<Path>, message: &str, options: StashOptions) -> Result<()> {
+    let args = stash_push_args(message, options);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &args).map(|_| ())
 }
 
 pub fn stash_apply(root: impl AsRef<Path>, selector: &str) -> Result<()> {
@@ -1099,7 +1649,11 @@ fn parse_branches(output: &str) -> Vec<Branch> {
             let name = parts.get(1)?.trim().to_owned();
             let refname = parts.get(2).copied().unwrap_or_default();
             let upstream_name = parts.get(3).copied().unwrap_or_default().trim();
+            let local = refname.starts_with("refs/heads/");
             let remote = refname.starts_with("refs/remotes/");
+            if !local && !remote {
+                return None;
+            }
             let upstream = (!remote && !upstream_name.is_empty()).then(|| UpstreamStatus {
                 name: upstream_name.to_owned(),
                 ahead: 0,
@@ -1198,6 +1752,16 @@ fn format_merge_message_subject_for_branch(subject: &str, current_branch: &str) 
 
 fn merge_in_progress(root: &Path) -> bool {
     git_path(root, "MERGE_HEAD").is_some_and(|path| path.exists())
+}
+
+fn rebase_in_progress(root: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|name| git_path(root, name).is_some_and(|path| path.exists()))
+}
+
+pub fn repository_rebase_in_progress(root: impl AsRef<Path>) -> bool {
+    rebase_in_progress(root.as_ref())
 }
 
 fn load_repository_config(root: &Path) -> RepositoryConfig {
@@ -1575,6 +2139,26 @@ mod tests {
     }
 
     #[test]
+    fn stash_push_args_reflect_dialog_options() {
+        assert_eq!(
+            stash_push_args("WIP", StashOptions::default()),
+            vec!["stash", "push", "-m", "WIP"]
+        );
+        assert_eq!(
+            stash_push_args(
+                "",
+                StashOptions {
+                    staged_files: true,
+                    keep_staged: true,
+                    include_untracked: true,
+                    include_ignored: true,
+                },
+            ),
+            vec!["stash", "push", "--staged", "--keep-index", "--all"]
+        );
+    }
+
+    #[test]
     fn merge_branch_conflicts_return_ok_so_ui_can_reload_conflict_state() {
         let root =
             std::env::temp_dir().join(format!("git-agent-merge-conflict-{}", std::process::id()));
@@ -1761,7 +2345,7 @@ mod tests {
 
     #[test]
     fn parses_branch_list_output_with_tabs() {
-        let output = " \tfeature-batch\trefs/heads/feature-batch\torigin/feature-batch\n \tfeature-clean\trefs/heads/feature-clean\t\n*\tmain\trefs/heads/main\torigin/main\n";
+        let output = " \tfeature-batch\trefs/heads/feature-batch\torigin/feature-batch\n \tfeature-clean\trefs/heads/feature-clean\t\n*\t(HEAD detached at c02dcf4)\t(HEAD detached at c02dcf4)\t\n*\tmain\trefs/heads/main\torigin/main\n";
 
         let branches = parse_branches(output);
 
@@ -1935,6 +2519,316 @@ mod tests {
     }
 
     #[test]
+    fn merge_commit_args_reflect_dialog_options() {
+        assert_eq!(
+            merge_commit_args("abc123", MergeOptions::default()),
+            vec!["merge", "abc123"]
+        );
+        assert_eq!(
+            merge_commit_args(
+                "abc123",
+                MergeOptions {
+                    commit_merge: false,
+                    include_messages: true,
+                    force_merge_commit: true,
+                    rebase: false,
+                    detect_renames: true,
+                    rename_threshold: 90,
+                },
+            ),
+            vec![
+                "merge",
+                "--no-commit",
+                "--log",
+                "--no-ff",
+                "-X",
+                "find-renames=90%",
+                "abc123"
+            ]
+        );
+        assert_eq!(
+            merge_commit_args(
+                "abc123",
+                MergeOptions {
+                    rebase: true,
+                    ..MergeOptions::default()
+                },
+            ),
+            vec!["rebase", "abc123"]
+        );
+    }
+
+    #[test]
+    fn archive_args_reflect_dialog_inputs() {
+        assert_eq!(
+            archive_args(std::path::Path::new("D:/repo/archive.zip"), "", "HEAD",),
+            vec![
+                "archive",
+                "--format=zip",
+                "--output",
+                "D:/repo/archive.zip",
+                "HEAD"
+            ]
+        );
+        assert_eq!(
+            archive_args(
+                std::path::Path::new("D:/repo/archive.tar"),
+                "release",
+                "abc123",
+            ),
+            vec![
+                "archive",
+                "--format=tar",
+                "--output",
+                "D:/repo/archive.tar",
+                "--prefix=release/",
+                "abc123"
+            ]
+        );
+        assert_eq!(
+            archive_args(
+                std::path::Path::new("D:/repo/archive.tar.gz"),
+                "release/",
+                "feature",
+            ),
+            vec![
+                "archive",
+                "--format=tar",
+                "--output",
+                "D:/repo/archive.tar.gz",
+                "--prefix=release/",
+                "feature"
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_todo_uses_ordered_actions() {
+        let items = vec![
+            InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Pick,
+                hash: "aaa111".to_owned(),
+                subject: "oldest".to_owned(),
+            },
+            InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Squash,
+                hash: "bbb222".to_owned(),
+                subject: "middle".to_owned(),
+            },
+            InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Drop,
+                hash: "ccc333".to_owned(),
+                subject: "newest".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            interactive_rebase_todo(&items),
+            "pick aaa111 oldest\nsquash bbb222 middle\ndrop ccc333 newest\n"
+        );
+    }
+
+    #[test]
+    fn rebase_in_progress_detects_rebase_state_directories() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+
+        assert!(!rebase_in_progress(&root));
+        assert!(!repository_rebase_in_progress(&root));
+
+        let rebase_merge = git_path(&root, "rebase-merge").unwrap();
+        fs::create_dir_all(&rebase_merge)?;
+        assert!(rebase_in_progress(&root));
+        assert!(repository_rebase_in_progress(&root));
+        fs::remove_dir_all(&rebase_merge)?;
+        assert!(!repository_rebase_in_progress(&root));
+
+        let rebase_apply = git_path(&root, "rebase-apply").unwrap();
+        fs::create_dir_all(&rebase_apply)?;
+        assert!(rebase_in_progress(&root));
+        assert!(repository_rebase_in_progress(&root));
+        let error = interactive_rebase(
+            &root,
+            "HEAD~1",
+            &[InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Drop,
+                hash: "abc123".to_owned(),
+                subject: "drop me".to_owned(),
+            }],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("already in progress"));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_control_actions_resume_skip_or_abort_existing_rebase() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-rebase-control-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("story.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        git_output(&root, &["checkout", "-b", "feature"])?;
+        fs::write(root.join("story.txt"), "feature\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "feature"])?;
+        git_output(&root, &["checkout", "master"])?;
+        fs::write(root.join("story.txt"), "master\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "master"])?;
+
+        let conflict = git_output(&root, &["rebase", "feature"]).unwrap_err();
+        assert!(conflict.to_string().contains("could not apply"));
+        assert!(repository_rebase_in_progress(&root));
+
+        let continue_error = rebase_continue(&root).unwrap_err().to_string();
+        assert!(continue_error.contains("needs merge") || continue_error.contains("unmerged"));
+
+        rebase_abort(&root)?;
+        assert!(!repository_rebase_in_progress(&root));
+
+        git_output(&root, &["rebase", "feature"]).unwrap_err();
+        assert!(repository_rebase_in_progress(&root));
+        rebase_skip(&root)?;
+        assert!(!repository_rebase_in_progress(&root));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_rebase_executes_generated_todo() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("file.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let base_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "one\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "one"])?;
+        let first_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "two\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "two"])?;
+        let second_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        interactive_rebase(
+            &root,
+            &base_hash,
+            &[
+                InteractiveRebaseTodoItem {
+                    action: InteractiveRebaseAction::Pick,
+                    hash: first_hash,
+                    subject: "one".to_owned(),
+                },
+                InteractiveRebaseTodoItem {
+                    action: InteractiveRebaseAction::Drop,
+                    hash: second_hash,
+                    subject: "two".to_owned(),
+                },
+            ],
+        )?;
+
+        let log = git_output(&root, &["log", "--format=%s"])?;
+        let _ = fs::remove_dir_all(&root);
+        assert!(log.contains("one"));
+        assert!(log.contains("base"));
+        assert!(!log.contains("two"));
+        Ok(())
+    }
+
+    #[test]
+    fn submodule_and_subtree_args_match_sourcetree_dialogs() {
+        assert_eq!(
+            add_submodule_args(&SubmoduleAddOptions {
+                source: "https://example.com/lib.git".to_owned(),
+                local_path: "vendor/lib".to_owned(),
+                source_branch: "main".to_owned(),
+                recursive: true,
+            }),
+            vec![
+                "submodule",
+                "add",
+                "-b",
+                "main",
+                "https://example.com/lib.git",
+                "vendor/lib"
+            ]
+        );
+        assert_eq!(
+            submodule_recursive_update_args("vendor/lib"),
+            vec![
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--",
+                "vendor/lib"
+            ]
+        );
+        assert_eq!(
+            add_subtree_args(&SubtreeAddOptions {
+                source: "https://example.com/lib.git".to_owned(),
+                local_path: "third_party/lib".to_owned(),
+                ref_name: "main".to_owned(),
+                squash: true,
+            }),
+            vec![
+                "subtree",
+                "add",
+                "--prefix",
+                "third_party/lib",
+                "https://example.com/lib.git",
+                "main",
+                "--squash"
+            ]
+        );
+    }
+
+    #[test]
+    fn lfs_args_and_attribute_parser_cover_tracking_flow() {
+        assert_eq!(lfs_install_args(), vec!["lfs", "install", "--local"]);
+        assert_eq!(lfs_track_args("*.psd"), vec!["lfs", "track", "*.psd"]);
+        assert_eq!(lfs_untrack_args("*.zip"), vec!["lfs", "untrack", "*.zip"]);
+        assert_eq!(lfs_simple_args("pull"), vec!["lfs", "pull"]);
+        assert_eq!(lfs_simple_args("fetch"), vec!["lfs", "fetch"]);
+        assert_eq!(lfs_simple_args("checkout"), vec!["lfs", "checkout"]);
+        assert_eq!(lfs_simple_args("prune"), vec!["lfs", "prune"]);
+        assert_eq!(
+            parse_lfs_gitattributes_patterns(
+                "*.psd filter=lfs diff=lfs merge=lfs -text\nassets/** filter=lfs diff=lfs merge=lfs -text\n*.txt text\n"
+            ),
+            vec!["*.psd", "assets/**"]
+        );
+        assert_eq!(
+            normalized_lfs_patterns(&[
+                " *.psd ".to_owned(),
+                "*.psd".to_owned(),
+                "*.mp4".to_owned()
+            ]),
+            vec!["*.psd", "*.mp4"]
+        );
+    }
+
+    #[test]
     fn push_args_target_selected_branches_tags_force_and_tracking() {
         assert_eq!(
             push_branch_args(
@@ -1946,7 +2840,7 @@ mod tests {
                 },
                 false,
             ),
-            vec!["push", "-u", "origin", "main:main"]
+            vec!["push", "-u", "origin", "main:refs/heads/main"]
         );
         assert_eq!(
             push_branch_args(
@@ -1962,7 +2856,7 @@ mod tests {
                 "push",
                 "--force-with-lease",
                 "upstream",
-                "feature/ui:review/ui"
+                "feature/ui:refs/heads/review/ui"
             ]
         );
         assert_eq!(push_tags_args("origin"), vec!["push", "origin", "--tags"]);

@@ -49,6 +49,9 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     ("diff.blocks", "\u{5dee}\u{5f02}\u{5757}"),
     ("diff.full_file", "\u{5b8c}\u{6574}\u{6587}\u{4ef6}"),
+    ("settings.appearance", "\u{5916}\u{89c2}"),
+    ("settings.theme", "\u{4e3b}\u{9898}"),
+    ("settings.language", "\u{8bed}\u{8a00}"),
     ("menu.copy", "\u{590d}\u{5236}"),
     ("repo.source.new_tab", "New tab"),
     ("repo.source.close_tab", "\u{5173}\u{95ed}\u{6807}\u{7b7e}"),
@@ -165,6 +168,324 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{6e05}\u{9664}\u{ff08}\u{4e22}\u{5f03}\u{6240}\u{6709}\u{66f4}\u{6539}\u{ff09}",
     ),
     (
+        "worktree.discard_all_confirm",
+        "\u{4e22}\u{5f03}\u{6240}\u{6709}\u{672a}\u{63d0}\u{4ea4}\u{7684}\u{66f4}\u{6539}\u{ff1f}",
+    ),
+    (
+        "worktree.discard_all_warning",
+        "\u{8fd9}\u{4f1a}\u{91cd}\u{7f6e}\u{5df2}\u{8ddf}\u{8e2a}\u{66f4}\u{6539}\u{5e76}\u{5220}\u{9664}\u{672a}\u{8ddf}\u{8e2a}\u{6587}\u{4ef6}\u{3002}",
+    ),
+    (
+        "stash.staged_files",
+        "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}",
+    ),
+    (
+        "stash.keep_staged",
+        "\u{4fdd}\u{7559}\u{6682}\u{5b58}\u{7684}\u{66f4}\u{6539}",
+    ),
+    (
+        "stash.include_untracked",
+        "\u{672a}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}",
+    ),
+    ("stash.include_ignored", "\u{6240}\u{6709}"),
+    ("checkout.title", "\u{68c0}\u{51fa}"),
+    (
+        "checkout.existing",
+        "\u{68c0}\u{51fa}\u{73b0}\u{6709}\u{7684}",
+    ),
+    (
+        "checkout.new_branch",
+        "\u{68c0}\u{51fa}\u{65b0}\u{5206}\u{652f}",
+    ),
+    (
+        "checkout.existing_commit",
+        "\u{9009}\u{62e9}\u{8981}\u{68c0}\u{51fa}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "checkout.remote_branch",
+        "\u{68c0}\u{51fa}\u{8fdc}\u{7aef}\u{5206}\u{652f}:",
+    ),
+    (
+        "checkout.local_branch",
+        "\u{65b0}\u{7684}\u{672c}\u{5730}\u{5206}\u{652f}\u{540d}:",
+    ),
+    (
+        "checkout.select_remote_branch",
+        "\u{9009}\u{62e9}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "checkout.track_remote",
+        "\u{672c}\u{5730}\u{5206}\u{652f}\u{5e94}\u{8ddf}\u{8e2a}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "checkout.detached_confirm_title",
+        "\u{8b66}\u{544a}\u{ff1a}\u{6b63}\u{5728}\u{521b}\u{5efa}\u{5206}\u{79bb}\u{7684} HEAD",
+    ),
+    (
+        "checkout.detached_target",
+        "\u{68c0}\u{51fa}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "checkout.detached_warning_detail",
+        "\u{68c0}\u{51fa}\u{8be5}\u{63d0}\u{4ea4}\u{4f1a}\u{521b}\u{5efa}\u{4e00}\u{4e2a}\u{5206}\u{79bb}\u{7684} HEAD\u{ff0c}\u{4f60}\u{5c06}\u{4e0d}\u{5728}\u{4efb}\u{4f55}\u{5206}\u{652f}\u{4e0a}\u{3002}\u{53ef}\u{7528}\u{4e8e}\u{4e34}\u{65f6} commit \u{9a8c}\u{8bc1}\u{ff1b}\u{82e5}\u{9700}\u{8981}\u{957f}\u{671f}\u{4fdd}\u{5b58}\u{ff0c}\u{8bf7}\u{4ece}\u{68c0}\u{51fa}\u{65b0}\u{5206}\u{652f}\u{521b}\u{5efa}\u{672c}\u{5730}\u{5206}\u{652f}\u{3002}",
+    ),
+    (
+        "checkout.error.fix_inputs",
+        "\u{8bf7}\u{7ea0}\u{6b63}\u{4ee5}\u{4e0b}\u{8f93}\u{5165}\u{9519}\u{8bef}:",
+    ),
+    (
+        "checkout.error.local_branch_invalid",
+        "\u{672c}\u{5730}\u{5206}\u{652f}\u{540d}\u{65e0}\u{6548}",
+    ),
+    (
+        "checkout.error.remote_branch_invalid",
+        "\u{9009}\u{4e2d}\u{7684}\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{540d}\u{65e0}\u{6548}",
+    ),
+    (
+        "checkout.error.local_branch_exists",
+        "\u{672c}\u{5730}\u{5206}\u{652f}\u{5df2}\u{5b58}\u{5728}",
+    ),
+    (
+        "interactive_rebase.title",
+        "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}",
+    ),
+    (
+        "interactive_rebase.select_commit",
+        "\u{9009}\u{62e9}\u{8981}\u{53d8}\u{57fa}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "interactive_rebase.selected_commit",
+        "\u{5df2}\u{9009}\u{63d0}\u{4ea4}:",
+    ),
+    ("interactive_rebase.todo_action", "\u{52a8}\u{4f5c}:"),
+    ("interactive_rebase.todo.pick", "\u{4fdd}\u{7559}"),
+    (
+        "interactive_rebase.todo.squash",
+        "\u{5408}\u{5e76}\u{5230}\u{4e0a}\u{4e00}\u{4e2a}",
+    ),
+    ("interactive_rebase.todo.drop", "\u{5220}\u{9664}"),
+    ("interactive_rebase.reset", "\u{91cd}\u{7f6e}"),
+    ("interactive_rebase.selected_count", "\u{5df2}\u{9009}"),
+    (
+        "interactive_rebase.drop_selected",
+        "\u{5220}\u{9664}\u{9009}\u{4e2d}",
+    ),
+    (
+        "interactive_rebase.squash_selected",
+        "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230}\u{4e0a}\u{4e00}\u{4e2a}",
+    ),
+    (
+        "interactive_rebase.reset_selected",
+        "\u{91cd}\u{7f6e}\u{9009}\u{4e2d}",
+    ),
+    (
+        "interactive_rebase.merge_commit_disabled",
+        "\u{5408}\u{5e76}\u{63d0}\u{4ea4}\u{6682}\u{4e0d}\u{652f}\u{6301}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{64cd}\u{4f5c}",
+    ),
+    (
+        "interactive_rebase.squash_previous",
+        "\u{7528}\u{6b64}\u{524d}\u{7684} squash",
+    ),
+    ("interactive_rebase.drop_commit", "\u{5220}\u{9664}"),
+    (
+        "interactive_rebase.error.dirty",
+        "git rebase -i --autosquash\nerror: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them.",
+    ),
+    (
+        "interactive_rebase.error.index_dirty",
+        "git rebase -i --autosquash\nerror: cannot rebase: Your index contains uncommitted changes.\nerror: Please commit or stash them.",
+    ),
+    (
+        "interactive_rebase.error.in_progress",
+        "\u{5f53}\u{524d}\u{4ed3}\u{5e93}\u{5df2}\u{6709}\u{672a}\u{5b8c}\u{6210}\u{7684} rebase\u{3002}\n\u{8bf7}\u{5148}\u{5904}\u{7406}\u{5f53}\u{524d} rebase\u{ff1a}git rebase --continue / --abort / --skip\u{ff0c}\u{7136}\u{540e}\u{518d}\u{91cd}\u{65b0}\u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{3002}",
+    ),
+    (
+        "interactive_rebase.error.detached",
+        "\u{5f53}\u{524d}\u{5904}\u{4e8e}\u{5206}\u{79bb} HEAD\u{ff0c}\u{8bf7}\u{5148}\u{68c0}\u{51fa}\u{6216}\u{521b}\u{5efa}\u{672c}\u{5730}\u{5206}\u{652f}\u{540e}\u{518d}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{3002}",
+    ),
+    (
+        "interactive_rebase.error.no_commits",
+        "\u{5f53}\u{524d}\u{5206}\u{652f}\u{6ca1}\u{6709}\u{53ef}\u{7528}\u{4e8e}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "interactive_rebase.error.first_squash",
+        "\u{6700}\u{65e9}\u{7684}\u{63d0}\u{4ea4}\u{4e0d}\u{80fd} squash",
+    ),
+    (
+        "interactive_rebase.in_progress.title",
+        "\u{53d8}\u{57fa}\u{8fdb}\u{884c}\u{4e2d}",
+    ),
+    (
+        "interactive_rebase.in_progress.detail",
+        "\u{5f53}\u{524d}\u{4ed3}\u{5e93}\u{6b63}\u{5728}\u{5904}\u{7406} git rebase\u{3002}\u{89e3}\u{51b3}\u{51b2}\u{7a81}\u{540e}\u{53ef}\u{7ee7}\u{7eed}\u{ff0c}\u{4e5f}\u{53ef}\u{8df3}\u{8fc7}\u{5f53}\u{524d}\u{63d0}\u{4ea4}\u{6216}\u{4e2d}\u{6b62}\u{53d8}\u{57fa}\u{3002}",
+    ),
+    (
+        "interactive_rebase.in_progress.conflicts",
+        "\u{5f53}\u{524d}\u{6709}\u{51b2}\u{7a81}\u{6587}\u{4ef6}\u{ff0c}\u{9700}\u{5148}\u{89e3}\u{51b2}\u{5e76}\u{6682}\u{5b58}\u{3002}",
+    ),
+    (
+        "interactive_rebase.in_progress.continue",
+        "\u{7ee7}\u{7eed}",
+    ),
+    (
+        "interactive_rebase.in_progress.skip",
+        "\u{8df3}\u{8fc7}\u{5f53}\u{524d}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "interactive_rebase.in_progress.abort",
+        "\u{4e2d}\u{6b62}\u{53d8}\u{57fa}",
+    ),
+    (
+        "submodule.title",
+        "\u{6dfb}\u{52a0}\u{5b50}\u{6a21}\u{5757}...",
+    ),
+    ("submodule.source", "\u{6e90}\u{8def}\u{5f84} / URL:"),
+    ("submodule.repo_type", "\u{4ed3}\u{5e93}\u{7c7b}\u{578b}:"),
+    (
+        "submodule.local_path",
+        "\u{672c}\u{5730}\u{76f8}\u{5173}\u{8def}\u{5f84}:",
+    ),
+    ("submodule.source_branch", "\u{6e90}\u{5206}\u{652f}:"),
+    (
+        "submodule.recursive",
+        "\u{9012}\u{5f52}\u{5b50}\u{6a21}\u{5757}",
+    ),
+    (
+        "subtree.title",
+        "\u{6dfb}\u{52a0}/\u{94fe}\u{63a5}\u{5b50}\u{6811}",
+    ),
+    ("subtree.source", "\u{6e90}\u{8def}\u{5f84} / URL:"),
+    ("subtree.repo_type", "\u{4ed3}\u{5e93}\u{7c7b}\u{578b}:"),
+    ("subtree.ref_name", "\u{5206}\u{652f} / \u{63d0}\u{4ea4}:"),
+    (
+        "subtree.local_path",
+        "\u{672c}\u{5730}\u{76f8}\u{5173}\u{8def}\u{5f84}:",
+    ),
+    ("subtree.squash", "squash \u{63d0}\u{4ea4}?"),
+    (
+        "subtree.error.ref_required",
+        "\u{5206}\u{652f}/\u{63d0}\u{4ea4}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
+        "dependency.advanced_options",
+        "\u{9ad8}\u{7ea7}\u{9009}\u{9879}",
+    ),
+    (
+        "dependency.repo_type_missing",
+        "\u{672a}\u{63d0}\u{4f9b}\u{8def}\u{5f84}\u{6216} URL",
+    ),
+    ("dependency.repo_type_git", "Git \u{4ed3}\u{5e93}"),
+    (
+        "dependency.repo_type_local",
+        "\u{672c}\u{5730}\u{8def}\u{5f84}",
+    ),
+    (
+        "dependency.error.source_required",
+        "\u{672a}\u{63d0}\u{4f9b}\u{8def}\u{5f84}\u{6216} URL",
+    ),
+    (
+        "dependency.error.local_path_required",
+        "\u{672c}\u{5730}\u{76f8}\u{5bf9}\u{8def}\u{5f84}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
+        "dependency.error.local_path_relative",
+        "\u{672c}\u{5730}\u{8def}\u{5f84}\u{5fc5}\u{987b}\u{662f}\u{4ed3}\u{5e93}\u{5185}\u{76f8}\u{5bf9}\u{8def}\u{5f84}",
+    ),
+    (
+        "lfs.init.title",
+        "\u{4e3a}\u{4ed3}\u{5e93}\u{521d}\u{59cb}\u{5316} Git LFS",
+    ),
+    ("lfs.intro.heading", "Git LFS"),
+    (
+        "lfs.intro.body",
+        "Git LFS \u{4f1a}\u{628a}\u{89c6}\u{9891}\u{3001}\u{8bbe}\u{8ba1}\u{56fe}\u{3001}\u{6e38}\u{620f}\u{8d44}\u{6e90}\u{3001}\u{4e8c}\u{8fdb}\u{5236}\u{5305}\u{7b49}\u{5927}\u{6587}\u{4ef6}\u{4fdd}\u{5b58}\u{5230}\u{5927}\u{6587}\u{4ef6}\u{5b58}\u{50a8}\u{ff0c}\u{4ed3}\u{5e93}\u{91cc}\u{53ea}\u{4fdd}\u{7559}\u{5f88}\u{5c0f}\u{7684}\u{6307}\u{9488}\u{6587}\u{4ef6}\u{3002}\u{8fd9}\u{6837}\u{53ef}\u{4ee5}\u{51cf}\u{5c11}\u{4ed3}\u{5e93}\u{4f53}\u{79ef}\u{548c}\u{62c9}\u{53d6}\u{3001}\u{63a8}\u{9001}\u{7684}\u{5361}\u{987f}\u{3002}",
+    ),
+    (
+        "lfs.intro.note",
+        "\u{5f00}\u{59cb}\u{540e}\u{9700}\u{8981}\u{9009}\u{62e9}\u{8981}\u{7531} Git LFS \u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}\u{7c7b}\u{578b}\u{ff0c}\u{4f8b}\u{5982} *.psd\u{3001}*.mp4 \u{6216} *.zip\u{3002}",
+    ),
+    ("lfs.start", "\u{5f00}\u{59cb}\u{4f7f}\u{7528} Git LFS"),
+    (
+        "lfs.track.title",
+        "Git LFS: \u{9009}\u{62e9}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}",
+    ),
+    (
+        "lfs.patterns_label",
+        "\u{5728} Git LFS \u{4e2d}\u{88ab}\u{8ffd}\u{8e2a}\u{7684}\u{6587}\u{4ef6}\u{7c7b}\u{578b}",
+    ),
+    (
+        "lfs.pattern_help",
+        "\u{4f60}\u{53ef}\u{4ee5}\u{7a0d}\u{540e}\u{518d}\u{4ece}\u{2018}\u{4ed3}\u{5e93} > Git LFS\u{2019}\u{4e0b}\u{7684}\u{83dc}\u{5355}\u{52a0}\u{5165}\u{8be5}\u{5217}\u{8868}\u{3002}",
+    ),
+    ("lfs.add", "\u{6dfb}\u{52a0}"),
+    ("lfs.remove", "\u{79fb}\u{9664}"),
+    ("lfs.track_files", "\u{8ddf}\u{8e2a}\u{6587}\u{4ef6}"),
+    (
+        "lfs.pattern_empty",
+        "\u{5c1a}\u{672a}\u{6dfb}\u{52a0}\u{8ddf}\u{8e2a}\u{7c7b}\u{578b}",
+    ),
+    ("lfs.pattern_placeholder", "\u{4f8b}\u{5982} *.psd"),
+    (
+        "lfs.error.pattern_required",
+        "\u{8ddf}\u{8e2a}\u{7c7b}\u{578b}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
+        "lfs.error.duplicate_pattern",
+        "\u{8ddf}\u{8e2a}\u{7c7b}\u{578b}\u{4e0d}\u{80fd}\u{91cd}\u{590d}",
+    ),
+    (
+        "merge.title",
+        "\u{9009}\u{62e9}\u{4e00}\u{4e2a}\u{63d0}\u{4ea4}\u{5408}\u{5e76}\u{5230}\u{5f53}\u{524d}\u{5206}\u{652f}",
+    ),
+    (
+        "merge.select_commit",
+        "\u{9009}\u{62e9}\u{8981}\u{5408}\u{5e76}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    ("merge.selected_commit", "\u{5df2}\u{9009}\u{63d0}\u{4ea4}:"),
+    (
+        "merge.commit_immediately",
+        "\u{7acb}\u{5373}\u{63d0}\u{4ea4}\u{5408}\u{5e76}\u{ff08}\u{5982}\u{679c}\u{6ca1}\u{6709}\u{51b2}\u{7a81}\u{ff09}",
+    ),
+    (
+        "merge.include_messages",
+        "\u{5305}\u{62ec}\u{88ab}\u{5408}\u{5e76}\u{63d0}\u{4ea4}\u{7684}\u{4fe1}\u{606f}\u{5185}\u{5bb9}",
+    ),
+    (
+        "merge.force_merge_commit",
+        "\u{65e0}\u{8bba}\u{5feb}\u{8fdb}\u{66f4}\u{65b0}\u{662f}\u{5426}\u{53ef}\u{4ee5}\u{88ab}\u{6267}\u{884c}\u{90fd}\u{521b}\u{5efa}\u{4e00}\u{4e2a}\u{65b0}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "merge.rebase",
+        "\u{7528}\u{53d8}\u{57fa}\u{4ee3}\u{66ff}\u{5408}\u{5e76}\u{ff08}\u{8b66}\u{544a}\u{ff1a}\u{8bf7}\u{786e}\u{4fdd}\u{4f60}\u{8fd8}\u{6ca1}\u{6709}\u{63a8}\u{9001}\u{60a8}\u{7684}\u{53d8}\u{66f4}\u{ff09}",
+    ),
+    (
+        "merge.detect_renames",
+        "\u{68c0}\u{6d4b}\u{76f8}\u{4f3c}\u{7684}\u{91cd}\u{547d}\u{540d}",
+    ),
+    ("archive.title", "\u{5b58}\u{6863}"),
+    ("archive.output_path", "\u{5b58}\u{6863}\u{6587}\u{4ef6}:"),
+    (
+        "archive.folder_prefix",
+        "\u{6587}\u{4ef6}\u{5939}\u{524d}\u{7f00}:",
+    ),
+    ("archive.target", "\u{63d0}\u{4ea4}:"),
+    (
+        "archive.worktree",
+        "\u{5de5}\u{4f5c}\u{526f}\u{672c}\u{7248}\u{672c}",
+    ),
+    (
+        "archive.commit",
+        "\u{6307}\u{5b9a}\u{7684}\u{63d0}\u{4ea4}:",
+    ),
+    (
+        "archive.error.output_required",
+        "\u{5b58}\u{6863}\u{6587}\u{4ef6}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
+        "archive.error.commit_required",
+        "\u{6307}\u{5b9a}\u{7684}\u{63d0}\u{4ea4}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
         "branch.pull_tracked",
         "\u{62c9}\u{53d6}\u{ff08}\u{5df2}\u{8ddf}\u{8e2a}\u{ff09}",
     ),
@@ -236,6 +557,39 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "settings.remote_accounts",
         "\u{8fdc}\u{7aef}\u{8d26}\u{6237}",
+    ),
+    (
+        "settings.repository_workspaces",
+        "\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}",
+    ),
+    (
+        "settings.repository_workspaces_hint",
+        "\u{672c}\u{5730}\u{4ed3}\u{5e93}\u{5217}\u{8868}\u{4f1a}\u{626b}\u{63cf}\u{8fd9}\u{4e9b}\u{6587}\u{4ef6}\u{5939}\u{7684}\u{4e0b}\u{4e00}\u{7ea7}\u{3002}",
+    ),
+    (
+        "settings.repository_workspaces_default",
+        "\u{9ed8}\u{8ba4}\u{ff1a}",
+    ),
+    (
+        "settings.repository_workspaces_empty",
+        "\u{672a}\u{914d}\u{7f6e}\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}",
+    ),
+    (
+        "settings.repository_workspace_add",
+        "\u{6dfb}\u{52a0}\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}",
+    ),
+    ("settings.auto_refresh", "\u{81ea}\u{52a8}\u{5237}\u{65b0}"),
+    (
+        "settings.refresh_active_repo_seconds",
+        "\u{5f53}\u{524d}\u{4ed3}\u{5e93}\u{ff08}\u{79d2}\u{ff09}",
+    ),
+    (
+        "settings.refresh_inactive_repo_seconds",
+        "\u{7a97}\u{53e3}\u{5176}\u{4ed6}\u{4ed3}\u{5e93}\u{ff08}\u{79d2}\u{ff09}",
+    ),
+    (
+        "settings.tab_empty",
+        "\u{6b64}\u{5206}\u{7c7b}\u{6682}\u{65e0}\u{914d}\u{7f6e}\u{3002}",
     ),
     (
         "settings.remote_account_name",
@@ -373,7 +727,44 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "push.push_tags",
         "\u{63a8}\u{9001}\u{6240}\u{6709}\u{6807}\u{7b7e}",
     ),
-    ("push.force", "\u{5f3a}\u{5236}\u{63a8}\u{9001}"),
+    (
+        "push.force",
+        "\u{5b89}\u{5168}\u{5f3a}\u{5236}\u{63a8}\u{9001} (--force-with-lease)",
+    ),
+    (
+        "push.detached_error",
+        "\u{5f53}\u{524d}\u{5904}\u{4e8e}\u{5206}\u{79bb} HEAD\u{ff0c}\u{65e0}\u{6cd5}\u{63a8}\u{9001}\u{5230}\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{3002}\u{8bf7}\u{5148}\u{68c0}\u{51fa}\u{6216}\u{521b}\u{5efa}\u{672c}\u{5730}\u{5206}\u{652f}\u{3002}",
+    ),
+    (
+        "push.force_confirm.title",
+        "\u{786e}\u{8ba4}\u{5b89}\u{5168}\u{5f3a}\u{63a8}",
+    ),
+    (
+        "push.force_confirm.message",
+        "\u{8fd9}\u{4f1a}\u{4f7f}\u{7528} --force-with-lease \u{8986}\u{76d6}\u{8fdc}\u{7aef}\u{5206}\u{652f}\u{3002}\u{8bf7}\u{786e}\u{8ba4}\u{8fdc}\u{7aef}\u{6ca1}\u{6709}\u{522b}\u{4eba}\u{65b0}\u{7684}\u{63d0}\u{4ea4}\u{3002}",
+    ),
+    (
+        "push.force_confirm.submit",
+        "\u{786e}\u{8ba4}\u{5b89}\u{5168}\u{5f3a}\u{63a8}",
+    ),
+    (
+        "rewrite_prompt.title",
+        "\u{5386}\u{53f2}\u{5df2}\u{91cd}\u{5199}",
+    ),
+    (
+        "rewrite_prompt.message",
+        "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{5df2}\u{5b8c}\u{6210}\u{ff0c}\u{5f53}\u{524d}\u{5206}\u{652f}\u{4e0e}\u{8fdc}\u{7aef}\u{5386}\u{53f2}\u{5df2}\u{7ecf}\u{5206}\u{53c9}\u{3002}\u{8bf7}\u{6253}\u{5f00}\u{63a8}\u{9001}\u{9009}\u{9879}\u{ff0c}\u{786e}\u{8ba4}\u{540e}\u{4f7f}\u{7528} --force-with-lease \u{5b89}\u{5168}\u{8986}\u{76d6}\u{8fdc}\u{7aef}\u{3002}",
+    ),
+    (
+        "rewrite_prompt.open_push",
+        "\u{6253}\u{5f00}\u{63a8}\u{9001}\u{9009}\u{9879}",
+    ),
+    ("rewrite_prompt.later", "\u{7a0d}\u{540e}\u{5904}\u{7406}"),
+    ("credentials.github_login", "\u{767b}\u{5f55} GitHub"),
+    (
+        "credentials.github_login_done",
+        "GitHub \u{767b}\u{5f55}\u{5df2}\u{5b8c}\u{6210}",
+    ),
 ];
 
 const EN: &[(&str, &str)] = &[
@@ -414,9 +805,28 @@ const EN: &[(&str, &str)] = &[
     ("push.track", "Track?"),
     ("push.select_all", "Select all"),
     ("push.push_tags", "Push all tags"),
-    ("push.force", "Force push"),
+    ("push.force", "Safe force push (--force-with-lease)"),
+    (
+        "push.detached_error",
+        "Current repository is in detached HEAD and cannot be pushed to a remote branch. Check out or create a local branch first.",
+    ),
+    ("push.force_confirm.title", "Confirm Safe Force Push"),
+    (
+        "push.force_confirm.message",
+        "This uses --force-with-lease to update the remote branch. Confirm the remote does not contain someone else's new commits.",
+    ),
+    ("push.force_confirm.submit", "Confirm Safe Force Push"),
+    ("rewrite_prompt.title", "History Rewritten"),
+    (
+        "rewrite_prompt.message",
+        "Interactive rebase completed and the current branch now diverges from the remote history. Open push options and use --force-with-lease after confirming.",
+    ),
+    ("rewrite_prompt.open_push", "Open Push Options"),
+    ("rewrite_prompt.later", "Later"),
     ("settings.title", "Settings"),
     ("options.title", "Options"),
+    ("settings.appearance", "Appearance"),
+    ("settings.theme", "Theme"),
     ("repo.settings", "Repository Settings"),
     ("repo.settings.title", "Repository Settings"),
     ("repo.settings.remote_paths", "Remote repository paths"),
@@ -428,6 +838,27 @@ const EN: &[(&str, &str)] = &[
     ("repo.settings.url_path", "URL / Path"),
     ("repo.settings.remote_account", "Remote Account"),
     ("settings.remote_accounts", "Remote Accounts"),
+    ("settings.repository_workspaces", "Workspaces"),
+    (
+        "settings.repository_workspaces_hint",
+        "Local repositories scan one level below these folders.",
+    ),
+    ("settings.repository_workspaces_default", "Default:"),
+    (
+        "settings.repository_workspaces_empty",
+        "No workspaces configured",
+    ),
+    ("settings.repository_workspace_add", "Add workspace"),
+    ("settings.auto_refresh", "Auto Refresh"),
+    (
+        "settings.refresh_active_repo_seconds",
+        "Current repo (seconds)",
+    ),
+    (
+        "settings.refresh_inactive_repo_seconds",
+        "Other repos (seconds)",
+    ),
+    ("settings.tab_empty", "No settings in this category yet."),
     ("settings.remote_account_name", "Account name"),
     ("settings.remote_account_host", "Host"),
     ("repo.settings.add_remote", "Add Remote"),
@@ -552,6 +983,192 @@ const EN: &[(&str, &str)] = &[
         "branch.discard_before_checkout",
         "Clear (discard all changes)",
     ),
+    ("checkout.title", "Checkout"),
+    ("checkout.existing", "Checkout existing"),
+    ("checkout.new_branch", "Checkout new branch"),
+    ("checkout.existing_commit", "Select commit to checkout"),
+    ("checkout.remote_branch", "Remote branch to checkout:"),
+    ("checkout.local_branch", "New local branch name:"),
+    ("checkout.select_remote_branch", "Select remote branch"),
+    (
+        "checkout.track_remote",
+        "Local branch should track remote branch",
+    ),
+    (
+        "checkout.detached_confirm_title",
+        "Warning: creating detached HEAD",
+    ),
+    ("checkout.detached_target", "Checkout commit"),
+    (
+        "checkout.detached_warning_detail",
+        "Checking out this commit creates a detached HEAD. You will not be on any branch. Use it for temporary commit verification; create a new branch if you need to keep the work.",
+    ),
+    (
+        "checkout.error.fix_inputs",
+        "Please correct the following input errors:",
+    ),
+    (
+        "checkout.error.local_branch_invalid",
+        "Local branch name is invalid",
+    ),
+    (
+        "checkout.error.remote_branch_invalid",
+        "Selected remote branch name is invalid",
+    ),
+    (
+        "checkout.error.local_branch_exists",
+        "Local branch already exists",
+    ),
+    ("interactive_rebase.title", "Interactive Rebase"),
+    (
+        "interactive_rebase.select_commit",
+        "Select commits to rebase",
+    ),
+    ("interactive_rebase.selected_commit", "Selected commit:"),
+    ("interactive_rebase.todo_action", "Action:"),
+    ("interactive_rebase.todo.pick", "Pick"),
+    ("interactive_rebase.todo.squash", "Squash into previous"),
+    ("interactive_rebase.todo.drop", "Drop"),
+    ("interactive_rebase.reset", "Reset"),
+    ("interactive_rebase.selected_count", "Selected"),
+    ("interactive_rebase.drop_selected", "Drop selected"),
+    (
+        "interactive_rebase.squash_selected",
+        "Squash selected into previous",
+    ),
+    ("interactive_rebase.reset_selected", "Reset selected"),
+    (
+        "interactive_rebase.merge_commit_disabled",
+        "Merge commits are shown for context and cannot be edited by this interactive rebase.",
+    ),
+    ("interactive_rebase.squash_previous", "Squash with previous"),
+    ("interactive_rebase.drop_commit", "Drop"),
+    (
+        "interactive_rebase.error.dirty",
+        "git rebase -i --autosquash\nerror: cannot rebase: You have unstaged changes.\nerror: Please commit or stash them.",
+    ),
+    (
+        "interactive_rebase.error.index_dirty",
+        "git rebase -i --autosquash\nerror: cannot rebase: Your index contains uncommitted changes.\nerror: Please commit or stash them.",
+    ),
+    (
+        "interactive_rebase.error.in_progress",
+        "A rebase is already in progress.\nRun git rebase --continue, --abort, or --skip before starting another interactive rebase.",
+    ),
+    (
+        "interactive_rebase.error.detached",
+        "Current repository is in detached HEAD. Check out or create a local branch before interactive rebase.",
+    ),
+    (
+        "interactive_rebase.error.no_commits",
+        "Current branch has no commits available for interactive rebase",
+    ),
+    (
+        "interactive_rebase.error.first_squash",
+        "Oldest commit cannot be squash",
+    ),
+    ("interactive_rebase.in_progress.title", "Rebase in progress"),
+    (
+        "interactive_rebase.in_progress.detail",
+        "This repository is currently running git rebase. Resolve conflicts, then continue, skip the current commit, or abort the rebase.",
+    ),
+    (
+        "interactive_rebase.in_progress.conflicts",
+        "Conflicted files must be resolved and staged before continuing.",
+    ),
+    ("interactive_rebase.in_progress.continue", "Continue"),
+    ("interactive_rebase.in_progress.skip", "Skip current commit"),
+    ("interactive_rebase.in_progress.abort", "Abort rebase"),
+    ("submodule.title", "Add Submodule..."),
+    ("submodule.source", "Source path / URL:"),
+    ("submodule.repo_type", "Repository type:"),
+    ("submodule.local_path", "Local relative path:"),
+    ("submodule.source_branch", "Source branch:"),
+    ("submodule.recursive", "Recursive submodules"),
+    ("subtree.title", "Add/Link Subtree"),
+    ("subtree.source", "Source path / URL:"),
+    ("subtree.repo_type", "Repository type:"),
+    ("subtree.ref_name", "Branch / Commit:"),
+    ("subtree.local_path", "Local relative path:"),
+    ("subtree.squash", "Squash commits?"),
+    ("subtree.error.ref_required", "Branch / commit is required"),
+    ("dependency.advanced_options", "Advanced options"),
+    ("dependency.repo_type_missing", "No path or URL provided"),
+    ("dependency.repo_type_git", "Git repository"),
+    ("dependency.repo_type_local", "Local path"),
+    (
+        "dependency.error.source_required",
+        "No path or URL provided",
+    ),
+    (
+        "dependency.error.local_path_required",
+        "Local relative path is required",
+    ),
+    (
+        "dependency.error.local_path_relative",
+        "Local path must be a relative path inside the repository",
+    ),
+    ("lfs.init.title", "Initialize Git LFS for repository"),
+    ("lfs.intro.heading", "Git LFS"),
+    (
+        "lfs.intro.body",
+        "Git LFS stores large files such as videos, designs, game assets, and binary packages in large-file storage while keeping small pointer files in the Git repository. This keeps clones, pulls, and pushes lighter.",
+    ),
+    (
+        "lfs.intro.note",
+        "Next choose file patterns Git LFS should track, such as *.psd, *.mp4, or *.zip.",
+    ),
+    ("lfs.start", "Start using Git LFS"),
+    ("lfs.track.title", "Git LFS: Select tracked files"),
+    ("lfs.patterns_label", "File types tracked in Git LFS"),
+    (
+        "lfs.pattern_help",
+        "You can add more patterns later from Repository > Git LFS.",
+    ),
+    ("lfs.add", "Add"),
+    ("lfs.remove", "Remove"),
+    ("lfs.track_files", "Track files"),
+    ("lfs.pattern_empty", "No tracked patterns yet"),
+    ("lfs.pattern_placeholder", "Example: *.psd"),
+    ("lfs.error.pattern_required", "Tracked pattern is required"),
+    (
+        "lfs.error.duplicate_pattern",
+        "Tracked patterns cannot repeat",
+    ),
+    (
+        "merge.title",
+        "Select a commit to merge into the current branch",
+    ),
+    ("merge.select_commit", "Select commit to merge"),
+    ("merge.selected_commit", "Selected commit:"),
+    (
+        "merge.commit_immediately",
+        "Commit merged changes immediately (if there are no conflicts)",
+    ),
+    (
+        "merge.include_messages",
+        "Include messages from merged commits",
+    ),
+    (
+        "merge.force_merge_commit",
+        "Create a new commit even if fast-forward is possible",
+    ),
+    (
+        "merge.rebase",
+        "Rebase instead of merge (warning: make sure you have not pushed your changes)",
+    ),
+    ("merge.detect_renames", "Detect similar renames"),
+    ("archive.title", "Archive"),
+    ("archive.output_path", "Archive file:"),
+    ("archive.folder_prefix", "Folder prefix:"),
+    ("archive.target", "Commit:"),
+    ("archive.worktree", "Working copy version"),
+    ("archive.commit", "Specified commit:"),
+    ("archive.error.output_required", "Archive file is required"),
+    (
+        "archive.error.commit_required",
+        "Specified commit is required",
+    ),
     ("branch.pull_tracked", "Pull (tracked)"),
     ("branch.push_tracked", "Push to (tracked)"),
     ("branch.push_to", "Push to"),
@@ -565,7 +1182,7 @@ const EN: &[(&str, &str)] = &[
     ("remote.title", "Remote Branches"),
     ("remote.none", "No remote repositories"),
     ("remote.no_branches", "No fetched remote branches"),
-    ("worktree.title", "Working Tree"),
+    ("worktree.title", "Workspace"),
     ("worktree.clean", "Clean"),
     ("worktree.clean_detail", "No pending file changes."),
     ("nav.history", "History"),
@@ -579,6 +1196,14 @@ const EN: &[(&str, &str)] = &[
     ("worktree.view_tree", "Tree view"),
     ("worktree.view_flat", "Full paths"),
     ("worktree.add_gitignore", "Add to .gitignore"),
+    (
+        "worktree.discard_all_confirm",
+        "Discard all uncommitted changes?",
+    ),
+    (
+        "worktree.discard_all_warning",
+        "This resets tracked changes and deletes untracked files.",
+    ),
     ("worktree.resolve_conflict", "Resolve conflict"),
     ("worktree.resolve_conflicts", "Resolve conflicts"),
     ("worktree.conflicts.title", "Conflicts"),
@@ -598,6 +1223,10 @@ const EN: &[(&str, &str)] = &[
     ("stash.pop", "Pop stash"),
     ("stash.drop", "Drop stash"),
     ("stash.confirm_drop", "Drop this stash?"),
+    ("stash.staged_files", "Staged files / selected files"),
+    ("stash.keep_staged", "Keep staged changes"),
+    ("stash.include_untracked", "Untracked files"),
+    ("stash.include_ignored", "All"),
     ("tag.title", "Tags"),
     ("tag.none", "No tags"),
     ("tag.create", "Create tag"),
@@ -653,6 +1282,8 @@ const EN: &[(&str, &str)] = &[
     ("dialog.close", "Close"),
     ("dialog.error.title", "Git error"),
     ("dialog.error.message", "The Git command returned an error."),
+    ("credentials.github_login", "Log in to GitHub"),
+    ("credentials.github_login_done", "GitHub login completed"),
     ("menu.copy_hash", "Copy commit hash"),
     ("menu.copy_short_hash", "Copy short hash"),
     ("menu.copy", "Copy"),

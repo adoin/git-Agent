@@ -39,8 +39,17 @@ const TOP_BAR_ROW_HEIGHT: f32 = 40.0;
 const TOP_BAR_GLOBAL_WIDTH: f32 = 480.0;
 const TOP_BAR_GLOBAL_ACTION_Y_OFFSET: f32 = -1.0;
 
-fn background_repo_refresh_interval() -> Duration {
-    Duration::from_secs(60)
+const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
+const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
+const MIN_REPO_REFRESH_SECONDS: u64 = 1;
+const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
+
+fn sanitize_repo_refresh_seconds(seconds: u64) -> u64 {
+    seconds.clamp(MIN_REPO_REFRESH_SECONDS, MAX_REPO_REFRESH_SECONDS)
+}
+
+fn repo_refresh_duration(seconds: u64) -> Duration {
+    Duration::from_secs(sanitize_repo_refresh_seconds(seconds))
 }
 const TOP_BAR_MIN_TABS_WIDTH: f32 = 420.0;
 const TOP_BAR_PANEL_X_INSET: f32 = 8.0;
@@ -61,12 +70,19 @@ const FILE_ROW_ICON_SLOT: f32 = 24.0;
 const FILE_ROW_LEFT_INSET: f32 = 10.0;
 const BRANCH_CURRENT_BADGE_RIGHT_GAP: f32 = 4.0;
 const BRANCH_CURRENT_BADGE_Y_OFFSET: f32 = 0.0;
-const WORKSPACE_LIST_COMMIT_GAP: f32 = 2.0;
-const WORKSPACE_HEADER_TOP_GAP: f32 = 4.0;
-const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 6.0;
-const WORKSPACE_HEADER_TITLE_SIZE: f32 = 20.0;
+const WORKSPACE_LIST_COMMIT_GAP: f32 = 7.0;
+const WORKSPACE_TABLE_GAP: f32 = 13.0;
+const WORKSPACE_HEADER_TOP_GAP: f32 = 1.0;
+const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 3.0;
+const WORKSPACE_HEADER_TITLE_SIZE: f32 = 18.0;
 const WORKSPACE_CARD_RADIUS: u8 = 6;
 const WORKSPACE_CARD_SHADOW_PAD: f32 = 14.0;
+const WORKSPACE_REPOSITORY_ROW_BODY_HEIGHT: f32 = 44.0;
+const WORKSPACE_REPOSITORY_ROW_VERTICAL_INSET: f32 = 1.0;
+const WORKSPACE_REPOSITORY_ROW_GAP: f32 = 0.0;
+const WORKSPACE_REPOSITORY_ROW_HEIGHT: f32 = WORKSPACE_REPOSITORY_ROW_BODY_HEIGHT
+    + WORKSPACE_REPOSITORY_ROW_VERTICAL_INSET * 2.0
+    + WORKSPACE_REPOSITORY_ROW_GAP;
 const COMMIT_MESSAGE_EDITOR_MIN_HEIGHT: f32 = 34.0;
 const COMMIT_BUTTON_ROW_HEIGHT: f32 = 30.0;
 const COMMIT_MESSAGE_BOTTOM_GAP: f32 = 4.0;
@@ -85,8 +101,8 @@ const CONTENT_PANEL_INSET_X: i8 = 14;
 const CONTENT_PANEL_INSET_Y: i8 = 12;
 const RESOURCE_ROW_HEIGHT: f32 = 30.0;
 const RESOURCE_TABLE_HEADER_HEIGHT: f32 = 24.0;
-const SETTINGS_DIALOG_WIDTH: f32 = 760.0;
-const SETTINGS_DIALOG_HEIGHT: f32 = 580.0;
+const SETTINGS_DIALOG_WIDTH: f32 = 960.0;
+const SETTINGS_DIALOG_HEIGHT: f32 = 680.0;
 const REPO_SETTINGS_DIALOG_WIDTH: f32 = 700.0;
 const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 460.0;
 const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
@@ -108,6 +124,14 @@ const PUSH_TABLE_ROW_HEIGHT: f32 = 28.0;
 const PUSH_TABLE_BODY_TEXT_Y_OFFSET: f32 = 3.0;
 const ACTION_DIALOG_TITLE_HEIGHT: f32 = 34.0;
 const ACTION_DIALOG_TITLE_SIZE: f32 = 16.0;
+const CHECKOUT_DIALOG_WIDTH: f32 = 980.0;
+const CHECKOUT_TAB_WIDTH: f32 = 142.0;
+const CHECKOUT_TAB_HEIGHT: f32 = 30.0;
+const ARCHIVE_DIALOG_WIDTH: f32 = 700.0;
+const MERGE_DIALOG_WIDTH: f32 = 980.0;
+const INTERACTIVE_REBASE_DIALOG_WIDTH: f32 = 980.0;
+const DEPENDENCY_DIALOG_WIDTH: f32 = 700.0;
+const LFS_DIALOG_WIDTH: f32 = 460.0;
 const REPO_SETTINGS_TABS_HEIGHT: f32 = 34.0;
 const REPO_SETTINGS_TAB_WIDTH: f32 = 104.0;
 const REPO_SETTINGS_TAB_HEIGHT: f32 = 28.0;
@@ -330,6 +354,11 @@ pub struct GitAgentApp {
     search_diff_display_mode: DiffDisplayMode,
     repo_source_search: String,
     known_repositories: Vec<KnownRepository>,
+    repository_workspaces: Vec<PathBuf>,
+    active_repository_workspace_index: usize,
+    show_workspace_repositories: bool,
+    workspace_repository_search: String,
+    next_workspace_repo_status_load_at: Instant,
     clone_url: String,
     clone_destination: String,
     create_repo_path: String,
@@ -339,8 +368,12 @@ pub struct GitAgentApp {
     search_dimension: SearchDimension,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
     foreground_repo_loads: HashSet<String>,
-    next_background_repo_refresh_at: Instant,
+    next_active_repo_refresh_at: Instant,
+    next_inactive_repo_refresh_at: Instant,
+    active_repo_refresh_seconds: u64,
+    inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    credential_login_task: Option<Receiver<anyhow::Result<()>>>,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
@@ -376,6 +409,16 @@ pub struct GitAgentApp {
     pending_fetch_action: Option<FetchActionDialog>,
     pending_pull_action: Option<PullActionDialog>,
     pending_push_action: Option<PushActionDialog>,
+    pending_force_push_confirm: Option<ConfirmForcePushDialog>,
+    pending_rewritten_history_prompt_root: Option<PathBuf>,
+    pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
+    pending_archive_action: Option<ArchiveActionDialog>,
+    pending_merge_action: Option<MergeActionDialog>,
+    pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>,
+    pending_rebase_control_action: Option<RebaseControlDialog>,
+    pending_submodule_action: Option<SubmoduleActionDialog>,
+    pending_subtree_action: Option<SubtreeActionDialog>,
+    pending_lfs_action: Option<LfsActionDialog>,
     commit_message: String,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
@@ -404,6 +447,8 @@ pub struct GitAgentApp {
     theme_accent: theme::ThemeAccent,
     layout_prefs: LayoutPrefs,
     history_show_remote_refs: bool,
+    history_show_branch_refs: bool,
+    history_show_tag_refs: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -421,6 +466,7 @@ struct RepoTabDragState {
 struct KnownRepository {
     root: PathBuf,
     name: String,
+    workspace_index: Option<usize>,
 }
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
@@ -432,6 +478,18 @@ type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 struct UpstreamSyncCounts {
     ahead: usize,
     behind: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRefKind {
+    Branch,
+    Tag,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryRefLabel {
+    name: String,
+    kind: HistoryRefKind,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -539,8 +597,18 @@ enum HistoryBranchScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsTab {
     General,
+    Git,
+    CustomActions,
+    Verification,
+    Network,
     RepoRemotes,
     RepoAdvanced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutDialogTab {
+    Existing,
+    NewBranch,
 }
 
 #[derive(Clone, Debug)]
@@ -597,6 +665,7 @@ enum CommitMenuAction {
 #[derive(Clone, Debug)]
 enum WorktreeActionDialog {
     ConfirmDiscard { path: String, untracked: bool },
+    ConfirmDiscardAll,
     ResolveConflicts { selected_path: Option<String> },
 }
 
@@ -641,12 +710,134 @@ struct PushActionDialog {
 }
 
 #[derive(Clone, Debug)]
+struct RewrittenHistoryPrompt {
+    branch: String,
+    upstream: String,
+    ahead: usize,
+    behind: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ConfirmForcePushDialog {
+    remote: String,
+    branches: Vec<git::PushBranchSpec>,
+    options: git::PushOptions,
+}
+
+#[derive(Clone, Debug)]
 struct PushBranchRow {
     selected: bool,
     local_branch: String,
     remote_branch: String,
     track: bool,
     upstream: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveTarget {
+    Worktree,
+    Commit,
+}
+
+#[derive(Clone, Debug)]
+struct ArchiveActionDialog {
+    output_path: String,
+    folder_prefix: String,
+    target: ArchiveTarget,
+    target_commit: String,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MergeActionDialog {
+    selected_hash: String,
+    selected_short_hash: String,
+    branch_scope: HistoryBranchScope,
+    sort_order: HistorySortOrder,
+    show_remote_refs: bool,
+    search: String,
+    history_cache: HistoryCommitBrowserCache,
+    commit_immediately: bool,
+    include_messages: bool,
+    force_merge_commit: bool,
+    rebase: bool,
+    detect_renames: bool,
+    rename_threshold: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveRebaseTodoAction {
+    Pick,
+    Squash,
+    Drop,
+}
+
+impl InteractiveRebaseTodoAction {
+    fn label(self, language: Language) -> &'static str {
+        match self {
+            Self::Pick => i18n::t(language, "interactive_rebase.todo.pick"),
+            Self::Squash => i18n::t(language, "interactive_rebase.todo.squash"),
+            Self::Drop => i18n::t(language, "interactive_rebase.todo.drop"),
+        }
+    }
+
+    fn to_git_action(self) -> git::InteractiveRebaseAction {
+        match self {
+            Self::Pick => git::InteractiveRebaseAction::Pick,
+            Self::Squash => git::InteractiveRebaseAction::Squash,
+            Self::Drop => git::InteractiveRebaseAction::Drop,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InteractiveRebaseActionDialog {
+    selected_hash: String,
+    selected_short_hash: String,
+    branch_scope: HistoryBranchScope,
+    sort_order: HistorySortOrder,
+    show_remote_refs: bool,
+    search: String,
+    history_cache: HistoryCommitBrowserCache,
+    actions: BTreeMap<String, InteractiveRebaseTodoAction>,
+    selected_hashes: HashSet<String>,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RebaseControlDialog {
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SubmoduleActionDialog {
+    source: String,
+    local_path: String,
+    source_branch: String,
+    recursive: bool,
+    advanced_open: bool,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SubtreeActionDialog {
+    source: String,
+    local_path: String,
+    ref_name: String,
+    squash: bool,
+    advanced_open: bool,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum LfsActionDialog {
+    Intro,
+    Track {
+        original_patterns: Vec<String>,
+        patterns: Vec<String>,
+        selected: Option<usize>,
+        validation_error: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,8 +855,17 @@ const CONFLICT_MODAL_PANEL_GAP: f32 = 14.0;
 
 #[derive(Clone, Debug)]
 enum StashActionDialog {
-    Create { message: String },
-    ConfirmDrop { selector: String, message: String },
+    Create {
+        message: String,
+        staged_files: bool,
+        keep_staged: bool,
+        include_untracked: bool,
+        include_ignored: bool,
+    },
+    ConfirmDrop {
+        selector: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -673,6 +873,26 @@ enum BranchActionDialog {
     Create {
         name: String,
         checkout: bool,
+    },
+    Checkout {
+        tab: CheckoutDialogTab,
+        selected_hash: String,
+        selected_short_hash: String,
+        discard_changes: bool,
+        history_branch_scope: HistoryBranchScope,
+        history_sort_order: HistorySortOrder,
+        history_show_remote_refs: bool,
+        history_search: String,
+        history_cache: HistoryCommitBrowserCache,
+        remote_branch: String,
+        local_branch: String,
+        track_remote: bool,
+        validation_error: Option<String>,
+    },
+    ConfirmDetachedCheckout {
+        hash: String,
+        short_hash: String,
+        discard_changes: bool,
     },
     ConfirmCheckout {
         name: String,
@@ -971,6 +1191,65 @@ impl HistoryRowsCache {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryCommitBrowserCommitKey {
+    commit_count: usize,
+    first_hash: String,
+    last_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistoryCommitBrowserSearchKey {
+    commits: HistoryCommitBrowserCommitKey,
+    search: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistoryCommitBrowserCache {
+    commit_key: Option<HistoryCommitBrowserCommitKey>,
+    search_key: Option<HistoryCommitBrowserSearchKey>,
+    layout: graph::GraphLayout,
+    visible_indexes: Vec<usize>,
+}
+
+impl HistoryCommitBrowserCache {
+    fn refresh(&mut self, commits: &[Commit], search: &str) {
+        let commit_key = history_commit_browser_commit_key(commits);
+        if self.commit_key.as_ref() != Some(&commit_key) {
+            self.layout = graph::layout(commits);
+            self.commit_key = Some(commit_key.clone());
+            self.search_key = None;
+            self.visible_indexes.clear();
+        }
+
+        let search = search.trim().to_lowercase();
+        let search_key = HistoryCommitBrowserSearchKey {
+            commits: commit_key,
+            search: search.clone(),
+        };
+        if self.search_key.as_ref() == Some(&search_key) {
+            return;
+        }
+
+        self.visible_indexes = history_browser_visible_indexes_for_query(commits, &search);
+        self.search_key = Some(search_key);
+    }
+}
+
+fn history_commit_browser_commit_key(commits: &[Commit]) -> HistoryCommitBrowserCommitKey {
+    HistoryCommitBrowserCommitKey {
+        commit_count: commits.len(),
+        first_hash: commits
+            .first()
+            .map(|commit| commit.hash.clone())
+            .unwrap_or_default(),
+        last_hash: commits
+            .last()
+            .map(|commit| commit.hash.clone())
+            .unwrap_or_default(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct LayoutPrefs {
@@ -993,6 +1272,9 @@ struct AppSettings {
     theme: SettingsThemeMode,
     theme_accent: SettingsThemeAccent,
     language: SettingsLanguage,
+    workspaces: Vec<PathBuf>,
+    active_repo_refresh_seconds: u64,
+    inactive_repo_refresh_seconds: u64,
     remote_accounts: Vec<RemoteAccountSettings>,
 }
 
@@ -1004,7 +1286,7 @@ enum SettingsThemeMode {
 
 impl Default for SettingsThemeMode {
     fn default() -> Self {
-        Self::Dark
+        Self::Light
     }
 }
 
@@ -1019,7 +1301,7 @@ enum SettingsThemeAccent {
 
 impl Default for SettingsThemeAccent {
     fn default() -> Self {
-        Self::Green
+        Self::Blue
     }
 }
 
@@ -1038,9 +1320,12 @@ impl Default for SettingsLanguage {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            theme: SettingsThemeMode::Dark,
-            theme_accent: SettingsThemeAccent::Green,
+            theme: SettingsThemeMode::Light,
+            theme_accent: SettingsThemeAccent::Blue,
             language: SettingsLanguage::Chinese,
+            workspaces: Vec::new(),
+            active_repo_refresh_seconds: DEFAULT_ACTIVE_REPO_REFRESH_SECONDS,
+            inactive_repo_refresh_seconds: DEFAULT_INACTIVE_REPO_REFRESH_SECONDS,
             remote_accounts: vec![RemoteAccountSettings::default()],
         }
     }
@@ -1076,6 +1361,38 @@ fn normalized_remote_accounts(accounts: &[RemoteAccountSettings]) -> Vec<RemoteA
     } else {
         accounts.to_vec()
     }
+}
+
+fn normalized_repository_workspaces(workspaces: &[PathBuf]) -> Vec<PathBuf> {
+    let mut normalized: Vec<PathBuf> = Vec::new();
+    for workspace in workspaces {
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+        let workspace = user_facing_path_buf(&workspace);
+        if normalized
+            .iter()
+            .any(|existing| paths_equal(existing.as_path(), workspace.as_path()))
+        {
+            continue;
+        }
+        normalized.push(workspace);
+    }
+    normalized
+}
+
+fn user_facing_path_buf(path: &Path) -> PathBuf {
+    PathBuf::from(user_facing_path_string(path))
+}
+
+fn user_facing_path_string(path: &Path) -> String {
+    let path = path.display().to_string();
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    path.strip_prefix(r"\\?\")
+        .map(ToOwned::to_owned)
+        .unwrap_or(path)
 }
 
 fn validate_remote_account_settings(name: &str, host: &str) -> Result<(), String> {
@@ -1518,6 +1835,10 @@ impl GitAgentApp {
         theme::install(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let app_settings = AppSettings::load();
+        let active_repo_refresh_seconds =
+            sanitize_repo_refresh_seconds(app_settings.active_repo_refresh_seconds);
+        let inactive_repo_refresh_seconds =
+            sanitize_repo_refresh_seconds(app_settings.inactive_repo_refresh_seconds);
         let tabs_state = RepoTabsState::load();
         let has_saved_tabs = tabs_state.source_tab_open || !tabs_state.tabs.is_empty();
         let repo_tabs = tabs_state.repo_tabs();
@@ -1549,6 +1870,11 @@ impl GitAgentApp {
             search_diff_display_mode: DiffDisplayMode::Blocks,
             repo_source_search: String::new(),
             known_repositories: Vec::new(),
+            repository_workspaces: normalized_repository_workspaces(&app_settings.workspaces),
+            active_repository_workspace_index: 0,
+            show_workspace_repositories: true,
+            workspace_repository_search: String::new(),
+            next_workspace_repo_status_load_at: Instant::now(),
             clone_url: String::new(),
             clone_destination: String::new(),
             create_repo_path: String::new(),
@@ -1558,8 +1884,14 @@ impl GitAgentApp {
             search_dimension: SearchDimension::Message,
             repo_tasks: HashMap::new(),
             foreground_repo_loads: HashSet::new(),
-            next_background_repo_refresh_at: Instant::now() + background_repo_refresh_interval(),
+            next_active_repo_refresh_at: Instant::now()
+                + repo_refresh_duration(active_repo_refresh_seconds),
+            next_inactive_repo_refresh_at: Instant::now()
+                + repo_refresh_duration(inactive_repo_refresh_seconds),
+            active_repo_refresh_seconds,
+            inactive_repo_refresh_seconds,
             remote_git_task: None,
+            credential_login_task: None,
             branch_checkout_task: None,
             merge_tool_task: None,
             repo_source_task: None,
@@ -1595,6 +1927,16 @@ impl GitAgentApp {
             pending_fetch_action: None,
             pending_pull_action: None,
             pending_push_action: None,
+            pending_force_push_confirm: None,
+            pending_rewritten_history_prompt_root: None,
+            pending_rewritten_history_prompt: None,
+            pending_archive_action: None,
+            pending_merge_action: None,
+            pending_interactive_rebase_action: None,
+            pending_rebase_control_action: None,
+            pending_submodule_action: None,
+            pending_subtree_action: None,
+            pending_lfs_action: None,
             commit_message: String::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
@@ -1633,6 +1975,8 @@ impl GitAgentApp {
             theme_accent: app_settings.theme_accent.into(),
             layout_prefs: LayoutPrefs::load(),
             history_show_remote_refs: true,
+            history_show_branch_refs: true,
+            history_show_tag_refs: true,
         };
 
         app.refresh_known_repositories();
@@ -1737,25 +2081,43 @@ impl GitAgentApp {
         self.spawn_repository_snapshot_load(path, repo_task_key);
     }
 
-    fn maybe_refresh_inactive_repositories(&mut self, ctx: &egui::Context) {
+    fn maybe_refresh_repositories(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        if now < self.next_background_repo_refresh_at {
-            ctx.request_repaint_after(self.next_background_repo_refresh_at - now);
-            return;
+
+        if now >= self.next_active_repo_refresh_at {
+            self.next_active_repo_refresh_at = now + self.active_repo_refresh_duration();
+            let active_tabs = self
+                .repo_tabs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.active_repo_tab == Some(*index))
+                .map(|(_, tab)| tab.clone())
+                .collect::<Vec<_>>();
+            for tab in active_tabs {
+                self.start_repository_snapshot_load(tab.root.clone());
+            }
         }
 
-        self.next_background_repo_refresh_at = now + background_repo_refresh_interval();
-        let inactive_tabs = self
-            .repo_tabs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| self.active_repo_tab != Some(*index))
-            .map(|(_, tab)| tab.clone())
-            .collect::<Vec<_>>();
-        for tab in inactive_tabs {
-            self.start_repository_snapshot_load(tab.root.clone());
+        if now >= self.next_inactive_repo_refresh_at {
+            self.next_inactive_repo_refresh_at = now + self.inactive_repo_refresh_duration();
+            let inactive_tabs = self
+                .repo_tabs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.active_repo_tab != Some(*index))
+                .map(|(_, tab)| tab.clone())
+                .collect::<Vec<_>>();
+            for tab in inactive_tabs {
+                self.start_repository_snapshot_load(tab.root.clone());
+            }
         }
-        ctx.request_repaint_after(background_repo_refresh_interval());
+
+        let next_refresh_at = self
+            .next_active_repo_refresh_at
+            .min(self.next_inactive_repo_refresh_at);
+        if now < next_refresh_at {
+            ctx.request_repaint_after(next_refresh_at - now);
+        }
     }
 
     fn open_repository_source_tab(&mut self) {
@@ -1769,6 +2131,21 @@ impl GitAgentApp {
 
     fn repository_source_active(&self) -> bool {
         self.source_tab_open && self.active_repo_tab.is_none()
+    }
+
+    fn open_tab_count(&self) -> usize {
+        self.repo_tabs.len() + usize::from(self.source_tab_open)
+    }
+
+    fn activate_repository_source_tab(&mut self) {
+        if !self.source_tab_open {
+            return;
+        }
+        self.active_repo_tab = None;
+        self.active_view = MainView::Workspace;
+        self.commit_state = RepoCommitState::default();
+        self.refresh_known_repositories();
+        self.save_repo_tabs();
     }
 
     fn ensure_repo_tab(&mut self, path: PathBuf) {
@@ -1803,6 +2180,33 @@ impl GitAgentApp {
             self.active_repo_tab = Some(index);
             self.save_repo_tabs();
             self.load_repository(tab.root);
+        }
+    }
+
+    fn switch_to_next_tab(&mut self) {
+        if self.open_tab_count() <= 1 {
+            return;
+        }
+        match self.active_repo_tab {
+            Some(index) if index + 1 < self.repo_tabs.len() => self.switch_repo_tab(index + 1),
+            Some(_) if self.source_tab_open => self.activate_repository_source_tab(),
+            Some(_) => self.switch_repo_tab(0),
+            None if !self.repo_tabs.is_empty() => self.switch_repo_tab(0),
+            None => {}
+        }
+    }
+
+    fn switch_to_previous_tab(&mut self) {
+        if self.open_tab_count() <= 1 {
+            return;
+        }
+        match self.active_repo_tab {
+            Some(index) if index > 0 => self.switch_repo_tab(index - 1),
+            Some(_) if self.source_tab_open => self.activate_repository_source_tab(),
+            Some(_) if !self.repo_tabs.is_empty() => self.switch_repo_tab(self.repo_tabs.len() - 1),
+            Some(_) => {}
+            None if !self.repo_tabs.is_empty() => self.switch_repo_tab(self.repo_tabs.len() - 1),
+            None => {}
         }
     }
 
@@ -1942,6 +2346,7 @@ impl GitAgentApp {
         self.sync_active_tab_with_snapshot(&snapshot);
         self.apply_sidebar_tree_state_for_repo(&snapshot.root);
         self.apply_merge_commit_message_default(&snapshot);
+        self.maybe_prepare_rewritten_history_prompt(&snapshot);
         self.snapshot = Some(snapshot);
         self.details_cache.clear();
         self.diff_cache.clear();
@@ -1958,6 +2363,29 @@ impl GitAgentApp {
         self.selected_worktree_file = None;
         self.worktree_selection = WorktreeSelectionState::default();
         self.request_selected_details();
+    }
+
+    fn maybe_prepare_rewritten_history_prompt(&mut self, snapshot: &RepositorySnapshot) {
+        let Some(root) = self.pending_rewritten_history_prompt_root.take() else {
+            return;
+        };
+        if !paths_equal(&root, &snapshot.root) {
+            self.pending_rewritten_history_prompt_root = Some(root);
+            return;
+        }
+        let Some(upstream) = snapshot.upstream.as_ref() else {
+            return;
+        };
+        if upstream.ahead > 0 && upstream.behind > 0 {
+            if let Some(branch) = current_named_local_branch(snapshot) {
+                self.pending_rewritten_history_prompt = Some(RewrittenHistoryPrompt {
+                    branch: branch.name.clone(),
+                    upstream: upstream.name.clone(),
+                    ahead: upstream.ahead,
+                    behind: upstream.behind,
+                });
+            }
+        }
     }
 
     fn apply_merge_commit_message_default(&mut self, snapshot: &RepositorySnapshot) {
@@ -2061,6 +2489,24 @@ impl GitAgentApp {
         self.last_notice = Some(self.tr("repo.git_flow.opened").to_owned());
     }
 
+    fn open_repo_settings_from_menu(&mut self) {
+        self.repo_settings_tab = SettingsTab::RepoRemotes;
+        self.repo_settings_open = true;
+    }
+
+    fn stage_toggle_current_repository(&mut self) {
+        self.pending_toolbar_single_click = None;
+        self.active_view = MainView::Workspace;
+        self.focus_commit_message = true;
+        let action = self
+            .snapshot
+            .as_ref()
+            .and_then(shortcut_stage_toggle_action);
+        if let Some(action) = action {
+            self.handle_worktree_action(action);
+        }
+    }
+
     fn open_remote_url(&mut self) {
         let Some(url) = self.default_remote_web_url() else {
             self.error = Some(self.tr("repo.remote.missing").to_owned());
@@ -2094,6 +2540,14 @@ impl GitAgentApp {
         if let Err(error) = open_url(&url) {
             self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
         }
+    }
+
+    fn create_pull_request_current_branch(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let branch = snapshot.branch.clone();
+        self.open_branch_pull_request_url(&branch);
     }
 
     fn open_commit_remote_url(&mut self, hash: &str) {
@@ -2209,6 +2663,63 @@ impl GitAgentApp {
             account_index: 0,
             validation_error: None,
         });
+    }
+
+    fn open_submodule_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        self.pending_submodule_action = Some(SubmoduleActionDialog {
+            source: String::new(),
+            local_path: String::new(),
+            source_branch: String::new(),
+            recursive: false,
+            advanced_open: true,
+            validation_error: None,
+        });
+    }
+
+    fn open_subtree_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        self.pending_subtree_action = Some(SubtreeActionDialog {
+            source: String::new(),
+            local_path: String::new(),
+            ref_name: String::new(),
+            squash: false,
+            advanced_open: true,
+            validation_error: None,
+        });
+    }
+
+    fn open_lfs_intro_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        self.pending_lfs_action = Some(LfsActionDialog::Intro);
+    }
+
+    fn open_lfs_track_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        match git::lfs_tracked_patterns(&snapshot.root) {
+            Ok(patterns) => {
+                self.pending_lfs_action = Some(LfsActionDialog::Track {
+                    original_patterns: patterns.clone(),
+                    patterns,
+                    selected: None,
+                    validation_error: None,
+                });
+            }
+            Err(error) => {
+                self.error = Some(error.to_string());
+            }
+        }
     }
 
     fn start_repo_source_task(
@@ -2342,6 +2853,179 @@ impl GitAgentApp {
         self.start_branch_checkout(name, false);
     }
 
+    fn open_checkout_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(commit) = self
+            .selected_commit
+            .and_then(|index| snapshot.commits.get(index))
+            .or_else(|| snapshot.commits.first())
+            .cloned()
+        else {
+            return;
+        };
+        let remote_branch = snapshot
+            .branches
+            .iter()
+            .find(|branch| branch.remote)
+            .map(|branch| branch.name.clone())
+            .unwrap_or_default();
+        let local_branch = checkout_local_branch_default(&remote_branch);
+
+        self.pending_branch_action = Some(BranchActionDialog::Checkout {
+            tab: CheckoutDialogTab::Existing,
+            selected_hash: commit.hash,
+            selected_short_hash: commit.short_hash,
+            discard_changes: false,
+            history_branch_scope: HistoryBranchScope::All,
+            history_sort_order: self.history_sort_order,
+            history_show_remote_refs: self.history_show_remote_refs,
+            history_search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            remote_branch,
+            local_branch,
+            track_remote: true,
+            validation_error: None,
+        });
+    }
+
+    fn open_merge_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let commits = merge_dialog_commits(snapshot, self.history_sort_order);
+        let Some(commit) = self
+            .selected_commit
+            .and_then(|index| snapshot.commits.get(index))
+            .filter(|commit| {
+                commits
+                    .iter()
+                    .any(|candidate| candidate.hash == commit.hash)
+            })
+            .or_else(|| commits.first())
+            .cloned()
+        else {
+            return;
+        };
+        self.pending_merge_action = Some(MergeActionDialog {
+            selected_hash: commit.hash,
+            selected_short_hash: commit.short_hash,
+            branch_scope: HistoryBranchScope::All,
+            sort_order: self.history_sort_order,
+            show_remote_refs: self.history_show_remote_refs,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            commit_immediately: true,
+            include_messages: false,
+            force_merge_commit: false,
+            rebase: false,
+            detect_renames: false,
+            rename_threshold: "90".to_owned(),
+        });
+    }
+
+    fn open_interactive_rebase_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        if snapshot.rebase_in_progress {
+            if !git::repository_rebase_in_progress(&snapshot.root) {
+                let root = snapshot.root.clone();
+                self.error = None;
+                self.load_repository_uncached(root);
+                return;
+            }
+            self.pending_rebase_control_action = Some(RebaseControlDialog::default());
+            self.active_view = MainView::Workspace;
+            return;
+        }
+        if !snapshot.unstaged.is_empty() {
+            self.error = Some(interactive_rebase_dirty_message(self.language));
+            return;
+        }
+        if !snapshot.staged.is_empty() {
+            self.error =
+                Some(i18n::t(self.language, "interactive_rebase.error.index_dirty").to_owned());
+            return;
+        }
+        if current_named_local_branch(snapshot).is_none() {
+            self.error =
+                Some(i18n::t(self.language, "interactive_rebase.error.detached").to_owned());
+            return;
+        }
+
+        let commits = interactive_rebase_dialog_commits(snapshot, self.history_sort_order);
+        let Some(commit) = self
+            .selected_commit
+            .and_then(|index| snapshot.commits.get(index))
+            .filter(|commit| {
+                !interactive_rebase_commit_is_merge(commit)
+                    && commits
+                        .iter()
+                        .any(|candidate| candidate.hash == commit.hash)
+            })
+            .or_else(|| {
+                commits
+                    .iter()
+                    .find(|commit| !interactive_rebase_commit_is_merge(commit))
+            })
+            .cloned()
+        else {
+            self.error =
+                Some(i18n::t(self.language, "interactive_rebase.error.no_commits").to_owned());
+            return;
+        };
+        let actions = commits
+            .iter()
+            .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+            .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
+            .collect();
+
+        self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
+            selected_hash: commit.hash,
+            selected_short_hash: commit.short_hash,
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: self.history_sort_order,
+            show_remote_refs: self.history_show_remote_refs,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions,
+            selected_hashes: HashSet::new(),
+            validation_error: None,
+        });
+    }
+
+    fn open_archive_dialog(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let target_commit = self
+            .selected_commit
+            .and_then(|index| snapshot.commits.get(index))
+            .map(|commit| commit.short_hash.clone())
+            .unwrap_or_else(|| "HEAD".to_owned());
+        self.pending_archive_action = Some(ArchiveActionDialog {
+            output_path: default_archive_output_path(&snapshot.root),
+            folder_prefix: String::new(),
+            target: ArchiveTarget::Worktree,
+            target_commit,
+            validation_error: None,
+        });
+    }
+
     fn start_branch_checkout(&mut self, name: String, discard_changes: bool) {
         if self.branch_actions_busy() {
             return;
@@ -2373,7 +3057,23 @@ impl GitAgentApp {
     }
 
     fn remote_git_busy(&self) -> bool {
-        self.remote_git_task.is_some()
+        self.remote_git_task.is_some() || self.credential_login_task.is_some()
+    }
+
+    fn start_github_credential_login(&mut self) {
+        if self.remote_git_busy() || self.loading_repo {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.credential_login_task = Some(receiver);
+        self.loading_repo = true;
+        self.error = None;
+        self.last_notice = None;
+
+        thread::spawn(move || {
+            let _ = sender.send(git::github_credential_manager_login());
+        });
     }
 
     fn start_remote_git_action(
@@ -2479,15 +3179,19 @@ impl GitAgentApp {
         let actions_enabled = !self.branch_actions_busy();
 
         compact_action_dialog(ctx, self.tr("fetch.title"), FETCH_DIALOG_WIDTH, |ui| {
-            ui.checkbox(&mut dialog.all_remotes, self.tr("fetch.all_remotes"));
-            ui.checkbox(&mut dialog.prune_tracking, self.tr("fetch.prune_tracking"));
+            action_checkbox(ui, &mut dialog.all_remotes, self.tr("fetch.all_remotes"));
+            action_checkbox(
+                ui,
+                &mut dialog.prune_tracking,
+                self.tr("fetch.prune_tracking"),
+            );
             ui.horizontal(|ui| {
-                ui.checkbox(&mut dialog.fetch_tags, self.tr("fetch.tags"));
+                action_checkbox(ui, &mut dialog.fetch_tags, self.tr("fetch.tags"));
                 if !dialog.fetch_tags {
                     dialog.force_tags = false;
                 }
                 ui.add_enabled_ui(dialog.fetch_tags, |ui| {
-                    ui.checkbox(&mut dialog.force_tags, self.tr("fetch.force_tags"));
+                    action_checkbox(ui, &mut dialog.force_tags, self.tr("fetch.force_tags"));
                 });
             });
 
@@ -2657,13 +3361,34 @@ impl GitAgentApp {
     }
 
     fn quick_push_current(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        if current_named_local_branch(snapshot).is_none() {
+            self.error = Some(self.tr("push.detached_error").to_owned());
+            return;
+        }
         self.start_remote_git_action(|root| git::push(root));
     }
 
     fn open_push_dialog(&mut self, target_branch: Option<String>, target_remote: Option<String>) {
+        self.open_push_dialog_with_force(target_branch, target_remote, false);
+    }
+
+    fn open_push_dialog_with_force(
+        &mut self,
+        target_branch: Option<String>,
+        target_remote: Option<String>,
+        force: bool,
+    ) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
+        let current_branch = current_named_local_branch(snapshot);
+        if target_branch.is_none() && current_branch.is_none() {
+            self.error = Some(self.tr("push.detached_error").to_owned());
+            return;
+        }
 
         let remote_names = self.remote_names();
         let target_upstream = target_branch
@@ -2688,7 +3413,9 @@ impl GitAgentApp {
         }
 
         let remote_branches = self.remote_branch_names_for(&remote);
-        let selected_branch = target_branch.unwrap_or_else(|| snapshot.branch.clone());
+        let selected_branch = target_branch
+            .or_else(|| current_branch.map(|branch| branch.name.clone()))
+            .unwrap_or_default();
         let rows = snapshot
             .branches
             .iter()
@@ -2717,7 +3444,7 @@ impl GitAgentApp {
             remote,
             rows,
             push_tags: true,
-            force: false,
+            force,
         });
     }
 
@@ -2751,16 +3478,7 @@ impl GitAgentApp {
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         if stage_toggle_shortcut_pressed(ctx) {
-            self.pending_toolbar_single_click = None;
-            self.active_view = MainView::Workspace;
-            self.focus_commit_message = true;
-            let action = self
-                .snapshot
-                .as_ref()
-                .and_then(shortcut_stage_toggle_action);
-            if let Some(action) = action {
-                self.handle_worktree_action(action);
-            }
+            self.stage_toggle_current_repository();
             return;
         }
 
@@ -2768,7 +3486,21 @@ impl GitAgentApp {
             return;
         }
 
-        if shortcut_pressed(ctx, egui::Key::P, true) {
+        if ctx.input(|input| input.key_pressed(egui::Key::F5)) {
+            self.refresh();
+        } else if shortcut_pressed(ctx, egui::Key::Tab, true) {
+            self.switch_to_previous_tab();
+        } else if shortcut_pressed(ctx, egui::Key::Tab, false) {
+            self.switch_to_next_tab();
+        } else if shortcut_pressed(ctx, egui::Key::Num1, false) {
+            self.active_view = MainView::Workspace;
+        } else if shortcut_pressed(ctx, egui::Key::Num2, false) {
+            self.active_view = MainView::History;
+        } else if shortcut_pressed(ctx, egui::Key::Num3, false) {
+            self.active_view = MainView::Search;
+        } else if shortcut_pressed(ctx, egui::Key::B, false) {
+            self.show_workspace_repositories = !self.show_workspace_repositories;
+        } else if shortcut_pressed(ctx, egui::Key::P, true) {
             self.quick_push_current();
         } else if shortcut_pressed(ctx, egui::Key::P, false) {
             self.push_current();
@@ -2882,7 +3614,26 @@ impl GitAgentApp {
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
-                Ok((_, Err(error))) => {
+                Ok((root, Err(error))) => {
+                    if self
+                        .pending_rewritten_history_prompt_root
+                        .as_ref()
+                        .is_some_and(|pending_root| paths_equal(pending_root, &root))
+                    {
+                        self.pending_rewritten_history_prompt_root = None;
+                    }
+                    if git::repository_rebase_in_progress(&root) {
+                        self.pending_rebase_control_action = Some(RebaseControlDialog {
+                            message: Some(error.to_string()),
+                        });
+                        self.active_view = MainView::Workspace;
+                        self.loading_repo = false;
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                        return;
+                    }
                     self.loading_repo = false;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
@@ -2893,8 +3644,39 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rewritten_history_prompt_root = None;
                     self.loading_repo = false;
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.credential_login_task.take() {
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    self.error = None;
+                    self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
+                    self.loading_repo = false;
+                    if let Some(root) = self.active_repo_root() {
+                        self.load_repository_uncached(root);
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.loading_repo = false;
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.credential_login_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.loading_repo = false;
+                    self.error = Some("Credential login stopped unexpectedly".to_owned());
                     self.last_notice = None;
                     ctx.request_repaint();
                 }
@@ -3392,9 +4174,73 @@ impl GitAgentApp {
             theme: self.theme_mode.into(),
             theme_accent: self.theme_accent.into(),
             language: self.language.into(),
+            workspaces: self.repository_workspaces.clone(),
+            active_repo_refresh_seconds: self.active_repo_refresh_seconds,
+            inactive_repo_refresh_seconds: self.inactive_repo_refresh_seconds,
             remote_accounts: self.remote_accounts.clone(),
         }
         .save();
+    }
+
+    fn active_repo_refresh_duration(&self) -> Duration {
+        repo_refresh_duration(self.active_repo_refresh_seconds)
+    }
+
+    fn inactive_repo_refresh_duration(&self) -> Duration {
+        repo_refresh_duration(self.inactive_repo_refresh_seconds)
+    }
+
+    fn set_active_repo_refresh_seconds(&mut self, seconds: u64) {
+        let seconds = sanitize_repo_refresh_seconds(seconds);
+        if self.active_repo_refresh_seconds != seconds {
+            self.active_repo_refresh_seconds = seconds;
+            self.next_active_repo_refresh_at = Instant::now() + self.active_repo_refresh_duration();
+            self.save_app_settings();
+        }
+    }
+
+    fn set_inactive_repo_refresh_seconds(&mut self, seconds: u64) {
+        let seconds = sanitize_repo_refresh_seconds(seconds);
+        if self.inactive_repo_refresh_seconds != seconds {
+            self.inactive_repo_refresh_seconds = seconds;
+            self.next_inactive_repo_refresh_at =
+                Instant::now() + self.inactive_repo_refresh_duration();
+            self.save_app_settings();
+        }
+    }
+
+    fn add_repository_workspace(&mut self, workspace: PathBuf) {
+        let mut workspaces = self.repository_workspaces.clone();
+        workspaces.push(workspace);
+        self.repository_workspaces = normalized_repository_workspaces(&workspaces);
+        self.active_repository_workspace_index = self.repository_workspaces.len().saturating_sub(1);
+        self.save_app_settings();
+        self.refresh_known_repositories();
+    }
+
+    fn remove_repository_workspace(&mut self, index: usize) {
+        if index < self.repository_workspaces.len() {
+            self.repository_workspaces.remove(index);
+            self.clamp_active_repository_workspace_index();
+            self.save_app_settings();
+            self.refresh_known_repositories();
+        }
+    }
+
+    fn clamp_active_repository_workspace_index(&mut self) {
+        if self.repository_workspaces.is_empty() {
+            self.active_repository_workspace_index = 0;
+        } else if self.active_repository_workspace_index >= self.repository_workspaces.len() {
+            self.active_repository_workspace_index = self.repository_workspaces.len() - 1;
+        }
+    }
+
+    fn repository_folder_dialog(&self) -> rfd::FileDialog {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(workspace) = self.repository_workspaces.first() {
+            dialog = dialog.set_directory(workspace);
+        }
+        dialog
     }
 
     fn save_repo_tabs(&self) {
@@ -3461,22 +4307,26 @@ impl GitAgentApp {
             gpg_sign: self.commit_state.gpg_sign,
         };
         let push_immediately = self.commit_state.push_immediately;
-        let push_target = self.snapshot.as_ref().and_then(|snapshot| {
-            let branch = snapshot.branch.clone();
-            if branch.is_empty() {
-                None
-            } else {
-                Some((
-                    snapshot
-                        .remotes
-                        .first()
-                        .map(|remote| remote.name.clone())
-                        .unwrap_or_else(|| "origin".to_owned()),
-                    branch,
-                    snapshot.upstream.is_some(),
-                ))
-            }
-        });
+        let push_target = if push_immediately {
+            let Some(snapshot) = self.snapshot.as_ref() else {
+                return;
+            };
+            let Some(branch) = current_named_local_branch(snapshot) else {
+                self.error = Some(self.tr("push.detached_error").to_owned());
+                return;
+            };
+            Some((
+                snapshot
+                    .remotes
+                    .first()
+                    .map(|remote| remote.name.clone())
+                    .unwrap_or_else(|| "origin".to_owned()),
+                branch.name.clone(),
+                branch.upstream.is_some(),
+            ))
+        } else {
+            None
+        };
         self.add_commit_message_history(message.clone());
         self.start_remote_git_action(move |root| {
             git::commit_with_options(root, &message, options)?;
@@ -3536,9 +4386,9 @@ impl GitAgentApp {
 
 impl App for GitAgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        theme::apply(ctx, self.theme_mode, self.theme_accent);
+        theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
-        self.maybe_refresh_inactive_repositories(ctx);
+        self.maybe_refresh_repositories(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
@@ -3566,6 +4416,15 @@ impl App for GitAgentApp {
         self.fetch_action_modal(ctx);
         self.pull_action_modal(ctx);
         self.push_action_modal(ctx);
+        self.force_push_confirm_modal(ctx);
+        self.archive_action_modal(ctx);
+        self.interactive_rebase_action_modal(ctx);
+        self.rebase_control_modal(ctx);
+        self.rewritten_history_prompt_modal(ctx);
+        self.lfs_action_modal(ctx);
+        self.submodule_action_modal(ctx);
+        self.subtree_action_modal(ctx);
+        self.merge_action_modal(ctx);
         self.stash_action_modal(ctx);
         self.branch_action_modal(ctx);
         self.tag_action_modal(ctx);
@@ -3605,10 +4464,10 @@ impl GitAgentApp {
                 .show(ui, |ui| {
                     ui.add(
                         TextEdit::multiline(&mut message)
+                            .id_salt("error_message_text")
                             .font(FontId::monospace(12.0))
                             .desired_width(f32::INFINITY)
-                            .desired_rows(10)
-                            .interactive(false),
+                            .desired_rows(10),
                     );
                 });
             ui.add_space(10.0);
@@ -3618,6 +4477,13 @@ impl GitAgentApp {
                 }
                 if ui.button(self.tr("menu.copy")).clicked() {
                     ui.ctx().copy_text(message.clone());
+                }
+                if github_authentication_error(&message)
+                    && dialog_primary_button(ui, self.tr("credentials.github_login"), true)
+                        .clicked()
+                {
+                    self.start_github_credential_login();
+                    close_requested = true;
                 }
             });
         });
@@ -3629,6 +4495,9 @@ impl GitAgentApp {
 
     fn main_layout(&mut self, ui: &mut Ui) {
         let full = ui.available_rect_before_wrap();
+        let workspace_repo_drawer_rect = (self.show_workspace_repositories
+            && !self.repository_source_active())
+        .then(|| workspace_repositories_drawer_rect(full));
         let details_visible = view_uses_side_details(self.active_view);
         self.layout_prefs.clamp();
         let layout = main_layout_rects(
@@ -3699,6 +4568,15 @@ impl GitAgentApp {
                     self.details(ui);
                 },
             );
+        }
+        if let Some(drawer_rect) = workspace_repo_drawer_rect {
+            if workspace_repositories_drawer_should_close(ui, full, drawer_rect) {
+                self.show_workspace_repositories = false;
+            } else {
+                workspace_repositories_drawer_at_rect(ui, drawer_rect, |ui| {
+                    self.workspace_repositories_panel(ui);
+                });
+            }
         }
         paint_layout_debug_rect(ui, layout.content, "main.content", Color32::YELLOW);
         paint_layout_debug_rect(ui, layout.sidebar, "main.sidebar", Color32::LIGHT_BLUE);
@@ -3804,116 +4682,424 @@ impl GitAgentApp {
 
     fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) {
         let repo_action_busy = self.loading_repo || self.remote_git_busy();
+        let repo_action_enabled = !repo_action_busy && has_repo;
+        let remote_action_enabled = repo_action_enabled && has_remote;
+        let git_dialog_enabled = !self.branch_actions_busy() && has_repo;
+        let has_worktree_changes = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_empty());
+        let has_merge_targets = self.snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.all_date_commits.is_empty() || !snapshot.commits.is_empty()
+        });
+        let has_archive_target = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.commits.is_empty());
         ui.horizontal_centered(|ui| {
             ui.add_space(8.0);
-            menu_button(ui, menu_label(self.language, "file"), |ui| {
-                if ui.button(self.tr("action.open")).clicked() {
+            top_menu_button(ui, menu_label(self.language, "file"), |ui| {
+                if menu_text_button(ui, true, self.tr("action.open")).clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.load_repository(path);
                     }
                     ui.close_menu();
                 }
-                if ui
-                    .add_enabled(has_repo, egui::Button::new(self.tr("action.refresh")))
-                    .clicked()
-                {
+            });
+            top_menu_button(ui, menu_label(self.language, "view"), |ui| {
+                if menu_shortcut_button(ui, has_repo, self.tr("action.refresh"), "F5").clicked() {
                     self.refresh();
                     ui.close_menu();
                 }
+                let tab_nav_enabled = self.open_tab_count() > 1;
+                if menu_shortcut_button(
+                    ui,
+                    tab_nav_enabled,
+                    menu_label(self.language, "next_tab"),
+                    "Ctrl+Tab",
+                )
+                .clicked()
+                {
+                    self.switch_to_next_tab();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    tab_nav_enabled,
+                    menu_label(self.language, "previous_tab"),
+                    "Ctrl+Shift+Tab",
+                )
+                .clicked()
+                {
+                    self.switch_to_previous_tab();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    has_repo,
+                    menu_label(self.language, "view_workspace"),
+                    "Ctrl+1",
+                )
+                .clicked()
+                {
+                    self.active_view = MainView::Workspace;
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    has_repo,
+                    menu_label(self.language, "view_history"),
+                    "Ctrl+2",
+                )
+                .clicked()
+                {
+                    self.active_view = MainView::History;
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    has_repo,
+                    menu_label(self.language, "view_search"),
+                    "Ctrl+3",
+                )
+                .clicked()
+                {
+                    self.active_view = MainView::Search;
+                    ui.close_menu();
+                }
+                let workspace_repositories_label = if self.show_workspace_repositories {
+                    menu_label(self.language, "hide_workspace_repositories")
+                } else {
+                    menu_label(self.language, "show_workspace_repositories")
+                };
+                if menu_shortcut_button(ui, true, workspace_repositories_label, "Ctrl+B").clicked()
+                {
+                    self.show_workspace_repositories = !self.show_workspace_repositories;
+                    ui.close_menu();
+                }
+                action_checkbox(
+                    ui,
+                    &mut self.history_show_branch_refs,
+                    menu_label(self.language, "show_branch_labels"),
+                );
+                action_checkbox(
+                    ui,
+                    &mut self.history_show_tag_refs,
+                    menu_label(self.language, "show_tag_labels"),
+                );
             });
-            menu_button(ui, menu_label(self.language, "edit"), |ui| {
-                ui.add_enabled(false, egui::Button::new(menu_label(self.language, "undo")));
-                ui.add_enabled(false, egui::Button::new(menu_label(self.language, "redo")));
-            });
-            menu_button(ui, menu_label(self.language, "view"), |ui| {
-                let light = self.theme_mode == theme::ThemeMode::Light;
-                if ui
-                    .selectable_label(!light, menu_label(self.language, "dark_theme"))
+            top_menu_button(ui, menu_label(self.language, "repo"), |ui| {
+                if menu_text_button(ui, has_repo, menu_label(self.language, "repo_settings"))
                     .clicked()
                 {
-                    self.set_theme_mode(theme::ThemeMode::Dark);
+                    self.open_repo_settings_from_menu();
                     ui.close_menu();
                 }
-                if ui
-                    .selectable_label(light, menu_label(self.language, "light_theme"))
-                    .clicked()
+                if menu_text_button(
+                    ui,
+                    has_repo && has_remote,
+                    menu_label(self.language, "repo_view_online"),
+                )
+                .clicked()
                 {
-                    self.set_theme_mode(theme::ThemeMode::Light);
+                    self.open_remote_url();
                     ui.close_menu();
                 }
-            });
-            menu_button(ui, menu_label(self.language, "repo"), |ui| {
-                if ui
-                    .add_enabled(
-                        !repo_action_busy && has_remote,
-                        egui::Button::new(self.tr("action.fetch")),
-                    )
-                    .clicked()
+                let stage_toggle_enabled = git_dialog_enabled
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .and_then(shortcut_stage_toggle_action)
+                        .is_some();
+                if menu_shortcut_button(
+                    ui,
+                    stage_toggle_enabled,
+                    menu_label(self.language, "repo_stage_toggle"),
+                    "Ctrl+Shift+C",
+                )
+                .clicked()
                 {
-                    self.fetch_all();
+                    self.stage_toggle_current_repository();
                     ui.close_menu();
                 }
-                if ui
-                    .add_enabled(
-                        !repo_action_busy && has_remote,
-                        egui::Button::new(self.tr("action.pull")),
-                    )
-                    .clicked()
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && has_worktree_changes,
+                    menu_label(self.language, "repo_discard"),
+                )
+                .clicked()
                 {
-                    self.pull_current();
+                    self.pending_worktree_action = Some(WorktreeActionDialog::ConfirmDiscardAll);
                     ui.close_menu();
                 }
-                if ui
-                    .add_enabled(
-                        !repo_action_busy && has_remote,
-                        egui::Button::new(self.tr("action.push")),
-                    )
-                    .clicked()
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_stash_changes"),
+                )
+                .clicked()
+                {
+                    self.handle_stash_action(StashMenuAction::Create);
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    remote_action_enabled,
+                    menu_label(self.language, "repo_push"),
+                    "Ctrl+P",
+                )
+                .clicked()
                 {
                     self.push_current();
                     ui.close_menu();
                 }
-            });
-            menu_button(ui, menu_label(self.language, "actions"), |ui| {
-                if ui
-                    .add_enabled(has_repo, egui::Button::new(self.tr("branch.local")))
-                    .clicked()
+                if menu_shortcut_button(
+                    ui,
+                    remote_action_enabled,
+                    menu_label(self.language, "repo_pull"),
+                    "Ctrl+L",
+                )
+                .clicked()
                 {
+                    self.pull_current();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    remote_action_enabled,
+                    menu_label(self.language, "repo_fetch"),
+                    "Ctrl+F",
+                )
+                .clicked()
+                {
+                    self.fetch_all();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_checkout"),
+                )
+                .clicked()
+                {
+                    self.open_checkout_dialog();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_branch"),
+                )
+                .clicked()
+                {
+                    self.handle_branch_action(BranchMenuAction::Create);
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && has_merge_targets,
+                    menu_label(self.language, "repo_merge"),
+                )
+                .clicked()
+                {
+                    self.open_merge_dialog();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_tag"),
+                )
+                .clicked()
+                {
+                    self.handle_tag_action(TagMenuAction::Create);
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && has_archive_target,
+                    menu_label(self.language, "repo_archive"),
+                )
+                .clicked()
+                {
+                    self.open_archive_dialog();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_interactive_rebase"),
+                )
+                .clicked()
+                {
+                    close_top_menu_popup(ui);
+                    self.open_interactive_rebase_dialog();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_add_submodule"),
+                )
+                .clicked()
+                {
+                    self.open_submodule_dialog();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "repo_add_link_subtree"),
+                )
+                .clicked()
+                {
+                    self.open_subtree_dialog();
+                    ui.close_menu();
+                }
+                menu_button(ui, menu_label(self.language, "repo_git_lfs"), |ui| {
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_initialize"),
+                    )
+                    .clicked()
+                    {
+                        self.open_lfs_intro_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_track_untrack"),
+                    )
+                    .clicked()
+                    {
+                        self.open_lfs_track_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_pull"),
+                    )
+                    .clicked()
+                    {
+                        self.execute_git_action(|root| git::lfs_pull(root));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_fetch"),
+                    )
+                    .clicked()
+                    {
+                        self.execute_git_action(|root| git::lfs_fetch(root));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_checkout"),
+                    )
+                    .clicked()
+                    {
+                        self.execute_git_action(|root| git::lfs_checkout(root));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_lfs_prune"),
+                    )
+                    .clicked()
+                    {
+                        self.execute_git_action(|root| git::lfs_prune(root));
+                        ui.close_menu();
+                    }
+                });
+                menu_button(ui, menu_label(self.language, "repo_git_flow"), |ui| {
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_initialize"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_next_action"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_start_feature"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_finish_feature"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_start_release"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_finish_release"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_start_hotfix"),
+                    );
+                    menu_text_button(
+                        ui,
+                        false,
+                        menu_label(self.language, "repo_git_flow_finish_hotfix"),
+                    );
+                });
+                if menu_text_button(
+                    ui,
+                    has_repo && has_remote,
+                    menu_label(self.language, "repo_create_pull_request"),
+                )
+                .clicked()
+                {
+                    self.create_pull_request_current_branch();
+                    ui.close_menu();
+                }
+                menu_text_button(
+                    ui,
+                    false,
+                    menu_label(self.language, "repo_benchmark_performance"),
+                );
+            });
+            top_menu_button(ui, menu_label(self.language, "actions"), |ui| {
+                if menu_text_button(ui, has_repo, self.tr("branch.local")).clicked() {
                     self.active_view = MainView::Branches;
                     ui.close_menu();
                 }
-                if ui
-                    .add_enabled(has_repo, egui::Button::new(self.tr("tag.title")))
-                    .clicked()
-                {
+                if menu_text_button(ui, has_repo, self.tr("tag.title")).clicked() {
                     self.active_view = MainView::Tags;
                     ui.close_menu();
                 }
-                if ui
-                    .add_enabled(has_repo, egui::Button::new(self.tr("stash.title")))
-                    .clicked()
-                {
+                if menu_text_button(ui, has_repo, self.tr("stash.title")).clicked() {
                     self.active_view = MainView::Stashes;
                     ui.close_menu();
                 }
             });
-            menu_button(ui, menu_label(self.language, "tools"), |ui| {
-                ui.add_enabled(
-                    false,
-                    egui::Button::new(menu_label(self.language, "ssh_agent")),
-                );
-                ui.add_enabled(
-                    false,
-                    egui::Button::new(menu_label(self.language, "process_viewer")),
-                );
-                if ui.button(menu_label(self.language, "options")).clicked() {
+            top_menu_button(ui, menu_label(self.language, "tools"), |ui| {
+                menu_text_button(ui, false, menu_label(self.language, "ssh_agent"));
+                menu_text_button(ui, false, menu_label(self.language, "process_viewer"));
+                if menu_text_button(ui, true, menu_label(self.language, "options")).clicked() {
                     self.settings_tab = SettingsTab::General;
                     self.settings_open = true;
                     ui.close_menu();
                 }
             });
-            menu_button(ui, menu_label(self.language, "help"), |ui| {
-                ui.add_enabled(false, egui::Button::new(menu_label(self.language, "about")));
+            top_menu_button(ui, menu_label(self.language, "help"), |ui| {
+                menu_text_button(ui, false, menu_label(self.language, "about"));
             });
         });
     }
@@ -3951,7 +5137,7 @@ impl GitAgentApp {
             .rect_filled(full, CornerRadius::ZERO, theme::bg());
         ui.painter().add(
             egui::Frame::new()
-                .fill(theme::panel_soft())
+                .fill(theme::chrome_bg())
                 .corner_radius(CornerRadius::same(6))
                 .shadow(panel_shadow())
                 .paint(top_island_rect),
@@ -4320,12 +5506,12 @@ impl GitAgentApp {
                     }
                     if toolbar_button(ui, "add", self.tr("repo.source.add"), !source_busy).clicked()
                     {
-                        load_path = rfd::FileDialog::new().pick_folder();
+                        load_path = self.repository_folder_dialog().pick_folder();
                     }
                     if toolbar_button(ui, "create", self.tr("repo.source.create"), !source_busy)
                         .clicked()
                     {
-                        create_path = rfd::FileDialog::new().pick_folder();
+                        create_path = self.repository_folder_dialog().pick_folder();
                     }
                     if source_busy {
                         ui.spinner();
@@ -4349,6 +5535,7 @@ impl GitAgentApp {
     }
 
     fn local_repository_source_page(&mut self, ui: &mut Ui, load_path: &mut Option<PathBuf>) {
+        self.clamp_active_repository_workspace_index();
         let search_hint = self.tr("repo.source.search");
         ui.horizontal(|ui| {
             ui.add_space(16.0);
@@ -4358,6 +5545,12 @@ impl GitAgentApp {
                 themed_singleline_text_edit(&mut self.repo_source_search, search_hint),
             );
         });
+        ui.add_space(10.0);
+        repository_workspace_tab_strip(
+            ui,
+            &self.repository_workspaces,
+            &mut self.active_repository_workspace_index,
+        );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.add_space(16.0);
@@ -4369,7 +5562,11 @@ impl GitAgentApp {
         });
         ui.add_space(6.0);
 
-        let repositories = self.filtered_known_repositories();
+        let repositories = if self.repository_workspaces.is_empty() {
+            Vec::new()
+        } else {
+            self.filtered_known_repositories(self.active_repository_workspace_index)
+        };
         if repositories.is_empty() {
             ui.horizontal(|ui| {
                 ui.add_space(16.0);
@@ -4388,19 +5585,168 @@ impl GitAgentApp {
         }
     }
 
+    fn workspace_repositories_panel(&mut self, ui: &mut Ui) {
+        self.clamp_active_repository_workspace_index();
+        let mut load_path = None;
+        let title = menu_label(self.language, "workspace_repositories");
+        let search_hint = self.tr("repo.source.search");
+        let repositories = if self.repository_workspaces.is_empty() {
+            Vec::new()
+        } else {
+            self.filtered_workspace_panel_repositories(self.active_repository_workspace_index)
+        };
+        if self.maybe_start_workspace_repository_status_load(&repositories) {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(title)
+                .size(18.0)
+                .strong()
+                .color(theme::text()),
+        );
+        ui.add_space(8.0);
+        themed_text_edit_selection(ui);
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            themed_singleline_text_edit(&mut self.workspace_repository_search, search_hint),
+        );
+        ui.add_space(8.0);
+        repository_workspace_tab_strip(
+            ui,
+            &self.repository_workspaces,
+            &mut self.active_repository_workspace_index,
+        );
+        ui.add_space(8.0);
+
+        if repositories.is_empty() {
+            empty_list_panel(ui, self.tr("repo.source.empty"));
+            return;
+        }
+
+        ScrollArea::vertical()
+            .id_salt("workspace_repositories_panel_scroll")
+            .auto_shrink([false, false])
+            .show_rows(
+                ui,
+                WORKSPACE_REPOSITORY_ROW_HEIGHT,
+                repositories.len(),
+                |ui, row_range| {
+                    let row_origin = ui.cursor().min;
+                    let row_width = ui.available_width();
+                    for (row_offset, index) in row_range.enumerate() {
+                        let row_rect = Rect::from_min_size(
+                            Pos2::new(
+                                row_origin.x,
+                                row_origin.y + row_offset as f32 * WORKSPACE_REPOSITORY_ROW_HEIGHT,
+                            ),
+                            Vec2::new(row_width.max(0.0), WORKSPACE_REPOSITORY_ROW_HEIGHT),
+                        );
+                        let repository = &repositories[index];
+                        let snapshot = self.workspace_repository_snapshot_for(&repository.root);
+                        if workspace_repository_status_row(
+                            ui,
+                            row_rect,
+                            repository,
+                            snapshot,
+                            self.language,
+                        )
+                        .clicked()
+                        {
+                            load_path = Some(repository.root.clone());
+                        }
+                    }
+                },
+            );
+
+        if let Some(path) = load_path {
+            if self
+                .active_repo_root()
+                .is_some_and(|root| paths_equal(&root, &path))
+            {
+                self.active_repo_tab = self
+                    .repo_tabs
+                    .iter()
+                    .position(|tab| paths_equal(&tab.root, &path));
+            } else {
+                self.load_repository(path);
+            }
+        }
+    }
+
+    fn filtered_workspace_panel_repositories(
+        &self,
+        workspace_index: usize,
+    ) -> Vec<KnownRepository> {
+        let query = self.workspace_repository_search.trim().to_lowercase();
+        self.known_repositories
+            .iter()
+            .filter(|repository| {
+                repository.workspace_index == Some(workspace_index)
+                    && (query.is_empty()
+                        || repository.name.to_lowercase().contains(&query)
+                        || user_facing_path_string(&repository.root)
+                            .to_lowercase()
+                            .contains(&query))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn workspace_repository_snapshot_for(&self, root: &Path) -> Option<&RepositorySnapshot> {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            if paths_equal(&snapshot.root, root) {
+                return Some(snapshot);
+            }
+        }
+        self.snapshot_cache.get(&repo_state_key(root)).or_else(|| {
+            self.snapshot_cache
+                .values()
+                .find(|snapshot| paths_equal(&snapshot.root, root))
+        })
+    }
+
+    fn maybe_start_workspace_repository_status_load(
+        &mut self,
+        repositories: &[KnownRepository],
+    ) -> bool {
+        let now = Instant::now();
+        if now < self.next_workspace_repo_status_load_at {
+            return false;
+        }
+        let path = repositories
+            .iter()
+            .filter(|repository| {
+                self.workspace_repository_snapshot_for(&repository.root)
+                    .is_none()
+            })
+            .map(|repository| repository.root.clone())
+            .find(|path| !self.repo_tasks.contains_key(&repo_state_key(path)));
+        let Some(path) = path else {
+            return false;
+        };
+        self.next_workspace_repo_status_load_at = now + Duration::from_millis(250);
+        self.start_repository_snapshot_load(path);
+        true
+    }
+
     fn remote_repository_source_page(&mut self, ui: &mut Ui) {
         let url_label = self.tr("repo.source.clone_url");
         let destination_label = self.tr("repo.source.destination");
         let clone_label = self.tr("repo.source.clone");
         let browse_label = self.tr("repo.source.browse");
+        let url_hint = placeholder_for_label(self.language, url_label);
+        let destination_hint = placeholder_for_label(self.language, destination_label);
         let busy = self.repo_source_task.is_some();
         let url_valid = self.clone_url_is_valid();
 
         ui.add_space(2.0);
         form_row(ui, url_label, |ui| {
+            themed_text_edit_selection(ui);
             let response = ui.add_sized(
                 [ui.available_width().min(680.0), 28.0],
-                TextEdit::singleline(&mut self.clone_url),
+                themed_singleline_text_edit(&mut self.clone_url, &url_hint),
             );
             if response.changed() {
                 self.on_clone_url_changed();
@@ -4426,16 +5772,17 @@ impl GitAgentApp {
         form_row(ui, destination_label, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(url_valid, |ui| {
+                    themed_text_edit_selection(ui);
                     ui.add_sized(
                         [ui.available_width().min(560.0), 28.0],
-                        TextEdit::singleline(&mut self.clone_destination),
+                        themed_singleline_text_edit(&mut self.clone_destination, &destination_hint),
                     );
                 });
                 if ui
                     .add_enabled(url_valid, egui::Button::new(browse_label))
                     .clicked()
                 {
-                    if let Some(parent) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(parent) = self.repository_folder_dialog().pick_folder() {
                         let repo_name = repo_name_from_url(&self.clone_url)
                             .unwrap_or_else(|| "repository".to_owned());
                         self.clone_destination = parent.join(repo_name).display().to_string();
@@ -4458,19 +5805,17 @@ impl GitAgentApp {
         });
     }
 
-    fn filtered_known_repositories(&self) -> Vec<KnownRepository> {
+    fn filtered_known_repositories(&self, workspace_index: usize) -> Vec<KnownRepository> {
         let query = self.repo_source_search.trim().to_lowercase();
         self.known_repositories
             .iter()
             .filter(|repository| {
-                query.is_empty()
-                    || repository.name.to_lowercase().contains(&query)
-                    || repository
-                        .root
-                        .display()
-                        .to_string()
-                        .to_lowercase()
-                        .contains(&query)
+                repository.workspace_index == Some(workspace_index)
+                    && (query.is_empty()
+                        || repository.name.to_lowercase().contains(&query)
+                        || user_facing_path_string(&repository.root)
+                            .to_lowercase()
+                            .contains(&query))
             })
             .cloned()
             .collect()
@@ -4478,15 +5823,16 @@ impl GitAgentApp {
 
     fn refresh_known_repositories(&mut self) {
         let mut repositories = Vec::new();
-        for tab in &self.repo_tabs {
-            add_known_repository(&mut repositories, tab.root.clone());
+        for (workspace_index, workspace) in self.repository_workspaces.iter().enumerate() {
+            scan_repository_children(workspace_index, workspace, &mut repositories);
         }
 
-        if let Ok(current_dir) = env::current_dir() {
-            add_known_repository(&mut repositories, current_dir.clone());
-            if let Some(parent) = current_dir.parent() {
-                scan_repository_children(parent, &mut repositories);
-            }
+        for tab in &self.repo_tabs {
+            add_known_repository(
+                &mut repositories,
+                tab.root.clone(),
+                known_repository_workspace_index(&tab.root, &self.repository_workspaces),
+            );
         }
 
         repositories.sort_by(|left, right| {
@@ -5471,8 +6817,11 @@ impl GitAgentApp {
                                     self.language,
                                     is_selected,
                                     self.history_show_remote_refs,
+                                    self.history_show_branch_refs,
+                                    self.history_show_tag_refs,
                                     self.history_cherry_pick_mode,
                                     cherry_pick_selected,
+                                    false,
                                 );
                             hash_copied |= copied_hash;
                             if select_for_cherry_pick {
@@ -6311,6 +7660,10 @@ impl GitAgentApp {
             StashMenuAction::Create => {
                 self.pending_stash_action = Some(StashActionDialog::Create {
                     message: String::new(),
+                    staged_files: false,
+                    keep_staged: false,
+                    include_untracked: false,
+                    include_ignored: false,
                 });
             }
             StashMenuAction::Apply { selector } => {
@@ -6544,14 +7897,14 @@ impl GitAgentApp {
                     });
                 });
                 ui.add_space(8.0);
-                let message_hint = self.tr("commit.message");
+                let message_hint = placeholder_for_label(self.language, self.tr("commit.message"));
                 let message_height = commit_message_editor_height(ui.available_height());
                 let commit_message_input = ui.make_persistent_id("commit_message_input");
                 let message_response = commit_message_editor_ui(
                     ui,
                     &mut self.commit_message,
                     commit_message_input,
-                    message_hint,
+                    &message_hint,
                     Vec2::new(ui.available_width(), message_height),
                 );
                 if self.focus_commit_message {
@@ -6732,31 +8085,27 @@ impl GitAgentApp {
         let is_truncated = diff_text.lines().count() > 1_200;
         let truncated_label = self.tr("diff.truncated");
 
-        let diff_response = diff_panel_frame().show(ui, |ui| {
-            let max_height = ui.available_height().max(160.0);
-            ScrollArea::both()
-                .id_salt((
-                    "commit_diff_scroll",
-                    hash,
-                    path,
-                    diff_display_mode_salt(mode),
-                ))
-                .max_height(max_height)
-                .show(ui, |ui| {
-                    render_unified_diff(
-                        ui,
-                        &diff_text,
-                        mode,
-                        self.language,
-                        &mut self.selected_diff_rows,
-                    );
-                    if is_truncated {
-                        ui.label(RichText::new(truncated_label).color(theme::muted()));
-                    }
-                });
-        });
-        let diff_rect = diff_response.response.rect;
-        paint_workspace_card_inset_shadow(ui, diff_rect);
+        let max_height = ui.available_height().max(160.0);
+        ScrollArea::both()
+            .id_salt((
+                "commit_diff_scroll",
+                hash,
+                path,
+                diff_display_mode_salt(mode),
+            ))
+            .max_height(max_height)
+            .show(ui, |ui| {
+                render_unified_diff(
+                    ui,
+                    &diff_text,
+                    mode,
+                    self.language,
+                    &mut self.selected_diff_rows,
+                );
+                if is_truncated {
+                    ui.label(RichText::new(truncated_label).color(theme::muted()));
+                }
+            });
     }
 
     fn search_diff_viewer(&mut self, ui: &mut Ui, hash: &str, mode: DiffDisplayMode) {
@@ -6787,31 +8136,27 @@ impl GitAgentApp {
         let is_truncated = diff_text.lines().count() > 1_200;
         let truncated_label = self.tr("diff.truncated");
 
-        let diff_response = diff_panel_frame().show(ui, |ui| {
-            let max_height = ui.available_height().max(160.0);
-            ScrollArea::both()
-                .id_salt((
-                    "search_commit_diff_scroll",
-                    hash,
-                    path,
-                    diff_display_mode_salt(mode),
-                ))
-                .max_height(max_height)
-                .show(ui, |ui| {
-                    render_unified_diff(
-                        ui,
-                        &diff_text,
-                        mode,
-                        self.language,
-                        &mut self.search_selected_diff_rows,
-                    );
-                    if is_truncated {
-                        ui.label(RichText::new(truncated_label).color(theme::muted()));
-                    }
-                });
-        });
-        let diff_rect = diff_response.response.rect;
-        paint_workspace_card_inset_shadow(ui, diff_rect);
+        let max_height = ui.available_height().max(160.0);
+        ScrollArea::both()
+            .id_salt((
+                "search_commit_diff_scroll",
+                hash,
+                path,
+                diff_display_mode_salt(mode),
+            ))
+            .max_height(max_height)
+            .show(ui, |ui| {
+                render_unified_diff(
+                    ui,
+                    &diff_text,
+                    mode,
+                    self.language,
+                    &mut self.search_selected_diff_rows,
+                );
+                if is_truncated {
+                    ui.label(RichText::new(truncated_label).color(theme::muted()));
+                }
+            });
     }
 
     fn worktree_diff_viewer(&self, ui: &mut Ui) {
@@ -6921,7 +8266,10 @@ impl GitAgentApp {
             let mut remote_url_display = remote_url.clone();
             ui.add_enabled(
                 false,
-                themed_singleline_text_edit(&mut remote_url_display, ""),
+                themed_singleline_text_edit(
+                    &mut remote_url_display,
+                    self.tr("repo.remote.missing"),
+                ),
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -6962,13 +8310,14 @@ impl GitAgentApp {
                     .color(theme::muted()),
             );
             ui.group(|ui| {
-                ui.checkbox(&mut dialog.commit_merge, self.tr("pull.commit_merge"));
-                ui.checkbox(&mut dialog.include_tags, self.tr("pull.include_tags"));
-                ui.checkbox(
+                action_checkbox(ui, &mut dialog.commit_merge, self.tr("pull.commit_merge"));
+                action_checkbox(ui, &mut dialog.include_tags, self.tr("pull.include_tags"));
+                action_checkbox(
+                    ui,
                     &mut dialog.force_merge_commit,
                     self.tr("pull.force_merge_commit"),
                 );
-                ui.checkbox(&mut dialog.rebase, self.tr("pull.rebase"));
+                action_checkbox(ui, &mut dialog.rebase, self.tr("pull.rebase"));
             });
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -7045,26 +8394,32 @@ impl GitAgentApp {
 
         compact_action_dialog(ctx, &title, PUSH_DIALOG_WIDTH, |ui| {
             let mut remote_url_display = remote_url.clone();
-            push_remote_form_row(ui, self.tr("push.remote"), &mut remote_url_display, |ui| {
-                egui::ComboBox::from_id_salt("push_remote_selector")
-                    .width(PUSH_REMOTE_FORM_SELECTOR_WIDTH)
-                    .selected_text(dialog.remote.as_str())
-                    .show_ui(ui, |ui| {
-                        for remote in &remotes {
-                            if ui
-                                .selectable_value(&mut dialog.remote, remote.clone(), remote)
-                                .clicked()
-                            {
-                                let branches = self.remote_branch_names_for(&dialog.remote);
-                                Self::update_push_rows_for_remote(
-                                    &mut dialog.rows,
-                                    &dialog.remote,
-                                    &branches,
-                                );
+            push_remote_form_row(
+                ui,
+                self.tr("push.remote"),
+                self.tr("repo.remote.missing"),
+                &mut remote_url_display,
+                |ui| {
+                    egui::ComboBox::from_id_salt("push_remote_selector")
+                        .width(PUSH_REMOTE_FORM_SELECTOR_WIDTH)
+                        .selected_text(dialog.remote.as_str())
+                        .show_ui(ui, |ui| {
+                            for remote in &remotes {
+                                if ui
+                                    .selectable_value(&mut dialog.remote, remote.clone(), remote)
+                                    .clicked()
+                                {
+                                    let branches = self.remote_branch_names_for(&dialog.remote);
+                                    Self::update_push_rows_for_remote(
+                                        &mut dialog.rows,
+                                        &dialog.remote,
+                                        &branches,
+                                    );
+                                }
                             }
-                        }
-                    });
-            });
+                        });
+                },
+            );
 
             ui.add_space(8.0);
             ui.label(
@@ -7094,10 +8449,7 @@ impl GitAgentApp {
             ui.add_space(8.0);
             let mut all_selected =
                 !dialog.rows.is_empty() && dialog.rows.iter().all(|row| row.selected);
-            if ui
-                .checkbox(&mut all_selected, self.tr("push.select_all"))
-                .changed()
-            {
+            if action_checkbox(ui, &mut all_selected, self.tr("push.select_all")).changed() {
                 for row in &mut dialog.rows {
                     row.selected = all_selected;
                     if row.selected && row.remote_branch.trim().is_empty() {
@@ -7108,8 +8460,8 @@ impl GitAgentApp {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.checkbox(&mut dialog.push_tags, self.tr("push.push_tags"));
-                ui.checkbox(&mut dialog.force, self.tr("push.force"));
+                action_checkbox(ui, &mut dialog.push_tags, self.tr("push.push_tags"));
+                action_checkbox(ui, &mut dialog.force, self.tr("push.force"));
             });
 
             ui.add_space(12.0);
@@ -7143,9 +8495,17 @@ impl GitAgentApp {
                             push_tags: dialog.push_tags,
                             force: dialog.force,
                         };
-                        execute = Some(Box::new(move |root| {
-                            git::push_selected(root, &remote, &branches, options)
-                        }));
+                        if dialog.force {
+                            self.pending_force_push_confirm = Some(ConfirmForcePushDialog {
+                                remote,
+                                branches,
+                                options,
+                            });
+                        } else {
+                            execute = Some(Box::new(move |root| {
+                                git::push_selected(root, &remote, &branches, options)
+                            }));
+                        }
                         close_after = true;
                     }
                 });
@@ -7160,6 +8520,61 @@ impl GitAgentApp {
         }
         if keep_open {
             self.pending_push_action = Some(dialog);
+        }
+    }
+
+    fn force_push_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.pending_force_push_confirm.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        compact_action_dialog(
+            ctx,
+            self.tr("push.force_confirm.title"),
+            ACTION_DIALOG_WIDTH,
+            |ui| {
+                ui.label(RichText::new(self.tr("push.force_confirm.message")).color(theme::text()));
+                ui.add_space(8.0);
+                for branch in &dialog.branches {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} -> {}/{}",
+                            branch.local_branch, dialog.remote, branch.remote_branch
+                        ))
+                        .small()
+                        .color(theme::muted()),
+                    );
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            keep_open = false;
+                        }
+                        if dialog_primary_button(ui, self.tr("push.force_confirm.submit"), true)
+                            .clicked()
+                        {
+                            let remote = dialog.remote.clone();
+                            let branches = dialog.branches.clone();
+                            let options = dialog.options;
+                            execute = Some(Box::new(move |root| {
+                                git::push_selected(root, &remote, &branches, options)
+                            }));
+                            keep_open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if keep_open {
+            self.pending_force_push_confirm = Some(dialog);
         }
     }
 
@@ -7203,8 +8618,10 @@ impl GitAgentApp {
                         .small()
                         .color(theme::muted()),
                 );
-                ui.add(TextEdit::singleline(name));
-                ui.checkbox(checkout, self.tr("branch.checkout"));
+                let name_hint = placeholder_for_label(self.language, self.tr("branch.name"));
+                themed_text_edit_selection(ui);
+                ui.add(themed_singleline_text_edit(name, &name_hint));
+                action_checkbox(ui, checkout, self.tr("branch.checkout"));
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let submit_requested = dialog_default_submit_requested(ui);
@@ -7241,9 +8658,10 @@ impl GitAgentApp {
                         .small()
                         .color(theme::muted()),
                 );
+                let name_hint = placeholder_for_label(self.language, self.tr("tag.name"));
                 themed_text_edit_selection(ui);
-                ui.add(themed_singleline_text_edit(name, ""));
-                ui.checkbox(push_after_create, self.tr("tag.push_after_create"));
+                ui.add(themed_singleline_text_edit(name, &name_hint));
+                action_checkbox(ui, push_after_create, self.tr("tag.push_after_create"));
                 if *push_after_create {
                     tag_remote_selector(ui, self.language, &remotes, remote);
                 }
@@ -7467,6 +8885,38 @@ impl GitAgentApp {
                         Some(WorktreeActionDialog::ConfirmDiscard { path, untracked });
                 }
             }
+            WorktreeActionDialog::ConfirmDiscardAll => {
+                compact_action_dialog(ctx, self.tr("repo_discard"), ACTION_DIALOG_WIDTH, |ui| {
+                    ui.label(
+                        RichText::new(self.tr("worktree.discard_all_confirm")).color(theme::text()),
+                    );
+                    ui.label(
+                        RichText::new(self.tr("worktree.discard_all_warning"))
+                            .color(theme::warning()),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui.button(self.tr("dialog.discard")).clicked() || submit_requested {
+                            execute = Some(Box::new(move |root| git::discard_all_changes(root)));
+                            close_after = true;
+                        }
+                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                    });
+                });
+
+                if let Some(action) = execute {
+                    self.execute_git_action(action);
+                }
+                if close_after {
+                    keep_open = false;
+                }
+                if keep_open {
+                    self.pending_worktree_action = Some(WorktreeActionDialog::ConfirmDiscardAll);
+                }
+            }
             WorktreeActionDialog::ResolveConflicts { selected_path } => {
                 let conflict_files = self
                     .snapshot
@@ -7578,6 +9028,1163 @@ impl GitAgentApp {
         }
     }
 
+    fn archive_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_archive_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let snapshot_root = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone());
+        let selected_commit = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                self.selected_commit
+                    .and_then(|index| snapshot.commits.get(index))
+                    .or_else(|| snapshot.commits.first())
+            })
+            .map(|commit| commit.short_hash.clone())
+            .unwrap_or_else(|| "HEAD".to_owned());
+
+        compact_action_dialog(ctx, self.tr("archive.title"), ARCHIVE_DIALOG_WIDTH, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [92.0, 24.0],
+                    egui::Label::new(
+                        RichText::new(self.tr("archive.output_path")).color(theme::text()),
+                    ),
+                );
+                let output_path_hint =
+                    placeholder_for_label(self.language, self.tr("archive.output_path"));
+                themed_text_edit_selection(ui);
+                ui.add_sized(
+                    [ui.available_width() - 42.0, 24.0],
+                    themed_singleline_text_edit(&mut dialog.output_path, &output_path_hint),
+                );
+                if ui.button("...").clicked() {
+                    let mut file_dialog = rfd::FileDialog::new()
+                        .add_filter("Zip archive", &["zip"])
+                        .add_filter("Tar archive", &["tar", "tar.gz"])
+                        .set_file_name("archive.zip");
+                    if let Some(root) = snapshot_root.as_ref() {
+                        file_dialog = file_dialog.set_directory(root);
+                    }
+                    if let Some(path) = file_dialog.save_file() {
+                        dialog.output_path = user_facing_path_string(&path);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [92.0, 24.0],
+                    egui::Label::new(
+                        RichText::new(self.tr("archive.folder_prefix")).color(theme::text()),
+                    ),
+                );
+                let folder_prefix_hint =
+                    placeholder_for_label(self.language, self.tr("archive.folder_prefix"));
+                themed_text_edit_selection(ui);
+                ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    themed_singleline_text_edit(&mut dialog.folder_prefix, &folder_prefix_hint),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [92.0, 24.0],
+                    egui::Label::new(RichText::new(self.tr("archive.target")).color(theme::text())),
+                );
+                ui.radio_value(
+                    &mut dialog.target,
+                    ArchiveTarget::Worktree,
+                    self.tr("archive.worktree"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 24.0], egui::Label::new(""));
+                ui.radio_value(
+                    &mut dialog.target,
+                    ArchiveTarget::Commit,
+                    self.tr("archive.commit"),
+                );
+                ui.add_enabled_ui(dialog.target == ArchiveTarget::Commit, |ui| {
+                    let target_commit_hint =
+                        placeholder_for_label(self.language, self.tr("archive.commit"));
+                    themed_text_edit_selection(ui);
+                    ui.add_sized(
+                        [ui.available_width() - 42.0, 24.0],
+                        themed_singleline_text_edit(&mut dialog.target_commit, &target_commit_hint),
+                    );
+                    if ui.button("...").clicked() {
+                        dialog.target = ArchiveTarget::Commit;
+                        dialog.target_commit = selected_commit.clone();
+                    }
+                });
+            });
+
+            if let Some(error) = dialog.validation_error.as_ref() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(error).color(theme::warning()).small());
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if ui
+                        .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
+                        .clicked()
+                        || (submit_requested && actions_enabled)
+                    {
+                        if let Some(error) = validate_archive_dialog(self.language, &dialog) {
+                            dialog.validation_error = Some(error);
+                        } else {
+                            let output_path = PathBuf::from(dialog.output_path.trim());
+                            let folder_prefix = dialog.folder_prefix.trim().to_owned();
+                            let target = archive_target_ref(&dialog);
+                            execute = Some(Box::new(move |root| {
+                                git::archive(root, &output_path, &folder_prefix, &target)
+                            }));
+                            close_after = true;
+                        }
+                    }
+                });
+            });
+        });
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_archive_action = Some(dialog);
+        }
+    }
+
+    fn interactive_rebase_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_interactive_rebase_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let mut hash_copied = false;
+        let actions_enabled = !self.branch_actions_busy();
+        let commits = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| interactive_rebase_dialog_commits(snapshot, dialog.sort_order))
+            .unwrap_or_default();
+        let disabled_hashes = interactive_rebase_disabled_hashes(&commits);
+        dialog.selected_hashes.retain(|hash| {
+            !disabled_hashes.contains(hash) && commits.iter().any(|commit| commit.hash == *hash)
+        });
+        for commit in commits
+            .iter()
+            .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        {
+            dialog
+                .actions
+                .entry(commit.hash.clone())
+                .or_insert(InteractiveRebaseTodoAction::Pick);
+        }
+        if disabled_hashes.contains(&dialog.selected_hash)
+            || !commits
+                .iter()
+                .any(|commit| commit.hash == dialog.selected_hash)
+        {
+            if let Some(commit) = commits
+                .iter()
+                .find(|commit| !interactive_rebase_commit_is_merge(commit))
+            {
+                dialog.selected_hash = commit.hash.clone();
+                dialog.selected_short_hash = commit.short_hash.clone();
+            }
+        }
+
+        compact_action_dialog(
+            ctx,
+            self.tr("interactive_rebase.title"),
+            INTERACTIVE_REBASE_DIALOG_WIDTH,
+            |ui| {
+                ui.label(
+                    RichText::new(self.tr("interactive_rebase.select_commit"))
+                        .small()
+                        .color(theme::muted()),
+                );
+                ui.add_space(4.0);
+                let browser_outcome = history_commit_browser(
+                    ui,
+                    &commits,
+                    &dialog.selected_hash,
+                    &mut dialog.branch_scope,
+                    &mut dialog.sort_order,
+                    &mut dialog.search,
+                    &mut dialog.show_remote_refs,
+                    self.history_show_branch_refs,
+                    self.history_show_tag_refs,
+                    &mut self.layout_prefs,
+                    self.language,
+                    &dialog.selected_hashes,
+                    &disabled_hashes,
+                    &mut dialog.history_cache,
+                    HistoryCommitBrowserConfig {
+                        id_salt: "interactive_rebase_commit_browser_scroll",
+                        show_view_controls: true,
+                        show_search: true,
+                        show_cherry_pick: false,
+                        show_jump: false,
+                        show_context_menu: false,
+                        select_rows: true,
+                        max_height: Some(300.0),
+                    },
+                );
+                hash_copied |= browser_outcome.hash_copied;
+                if browser_outcome.prefs_changed {
+                    self.layout_prefs.save();
+                }
+                if let Some(commit) = browser_outcome.picked_commit {
+                    dialog.selected_hash = commit.hash;
+                    dialog.selected_short_hash = commit.short_hash;
+                }
+                if let Some(hash) = browser_outcome.toggled_cherry_pick_hash {
+                    if !dialog.selected_hashes.insert(hash.clone()) {
+                        dialog.selected_hashes.remove(&hash);
+                    }
+                }
+
+                ui.add_space(10.0);
+                let selected_actionable_hashes =
+                    interactive_rebase_selected_actionable_hashes(&dialog, &commits);
+                let selected_batch_count = selected_actionable_hashes.len();
+                let oldest_actionable_hash = commits
+                    .iter()
+                    .rev()
+                    .find(|commit| !interactive_rebase_commit_is_merge(commit))
+                    .map(|commit| commit.hash.clone());
+                let selected = commits
+                    .iter()
+                    .position(|commit| commit.hash == dialog.selected_hash)
+                    .map(|index| {
+                        let commit = &commits[index];
+                        (
+                            index,
+                            commit.hash.clone(),
+                            commit.short_hash.clone(),
+                            commit.subject.clone(),
+                            interactive_rebase_commit_is_merge(commit),
+                        )
+                    });
+                Self::merge_options_panel(ui, |ui| {
+                    if let Some((_, hash, short_hash, subject, is_merge)) = selected.as_ref() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} {}",
+                                    self.tr("interactive_rebase.selected_commit"),
+                                    short_hash
+                                ))
+                                .small()
+                                .color(theme::muted()),
+                            );
+                            ui.label(RichText::new(subject).color(theme::text()));
+                        });
+                        if *is_merge {
+                            ui.label(
+                                RichText::new(self.tr("interactive_rebase.merge_commit_disabled"))
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(self.tr("interactive_rebase.todo_action"))
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                                let action = dialog
+                                    .actions
+                                    .entry(hash.clone())
+                                    .or_insert(InteractiveRebaseTodoAction::Pick);
+                                egui::ComboBox::from_id_salt("interactive_rebase_action_selector")
+                                    .selected_text(action.label(self.language))
+                                    .show_ui(ui, |ui| {
+                                        for (candidate, label) in [
+                                            (
+                                                InteractiveRebaseTodoAction::Pick,
+                                                self.tr("interactive_rebase.todo.pick"),
+                                            ),
+                                            (
+                                                InteractiveRebaseTodoAction::Squash,
+                                                self.tr("interactive_rebase.todo.squash"),
+                                            ),
+                                            (
+                                                InteractiveRebaseTodoAction::Drop,
+                                                self.tr("interactive_rebase.todo.drop"),
+                                            ),
+                                        ] {
+                                            ui.selectable_value(action, candidate, label);
+                                        }
+                                    });
+                                let is_oldest = oldest_actionable_hash
+                                    .as_ref()
+                                    .is_some_and(|oldest| oldest == hash);
+                                if is_oldest && *action == InteractiveRebaseTodoAction::Squash {
+                                    ui.label(
+                                        RichText::new(
+                                            self.tr("interactive_rebase.error.first_squash"),
+                                        )
+                                        .small()
+                                        .color(theme::warning()),
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(self.tr("interactive_rebase.error.no_commits"))
+                                .small()
+                                .color(theme::muted()),
+                        );
+                    }
+                });
+
+                if let Some(error) = dialog.validation_error.as_ref() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(error).color(theme::warning()).small());
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            self.tr("interactive_rebase.selected_count"),
+                            selected_batch_count
+                        ))
+                        .small()
+                        .color(theme::muted()),
+                    );
+                    if ui.button(self.tr("interactive_rebase.reset")).clicked() {
+                        for action in dialog.actions.values_mut() {
+                            *action = InteractiveRebaseTodoAction::Pick;
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            selected_batch_count > 0,
+                            egui::Button::new(self.tr("interactive_rebase.drop_selected")),
+                        )
+                        .clicked()
+                    {
+                        for hash in &selected_actionable_hashes {
+                            dialog
+                                .actions
+                                .insert(hash.clone(), InteractiveRebaseTodoAction::Drop);
+                        }
+                    }
+                    let can_squash_selected = selected_batch_count > 0
+                        && !selected_actionable_hashes.iter().any(|hash| {
+                            oldest_actionable_hash
+                                .as_ref()
+                                .is_some_and(|oldest| oldest == hash)
+                        });
+                    if ui
+                        .add_enabled(
+                            can_squash_selected,
+                            egui::Button::new(self.tr("interactive_rebase.squash_selected")),
+                        )
+                        .clicked()
+                    {
+                        for hash in &selected_actionable_hashes {
+                            dialog
+                                .actions
+                                .insert(hash.clone(), InteractiveRebaseTodoAction::Squash);
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            selected_batch_count > 0,
+                            egui::Button::new(self.tr("interactive_rebase.reset_selected")),
+                        )
+                        .clicked()
+                    {
+                        for hash in &selected_actionable_hashes {
+                            dialog
+                                .actions
+                                .insert(hash.clone(), InteractiveRebaseTodoAction::Pick);
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        let can_rebase = actions_enabled && !commits.is_empty();
+                        if ui
+                            .add_enabled(can_rebase, egui::Button::new(self.tr("dialog.ok")))
+                            .clicked()
+                            || (submit_requested && can_rebase)
+                        {
+                            if let Some(error) =
+                                validate_interactive_rebase_dialog(self.language, &dialog, &commits)
+                            {
+                                dialog.validation_error = Some(error);
+                            } else {
+                                let base = interactive_rebase_base_for_commits(&commits)
+                                    .unwrap_or_else(|| "--root".to_owned());
+                                let todo_items = interactive_rebase_todo_items(&dialog, &commits);
+                                execute = Some(Box::new(move |root| {
+                                    git::interactive_rebase(root, &base, &todo_items)
+                                }));
+                                close_after = true;
+                            }
+                        }
+                    });
+                });
+            },
+        );
+
+        if hash_copied {
+            self.show_toast(self.tr("status.hash_copied"));
+        }
+        if let Some(action) = execute {
+            if let Some(snapshot) = self.snapshot.as_ref() {
+                self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+            }
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_interactive_rebase_action = Some(dialog);
+        }
+    }
+
+    fn rebase_control_modal(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.pending_rebase_control_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut open_conflicts = false;
+        let mut mark_rewrite_prompt = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let has_conflicts = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !worktree_conflict_files(snapshot).is_empty());
+        let actions_enabled = !self.branch_actions_busy();
+
+        compact_action_dialog(
+            ctx,
+            self.tr("interactive_rebase.in_progress.title"),
+            ACTION_DIALOG_WIDTH,
+            |ui| {
+                ui.label(
+                    RichText::new(self.tr("interactive_rebase.in_progress.detail"))
+                        .color(theme::text()),
+                );
+                if has_conflicts {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(self.tr("interactive_rebase.in_progress.conflicts"))
+                            .small()
+                            .color(theme::warning()),
+                    );
+                }
+                if let Some(message) = dialog.message.as_ref() {
+                    ui.add_space(8.0);
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(110.0)
+                        .show(ui, |ui| {
+                            let mut message = message.clone();
+                            ui.add(
+                                TextEdit::multiline(&mut message)
+                                    .id_salt("rebase_control_error_text")
+                                    .font(FontId::monospace(12.0))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(4),
+                            );
+                        });
+                }
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.close")).clicked() {
+                        close_after = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            actions_enabled,
+                            egui::Button::new(self.tr("interactive_rebase.in_progress.abort")),
+                        )
+                        .clicked()
+                    {
+                        execute = Some(Box::new(|root| git::rebase_abort(root)));
+                        close_after = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            actions_enabled,
+                            egui::Button::new(self.tr("interactive_rebase.in_progress.skip")),
+                        )
+                        .clicked()
+                    {
+                        execute = Some(Box::new(|root| git::rebase_skip(root)));
+                        mark_rewrite_prompt = true;
+                        close_after = true;
+                    }
+                    if dialog_primary_button(
+                        ui,
+                        self.tr("interactive_rebase.in_progress.continue"),
+                        actions_enabled && !has_conflicts,
+                    )
+                    .clicked()
+                    {
+                        execute = Some(Box::new(|root| git::rebase_continue(root)));
+                        mark_rewrite_prompt = true;
+                        close_after = true;
+                    }
+                    if has_conflicts
+                        && dialog_primary_button(
+                            ui,
+                            self.tr("worktree.resolve_conflicts"),
+                            actions_enabled,
+                        )
+                        .clicked()
+                    {
+                        open_conflicts = true;
+                        close_after = true;
+                    }
+                });
+            },
+        );
+
+        if open_conflicts {
+            self.pending_worktree_action = Some(WorktreeActionDialog::ResolveConflicts {
+                selected_path: None,
+            });
+        }
+        if let Some(action) = execute {
+            if mark_rewrite_prompt {
+                if let Some(snapshot) = self.snapshot.as_ref() {
+                    self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+                }
+            }
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_rebase_control_action = Some(dialog);
+        }
+    }
+
+    fn rewritten_history_prompt_modal(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.pending_rewritten_history_prompt.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut open_push = false;
+        compact_action_dialog(
+            ctx,
+            self.tr("rewrite_prompt.title"),
+            ACTION_DIALOG_WIDTH,
+            |ui| {
+                ui.label(RichText::new(self.tr("rewrite_prompt.message")).color(theme::text()));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} -> {}  +{} / -{}",
+                        prompt.branch, prompt.upstream, prompt.ahead, prompt.behind
+                    ))
+                    .small()
+                    .color(theme::muted()),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("rewrite_prompt.later")).clicked() {
+                            keep_open = false;
+                        }
+                        if dialog_primary_button(ui, self.tr("rewrite_prompt.open_push"), true)
+                            .clicked()
+                        {
+                            open_push = true;
+                            keep_open = false;
+                        }
+                    });
+                });
+            },
+        );
+
+        if open_push {
+            self.open_push_dialog_with_force(Some(prompt.branch.clone()), None, true);
+        }
+        if keep_open {
+            self.pending_rewritten_history_prompt = Some(prompt);
+        }
+    }
+
+    fn lfs_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_lfs_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut next_dialog: Option<LfsActionDialog> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+
+        match &mut dialog {
+            LfsActionDialog::Intro => {
+                compact_action_dialog(ctx, self.tr("lfs.init.title"), LFS_DIALOG_WIDTH, |ui| {
+                    ui.label(
+                        RichText::new(self.tr("lfs.intro.heading"))
+                            .strong()
+                            .color(theme::text()),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(self.tr("lfs.intro.body")).color(theme::text()));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(self.tr("lfs.intro.note")).color(theme::muted()));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(self.tr("dialog.cancel")).clicked() {
+                                close_after = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    actions_enabled,
+                                    egui::Button::new(self.tr("lfs.start")),
+                                )
+                                .clicked()
+                            {
+                                if let Some(snapshot) = self.snapshot.as_ref() {
+                                    match git::lfs_tracked_patterns(&snapshot.root) {
+                                        Ok(patterns) => {
+                                            next_dialog = Some(LfsActionDialog::Track {
+                                                original_patterns: patterns.clone(),
+                                                patterns,
+                                                selected: None,
+                                                validation_error: None,
+                                            });
+                                            close_after = true;
+                                        }
+                                        Err(error) => {
+                                            self.error = Some(error.to_string());
+                                            close_after = true;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+            LfsActionDialog::Track {
+                original_patterns,
+                patterns,
+                selected,
+                validation_error,
+            } => {
+                compact_action_dialog(ctx, self.tr("lfs.init.title"), LFS_DIALOG_WIDTH, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(self.tr("lfs.track.title"))
+                                .strong()
+                                .color(theme::accent_deep()),
+                        );
+                    });
+                    ui.label(RichText::new(self.tr("lfs.patterns_label")).color(theme::text()));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            lfs_pattern_list(ui, patterns, selected, self.language);
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button(self.tr("lfs.add")).clicked() {
+                                    patterns.push(String::new());
+                                    *selected = Some(patterns.len().saturating_sub(1));
+                                }
+                                let remove_enabled =
+                                    selected.and_then(|index| patterns.get(index)).is_some();
+                                if ui
+                                    .add_enabled(
+                                        remove_enabled,
+                                        egui::Button::new(self.tr("lfs.remove")),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(index) = selected.take() {
+                                        if index < patterns.len() {
+                                            patterns.remove(index);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(10.0);
+                        ui.add_sized(
+                            [150.0, 160.0],
+                            egui::Label::new(
+                                RichText::new(self.tr("lfs.pattern_help")).color(theme::text()),
+                            )
+                            .wrap(),
+                        );
+                    });
+
+                    if let Some(error) = validation_error.as_ref() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(error).color(theme::warning()).small());
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(self.tr("dialog.cancel")).clicked() {
+                                close_after = true;
+                            }
+                            let submit_requested = dialog_default_submit_requested(ui);
+                            if ui
+                                .add_enabled(
+                                    actions_enabled,
+                                    egui::Button::new(self.tr("lfs.track_files")),
+                                )
+                                .clicked()
+                                || (submit_requested && actions_enabled)
+                            {
+                                if let Some(error) = validate_lfs_patterns(self.language, patterns)
+                                {
+                                    *validation_error = Some(error);
+                                } else {
+                                    let options = git::LfsTrackOptions {
+                                        original_patterns: original_patterns.clone(),
+                                        patterns: patterns.clone(),
+                                    };
+                                    execute = Some(Box::new(move |root| {
+                                        git::configure_lfs_patterns(root, options)
+                                    }));
+                                    close_after = true;
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+        }
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if let Some(next) = next_dialog {
+            self.pending_lfs_action = Some(next);
+            return;
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_lfs_action = Some(dialog);
+        }
+    }
+
+    fn submodule_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_submodule_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let snapshot_root = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone());
+
+        compact_action_dialog(
+            ctx,
+            self.tr("submodule.title"),
+            DEPENDENCY_DIALOG_WIDTH,
+            |ui| {
+                dependency_source_row(
+                    ui,
+                    self.language,
+                    self.tr("submodule.source"),
+                    &mut dialog.source,
+                    snapshot_root.as_deref(),
+                );
+                dependency_repo_type_row(
+                    ui,
+                    self.language,
+                    self.tr("submodule.repo_type"),
+                    &dialog.source,
+                );
+                dependency_local_path_row(
+                    ui,
+                    self.language,
+                    self.tr("submodule.local_path"),
+                    &mut dialog.local_path,
+                    snapshot_root.as_deref(),
+                );
+                dependency_advanced_toggle(
+                    ui,
+                    &mut dialog.advanced_open,
+                    self.tr("dependency.advanced_options"),
+                );
+                if dialog.advanced_open {
+                    dependency_text_row(
+                        ui,
+                        self.language,
+                        self.tr("submodule.source_branch"),
+                        &mut dialog.source_branch,
+                    );
+                    action_checkbox(ui, &mut dialog.recursive, self.tr("submodule.recursive"));
+                }
+
+                if let Some(error) = dialog.validation_error.as_ref() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(error).color(theme::warning()).small());
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui
+                            .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
+                            .clicked()
+                            || (submit_requested && actions_enabled)
+                        {
+                            if let Some(error) =
+                                validate_submodule_action_dialog(self.language, &dialog)
+                            {
+                                dialog.validation_error = Some(error);
+                            } else {
+                                let options = git::SubmoduleAddOptions {
+                                    source: dialog.source.trim().to_owned(),
+                                    local_path: normalize_dialog_relative_path(&dialog.local_path),
+                                    source_branch: dialog.source_branch.trim().to_owned(),
+                                    recursive: dialog.recursive,
+                                };
+                                execute =
+                                    Some(Box::new(move |root| git::add_submodule(root, options)));
+                                close_after = true;
+                            }
+                        }
+                    });
+                });
+            },
+        );
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_submodule_action = Some(dialog);
+        }
+    }
+
+    fn subtree_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_subtree_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let snapshot_root = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone());
+
+        compact_action_dialog(
+            ctx,
+            self.tr("subtree.title"),
+            DEPENDENCY_DIALOG_WIDTH,
+            |ui| {
+                dependency_source_row(
+                    ui,
+                    self.language,
+                    self.tr("subtree.source"),
+                    &mut dialog.source,
+                    snapshot_root.as_deref(),
+                );
+                dependency_repo_type_row(
+                    ui,
+                    self.language,
+                    self.tr("subtree.repo_type"),
+                    &dialog.source,
+                );
+                dependency_text_row(
+                    ui,
+                    self.language,
+                    self.tr("subtree.ref_name"),
+                    &mut dialog.ref_name,
+                );
+                dependency_local_path_row(
+                    ui,
+                    self.language,
+                    self.tr("subtree.local_path"),
+                    &mut dialog.local_path,
+                    snapshot_root.as_deref(),
+                );
+                dependency_advanced_toggle(
+                    ui,
+                    &mut dialog.advanced_open,
+                    self.tr("dependency.advanced_options"),
+                );
+                if dialog.advanced_open {
+                    action_checkbox(ui, &mut dialog.squash, self.tr("subtree.squash"));
+                }
+
+                if let Some(error) = dialog.validation_error.as_ref() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(error).color(theme::warning()).small());
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if ui
+                            .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
+                            .clicked()
+                            || (submit_requested && actions_enabled)
+                        {
+                            if let Some(error) =
+                                validate_subtree_action_dialog(self.language, &dialog)
+                            {
+                                dialog.validation_error = Some(error);
+                            } else {
+                                let options = git::SubtreeAddOptions {
+                                    source: dialog.source.trim().to_owned(),
+                                    local_path: normalize_dialog_relative_path(&dialog.local_path),
+                                    ref_name: dialog.ref_name.trim().to_owned(),
+                                    squash: dialog.squash,
+                                };
+                                execute =
+                                    Some(Box::new(move |root| git::add_subtree(root, options)));
+                                close_after = true;
+                            }
+                        }
+                    });
+                });
+            },
+        );
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_subtree_action = Some(dialog);
+        }
+    }
+
+    fn merge_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_merge_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let mut hash_copied = false;
+        let actions_enabled = !self.branch_actions_busy();
+        let commits = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                history_dialog_commits(snapshot, dialog.branch_scope, dialog.sort_order)
+            })
+            .unwrap_or_default();
+        if !commits
+            .iter()
+            .any(|commit| commit.hash == dialog.selected_hash)
+        {
+            if let Some(commit) = commits.first() {
+                dialog.selected_hash = commit.hash.clone();
+                dialog.selected_short_hash = commit.short_hash.clone();
+            }
+        }
+
+        compact_action_dialog(ctx, self.tr("merge.title"), MERGE_DIALOG_WIDTH, |ui| {
+            ui.label(
+                RichText::new(self.tr("merge.select_commit"))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.add_space(4.0);
+            let browser_outcome = history_commit_browser(
+                ui,
+                &commits,
+                &dialog.selected_hash,
+                &mut dialog.branch_scope,
+                &mut dialog.sort_order,
+                &mut dialog.search,
+                &mut dialog.show_remote_refs,
+                self.history_show_branch_refs,
+                self.history_show_tag_refs,
+                &mut self.layout_prefs,
+                self.language,
+                &HashSet::new(),
+                &HashSet::new(),
+                &mut dialog.history_cache,
+                HistoryCommitBrowserConfig {
+                    id_salt: "merge_commit_browser_scroll",
+                    show_view_controls: true,
+                    show_search: true,
+                    show_cherry_pick: false,
+                    show_jump: false,
+                    show_context_menu: false,
+                    select_rows: false,
+                    max_height: Some(300.0),
+                },
+            );
+            hash_copied |= browser_outcome.hash_copied;
+            if browser_outcome.prefs_changed {
+                self.layout_prefs.save();
+            }
+            if let Some(commit) = browser_outcome.picked_commit {
+                dialog.selected_hash = commit.hash;
+                dialog.selected_short_hash = commit.short_hash;
+            }
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} {}",
+                    self.tr("merge.selected_commit"),
+                    dialog.selected_short_hash
+                ))
+                .small()
+                .color(theme::muted()),
+            );
+            Self::merge_options_panel(ui, |ui| {
+                action_checkbox(
+                    ui,
+                    &mut dialog.commit_immediately,
+                    self.tr("merge.commit_immediately"),
+                );
+                action_checkbox(
+                    ui,
+                    &mut dialog.include_messages,
+                    self.tr("merge.include_messages"),
+                );
+                action_checkbox(
+                    ui,
+                    &mut dialog.force_merge_commit,
+                    self.tr("merge.force_merge_commit"),
+                );
+                action_checkbox(ui, &mut dialog.rebase, self.tr("merge.rebase"));
+                ui.horizontal(|ui| {
+                    action_checkbox(
+                        ui,
+                        &mut dialog.detect_renames,
+                        self.tr("merge.detect_renames"),
+                    );
+                    let threshold_label = match self.language {
+                        Language::Chinese => "\u{9608}\u{503c}",
+                        Language::English => "threshold",
+                    };
+                    let threshold_hint = placeholder_for_label(self.language, threshold_label);
+                    themed_text_edit_selection(ui);
+                    ui.add_sized(
+                        [42.0, 22.0],
+                        themed_singleline_text_edit(&mut dialog.rename_threshold, &threshold_hint),
+                    );
+                    ui.label(RichText::new("%").color(theme::muted()));
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    let can_merge = actions_enabled && !dialog.selected_hash.trim().is_empty();
+                    if ui
+                        .add_enabled(can_merge, egui::Button::new(self.tr("dialog.ok")))
+                        .clicked()
+                        || (submit_requested && can_merge)
+                    {
+                        let hash = dialog.selected_hash.trim().to_owned();
+                        let options = git::MergeOptions {
+                            commit_merge: dialog.commit_immediately,
+                            include_messages: dialog.include_messages,
+                            force_merge_commit: dialog.force_merge_commit,
+                            rebase: dialog.rebase,
+                            detect_renames: dialog.detect_renames,
+                            rename_threshold: parse_merge_rename_threshold(
+                                &dialog.rename_threshold,
+                            ),
+                        };
+                        execute = Some(Box::new(move |root| {
+                            git::merge_commit(root, &hash, options)
+                        }));
+                        close_after = true;
+                    }
+                });
+            });
+        });
+
+        if hash_copied {
+            self.show_toast(self.tr("status.hash_copied"));
+        }
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_merge_action = Some(dialog);
+        }
+    }
+
+    fn merge_options_panel(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+        soft_panel_frame(theme::panel_soft(), 10, 8)
+            .stroke(Stroke::NONE)
+            .shadow(panel_shadow())
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                add_contents(ui);
+            });
+    }
+
     fn stash_action_modal(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.pending_stash_action.take() else {
             return;
@@ -7589,22 +10196,43 @@ impl GitAgentApp {
             None;
 
         match &mut dialog {
-            StashActionDialog::Create { message } => {
+            StashActionDialog::Create {
+                message,
+                staged_files,
+                keep_staged,
+                include_untracked,
+                include_ignored,
+            } => {
                 compact_action_dialog(ctx, self.tr("stash.create"), ACTION_DIALOG_WIDTH, |ui| {
-                    let hint = self.tr("stash.message");
+                    let hint = placeholder_for_label(self.language, self.tr("stash.message"));
+                    themed_text_edit_selection(ui);
                     ui.add_sized(
                         [ui.available_width(), 34.0],
-                        TextEdit::singleline(message).hint_text(hint),
+                        themed_singleline_text_edit(message, &hint),
                     );
+                    action_checkbox(ui, staged_files, self.tr("stash.staged_files"));
+                    action_checkbox(ui, keep_staged, self.tr("stash.keep_staged"));
+                    action_checkbox(ui, include_untracked, self.tr("stash.include_untracked"));
+                    action_checkbox(ui, include_ignored, self.tr("stash.include_ignored"));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         let submit_requested = dialog_default_submit_requested(ui);
-                        if ui.button(self.tr("stash.create")).clicked() || submit_requested {
+                        if dialog_primary_button(ui, self.tr("stash.create"), true).clicked()
+                            || submit_requested
+                        {
                             let message = message.trim().to_owned();
-                            execute = Some(Box::new(move |root| git::stash_push(root, &message)));
+                            let options = git::StashOptions {
+                                staged_files: *staged_files,
+                                keep_staged: *keep_staged,
+                                include_untracked: *include_untracked,
+                                include_ignored: *include_ignored,
+                            };
+                            execute = Some(Box::new(move |root| {
+                                git::stash_push(root, &message, options)
+                            }));
                             close_after = true;
                         }
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
                             close_after = true;
                         }
                     });
@@ -7617,12 +10245,14 @@ impl GitAgentApp {
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         let submit_requested = dialog_default_submit_requested(ui);
-                        if ui.button(self.tr("stash.drop")).clicked() || submit_requested {
+                        if dialog_primary_button(ui, self.tr("stash.drop"), true).clicked()
+                            || submit_requested
+                        {
                             let selector = selector.clone();
                             execute = Some(Box::new(move |root| git::stash_drop(root, &selector)));
                             close_after = true;
                         }
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
                             close_after = true;
                         }
                     });
@@ -7653,238 +10283,289 @@ impl GitAgentApp {
         let mut checkout_requested: Option<(String, bool)> = None;
         let branch_actions_enabled = !self.branch_actions_busy();
 
-        match &mut dialog {
-            BranchActionDialog::Create { name, checkout } => {
-                compact_action_dialog(ctx, self.tr("branch.create"), ACTION_DIALOG_WIDTH, |ui| {
-                    ui.label(
-                        RichText::new(self.tr("branch.name"))
-                            .small()
-                            .color(theme::muted()),
-                    );
-                    ui.add(TextEdit::singleline(name));
-                    ui.checkbox(checkout, self.tr("branch.checkout"));
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        let default_action_enabled =
-                            branch_actions_enabled && !name.trim().is_empty();
-                        let submit_requested = dialog_default_submit_requested(ui);
-                        if ui
-                            .add_enabled(
-                                default_action_enabled,
-                                egui::Button::new(self.tr("dialog.create")),
-                            )
-                            .clicked()
-                            || (submit_requested && default_action_enabled)
-                        {
-                            let branch_name = name.trim().to_owned();
-                            let checkout = *checkout;
-                            execute = Some(Box::new(move |root| {
-                                git::create_branch_from_head(root, &branch_name, checkout)
-                            }));
-                            close_after = true;
-                        }
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
-                            close_after = true;
-                        }
-                    });
-                });
+        if matches!(
+            dialog,
+            BranchActionDialog::Checkout { .. }
+                | BranchActionDialog::ConfirmDetachedCheckout { .. }
+        ) {
+            let (checkout_close_after, checkout_execute) =
+                self.checkout_dialog_modal(ctx, &mut dialog, branch_actions_enabled);
+            if checkout_close_after {
+                close_after = true;
             }
-            BranchActionDialog::ConfirmCheckout {
-                name,
-                discard_changes,
-            } => {
-                compact_action_dialog(
-                    ctx,
-                    self.tr("branch.confirm_checkout_title"),
-                    ACTION_DIALOG_WIDTH,
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            let (icon_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            paint_ui_icon(
-                                ui,
-                                icon_rect.shrink(2.0),
-                                UiIcon::Warning,
-                                theme::warning(),
-                            );
+            if let Some(action) = checkout_execute {
+                execute = Some(action);
+            }
+        } else {
+            match &mut dialog {
+                BranchActionDialog::Create { name, checkout } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.create"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
                             ui.label(
-                                RichText::new(format!(
-                                    "{} \"{}\"?",
-                                    self.tr("branch.confirm_checkout"),
-                                    name
-                                ))
-                                .color(theme::text()),
+                                RichText::new(self.tr("branch.name"))
+                                    .small()
+                                    .color(theme::muted()),
                             );
-                        });
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(discard_changes, self.tr("branch.discard_before_checkout"));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let name_hint =
+                                placeholder_for_label(self.language, self.tr("branch.name"));
+                            themed_text_edit_selection(ui);
+                            ui.add(themed_singleline_text_edit(name, &name_hint));
+                            action_checkbox(ui, checkout, self.tr("branch.checkout"));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let default_action_enabled =
+                                    branch_actions_enabled && !name.trim().is_empty();
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if ui
+                                    .add_enabled(
+                                        default_action_enabled,
+                                        egui::Button::new(self.tr("dialog.create")),
+                                    )
+                                    .clicked()
+                                    || (submit_requested && default_action_enabled)
+                                {
+                                    let branch_name = name.trim().to_owned();
+                                    let checkout = *checkout;
+                                    execute = Some(Box::new(move |root| {
+                                        git::create_branch_from_head(root, &branch_name, checkout)
+                                    }));
+                                    close_after = true;
+                                }
                                 if ui.button(self.tr("dialog.cancel")).clicked() {
                                     close_after = true;
                                 }
+                            });
+                        },
+                    );
+                }
+                BranchActionDialog::ConfirmCheckout {
+                    name,
+                    discard_changes,
+                } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.confirm_checkout_title"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                                paint_ui_icon(
+                                    ui,
+                                    icon_rect.shrink(2.0),
+                                    UiIcon::Warning,
+                                    theme::warning(),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} \"{}\"?",
+                                        self.tr("branch.confirm_checkout"),
+                                        name
+                                    ))
+                                    .color(theme::text()),
+                                );
+                            });
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                action_checkbox(
+                                    ui,
+                                    discard_changes,
+                                    self.tr("branch.discard_before_checkout"),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button(self.tr("dialog.cancel")).clicked() {
+                                        close_after = true;
+                                    }
+                                    let submit_requested = dialog_default_submit_requested(ui);
+                                    if ui
+                                        .add_enabled(
+                                            branch_actions_enabled,
+                                            egui::Button::new(self.tr("dialog.ok")),
+                                        )
+                                        .clicked()
+                                        || (submit_requested && branch_actions_enabled)
+                                    {
+                                        checkout_requested = Some((name.clone(), *discard_changes));
+                                        close_after = true;
+                                    }
+                                });
+                            });
+                        },
+                    );
+                }
+                BranchActionDialog::CheckoutRemote {
+                    remote_branch,
+                    local_branch,
+                } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.sync_remote"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.label(RichText::new(remote_branch.as_str()).color(theme::text()));
+                            ui.label(
+                                RichText::new(self.tr("branch.local_alias"))
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                            let local_branch_hint =
+                                placeholder_for_label(self.language, self.tr("branch.local_alias"));
+                            themed_text_edit_selection(ui);
+                            ui.add(themed_singleline_text_edit(
+                                local_branch,
+                                &local_branch_hint,
+                            ));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let default_action_enabled =
+                                    branch_actions_enabled && !local_branch.trim().is_empty();
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if ui
+                                    .add_enabled(
+                                        default_action_enabled,
+                                        egui::Button::new(self.tr("dialog.checkout")),
+                                    )
+                                    .clicked()
+                                    || (submit_requested && default_action_enabled)
+                                {
+                                    let remote_branch = remote_branch.clone();
+                                    let local_branch = local_branch.trim().to_owned();
+                                    execute = Some(Box::new(move |root| {
+                                        git::checkout_remote_branch(
+                                            root,
+                                            &remote_branch,
+                                            &local_branch,
+                                        )
+                                    }));
+                                    close_after = true;
+                                }
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                            });
+                        },
+                    );
+                }
+                BranchActionDialog::Rename { old_name, new_name } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.rename_title"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.label(RichText::new(old_name.as_str()).color(theme::text()));
+                            ui.label(
+                                RichText::new(self.tr("branch.new_name"))
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                            let new_name_hint =
+                                placeholder_for_label(self.language, self.tr("branch.new_name"));
+                            themed_text_edit_selection(ui);
+                            ui.add(themed_singleline_text_edit(new_name, &new_name_hint));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let default_action_enabled =
+                                    branch_actions_enabled && !new_name.trim().is_empty();
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if ui
+                                    .add_enabled(
+                                        default_action_enabled,
+                                        egui::Button::new(self.tr("dialog.ok")),
+                                    )
+                                    .clicked()
+                                    || (submit_requested && default_action_enabled)
+                                {
+                                    let old_name = old_name.clone();
+                                    let new_name = new_name.trim().to_owned();
+                                    execute = Some(Box::new(move |root| {
+                                        git::rename_branch(root, &old_name, &new_name)
+                                    }));
+                                    close_after = true;
+                                }
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                            });
+                        },
+                    );
+                }
+                BranchActionDialog::ConfirmDelete { name, force } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.delete"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.label(
+                                RichText::new(self.tr("branch.confirm_delete"))
+                                    .color(theme::text()),
+                            );
+                            ui.label(RichText::new(name.as_str()).color(theme::warning()));
+                            action_checkbox(ui, force, self.tr("branch.force_delete"));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
                                 let submit_requested = dialog_default_submit_requested(ui);
                                 if ui
                                     .add_enabled(
                                         branch_actions_enabled,
-                                        egui::Button::new(self.tr("dialog.ok")),
+                                        egui::Button::new(self.tr("branch.delete")),
                                     )
                                     .clicked()
                                     || (submit_requested && branch_actions_enabled)
                                 {
-                                    checkout_requested = Some((name.clone(), *discard_changes));
+                                    let name = name.clone();
+                                    let force = *force;
+                                    execute = Some(Box::new(move |root| {
+                                        git::delete_branch(root, &name, force)
+                                    }));
+                                    close_after = true;
+                                }
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
                                     close_after = true;
                                 }
                             });
-                        });
-                    },
-                );
-            }
-            BranchActionDialog::CheckoutRemote {
-                remote_branch,
-                local_branch,
-            } => {
-                compact_action_dialog(
-                    ctx,
-                    self.tr("branch.sync_remote"),
-                    ACTION_DIALOG_WIDTH,
-                    |ui| {
-                        ui.label(RichText::new(remote_branch.as_str()).color(theme::text()));
-                        ui.label(
-                            RichText::new(self.tr("branch.local_alias"))
-                                .small()
-                                .color(theme::muted()),
-                        );
-                        ui.add(TextEdit::singleline(local_branch));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            let default_action_enabled =
-                                branch_actions_enabled && !local_branch.trim().is_empty();
-                            let submit_requested = dialog_default_submit_requested(ui);
-                            if ui
-                                .add_enabled(
-                                    default_action_enabled,
-                                    egui::Button::new(self.tr("dialog.checkout")),
-                                )
-                                .clicked()
-                                || (submit_requested && default_action_enabled)
-                            {
-                                let remote_branch = remote_branch.clone();
-                                let local_branch = local_branch.trim().to_owned();
-                                execute = Some(Box::new(move |root| {
-                                    git::checkout_remote_branch(root, &remote_branch, &local_branch)
-                                }));
-                                close_after = true;
-                            }
-                            if ui.button(self.tr("dialog.cancel")).clicked() {
-                                close_after = true;
-                            }
-                        });
-                    },
-                );
-            }
-            BranchActionDialog::Rename { old_name, new_name } => {
-                compact_action_dialog(
-                    ctx,
-                    self.tr("branch.rename_title"),
-                    ACTION_DIALOG_WIDTH,
-                    |ui| {
-                        ui.label(RichText::new(old_name.as_str()).color(theme::text()));
-                        ui.label(
-                            RichText::new(self.tr("branch.new_name"))
-                                .small()
-                                .color(theme::muted()),
-                        );
-                        ui.add(TextEdit::singleline(new_name));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            let default_action_enabled =
-                                branch_actions_enabled && !new_name.trim().is_empty();
-                            let submit_requested = dialog_default_submit_requested(ui);
-                            if ui
-                                .add_enabled(
-                                    default_action_enabled,
-                                    egui::Button::new(self.tr("dialog.ok")),
-                                )
-                                .clicked()
-                                || (submit_requested && default_action_enabled)
-                            {
-                                let old_name = old_name.clone();
-                                let new_name = new_name.trim().to_owned();
-                                execute = Some(Box::new(move |root| {
-                                    git::rename_branch(root, &old_name, &new_name)
-                                }));
-                                close_after = true;
-                            }
-                            if ui.button(self.tr("dialog.cancel")).clicked() {
-                                close_after = true;
-                            }
-                        });
-                    },
-                );
-            }
-            BranchActionDialog::ConfirmDelete { name, force } => {
-                compact_action_dialog(ctx, self.tr("branch.delete"), ACTION_DIALOG_WIDTH, |ui| {
-                    ui.label(RichText::new(self.tr("branch.confirm_delete")).color(theme::text()));
-                    ui.label(RichText::new(name.as_str()).color(theme::warning()));
-                    ui.checkbox(force, self.tr("branch.force_delete"));
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        let submit_requested = dialog_default_submit_requested(ui);
-                        if ui
-                            .add_enabled(
-                                branch_actions_enabled,
-                                egui::Button::new(self.tr("branch.delete")),
-                            )
-                            .clicked()
-                            || (submit_requested && branch_actions_enabled)
-                        {
-                            let name = name.clone();
-                            let force = *force;
-                            execute =
-                                Some(Box::new(move |root| git::delete_branch(root, &name, force)));
-                            close_after = true;
-                        }
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
-                            close_after = true;
-                        }
-                    });
-                });
-            }
-            BranchActionDialog::ConfirmDeleteRemote { remote_branch } => {
-                compact_action_dialog(
-                    ctx,
-                    self.tr("branch.delete_remote"),
-                    ACTION_DIALOG_WIDTH,
-                    |ui| {
-                        ui.label(
-                            RichText::new(self.tr("branch.confirm_delete_remote"))
-                                .color(theme::text()),
-                        );
-                        ui.label(RichText::new(remote_branch.as_str()).color(theme::warning()));
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            let submit_requested = dialog_default_submit_requested(ui);
-                            if ui
-                                .add_enabled(
-                                    branch_actions_enabled,
-                                    egui::Button::new(self.tr("branch.delete_remote")),
-                                )
-                                .clicked()
-                                || (submit_requested && branch_actions_enabled)
-                            {
-                                let remote_branch = remote_branch.clone();
-                                execute = Some(Box::new(move |root| {
-                                    git::delete_remote_branch(root, &remote_branch)
-                                }));
-                                close_after = true;
-                            }
-                            if ui.button(self.tr("dialog.cancel")).clicked() {
-                                close_after = true;
-                            }
-                        });
-                    },
-                );
+                        },
+                    );
+                }
+                BranchActionDialog::ConfirmDeleteRemote { remote_branch } => {
+                    compact_action_dialog(
+                        ctx,
+                        self.tr("branch.delete_remote"),
+                        ACTION_DIALOG_WIDTH,
+                        |ui| {
+                            ui.label(
+                                RichText::new(self.tr("branch.confirm_delete_remote"))
+                                    .color(theme::text()),
+                            );
+                            ui.label(RichText::new(remote_branch.as_str()).color(theme::warning()));
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled,
+                                        egui::Button::new(self.tr("branch.delete_remote")),
+                                    )
+                                    .clicked()
+                                    || (submit_requested && branch_actions_enabled)
+                                {
+                                    let remote_branch = remote_branch.clone();
+                                    execute = Some(Box::new(move |root| {
+                                        git::delete_remote_branch(root, &remote_branch)
+                                    }));
+                                    close_after = true;
+                                }
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                            });
+                        },
+                    );
+                }
+                BranchActionDialog::Checkout { .. }
+                | BranchActionDialog::ConfirmDetachedCheckout { .. } => {}
             }
         }
 
@@ -7900,6 +10581,382 @@ impl GitAgentApp {
         if keep_open {
             self.pending_branch_action = Some(dialog);
         }
+    }
+
+    fn checkout_dialog_modal(
+        &mut self,
+        ctx: &egui::Context,
+        dialog: &mut BranchActionDialog,
+        branch_actions_enabled: bool,
+    ) -> (
+        bool,
+        Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>>,
+    ) {
+        let mut close_after = false;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let mut next_dialog: Option<BranchActionDialog> = None;
+        let mut hash_copied = false;
+        let remote_branch_choices = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .branches
+                    .iter()
+                    .filter(|branch| branch.remote && !branch.name.ends_with("/HEAD"))
+                    .map(|branch| branch.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let local_branch_names = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .branches
+                    .iter()
+                    .filter(|branch| !branch.remote)
+                    .map(|branch| branch.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        match dialog {
+            BranchActionDialog::Checkout {
+                tab,
+                selected_hash,
+                selected_short_hash,
+                discard_changes,
+                history_branch_scope,
+                history_sort_order,
+                history_show_remote_refs,
+                history_search,
+                history_cache,
+                remote_branch,
+                local_branch,
+                track_remote,
+                validation_error,
+            } => {
+                let commit_rows = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        history_dialog_commits(snapshot, *history_branch_scope, *history_sort_order)
+                    })
+                    .unwrap_or_default();
+                if selected_hash.is_empty()
+                    || !commit_rows
+                        .iter()
+                        .any(|commit| commit.hash == *selected_hash)
+                {
+                    if let Some(commit) = commit_rows.first() {
+                        *selected_hash = commit.hash.clone();
+                        *selected_short_hash = commit.short_hash.clone();
+                    }
+                }
+                if remote_branch.is_empty() {
+                    if let Some(branch) = remote_branch_choices.first() {
+                        *remote_branch = branch.clone();
+                        *local_branch = checkout_local_branch_default(branch);
+                    }
+                }
+
+                compact_action_dialog(
+                    ctx,
+                    self.tr("checkout.title"),
+                    CHECKOUT_DIALOG_WIDTH,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            checkout_tab_button(
+                                ui,
+                                tab,
+                                CheckoutDialogTab::Existing,
+                                UiIcon::Fetch,
+                                self.tr("checkout.existing"),
+                            );
+                            checkout_tab_button(
+                                ui,
+                                tab,
+                                CheckoutDialogTab::NewBranch,
+                                UiIcon::Branch,
+                                self.tr("checkout.new_branch"),
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        match tab {
+                            CheckoutDialogTab::Existing => {
+                                ui.label(
+                                    RichText::new(self.tr("checkout.existing_commit"))
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                                let browser_outcome = history_commit_browser(
+                                    ui,
+                                    &commit_rows,
+                                    selected_hash,
+                                    history_branch_scope,
+                                    history_sort_order,
+                                    history_search,
+                                    history_show_remote_refs,
+                                    self.history_show_branch_refs,
+                                    self.history_show_tag_refs,
+                                    &mut self.layout_prefs,
+                                    self.language,
+                                    &HashSet::new(),
+                                    &HashSet::new(),
+                                    history_cache,
+                                    HistoryCommitBrowserConfig {
+                                        id_salt: "checkout_existing_commit_browser",
+                                        show_view_controls: true,
+                                        show_search: true,
+                                        show_cherry_pick: false,
+                                        show_jump: false,
+                                        show_context_menu: false,
+                                        select_rows: false,
+                                        max_height: Some(300.0),
+                                    },
+                                );
+                                hash_copied |= browser_outcome.hash_copied;
+                                if browser_outcome.prefs_changed {
+                                    self.layout_prefs.save();
+                                }
+                                if let Some(commit) = browser_outcome.picked_commit {
+                                    *selected_hash = commit.hash;
+                                    *selected_short_hash = commit.short_hash;
+                                }
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    action_checkbox(
+                                        ui,
+                                        discard_changes,
+                                        self.tr("branch.discard_before_checkout"),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                                            close_after = true;
+                                        }
+                                        let can_checkout = branch_actions_enabled
+                                            && !selected_hash.trim().is_empty();
+                                        let submit_requested = dialog_default_submit_requested(ui);
+                                        if ui
+                                            .add_enabled(
+                                                can_checkout,
+                                                egui::Button::new(self.tr("dialog.ok")),
+                                            )
+                                            .clicked()
+                                            || (submit_requested && can_checkout)
+                                        {
+                                            next_dialog =
+                                                Some(BranchActionDialog::ConfirmDetachedCheckout {
+                                                    hash: selected_hash.clone(),
+                                                    short_hash: selected_short_hash.clone(),
+                                                    discard_changes: *discard_changes,
+                                                });
+                                        }
+                                    });
+                                });
+                            }
+                            CheckoutDialogTab::NewBranch => {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [118.0, 24.0],
+                                        egui::Label::new(
+                                            RichText::new(self.tr("checkout.remote_branch"))
+                                                .color(theme::muted()),
+                                        ),
+                                    );
+                                    egui::ComboBox::from_id_salt("checkout_remote_branch_selector")
+                                        .width(ui.available_width())
+                                        .selected_text(if remote_branch.is_empty() {
+                                            self.tr("checkout.select_remote_branch")
+                                        } else {
+                                            remote_branch.as_str()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for branch in &remote_branch_choices {
+                                                if ui
+                                                    .selectable_value(
+                                                        remote_branch,
+                                                        branch.clone(),
+                                                        branch.as_str(),
+                                                    )
+                                                    .clicked()
+                                                    && local_branch.trim().is_empty()
+                                                {
+                                                    *local_branch =
+                                                        checkout_local_branch_default(branch);
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [118.0, 24.0],
+                                        egui::Label::new(
+                                            RichText::new(self.tr("checkout.local_branch"))
+                                                .color(theme::muted()),
+                                        ),
+                                    );
+                                    let local_branch_hint = placeholder_for_label(
+                                        self.language,
+                                        self.tr("checkout.local_branch"),
+                                    );
+                                    themed_text_edit_selection(ui);
+                                    ui.add_sized(
+                                        [ui.available_width(), 24.0],
+                                        themed_singleline_text_edit(
+                                            local_branch,
+                                            &local_branch_hint,
+                                        ),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_space(118.0);
+                                    action_checkbox(
+                                        ui,
+                                        track_remote,
+                                        self.tr("checkout.track_remote"),
+                                    );
+                                });
+                                if let Some(error) = validation_error.as_ref() {
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new(error.as_str()).color(theme::warning()));
+                                }
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                                            close_after = true;
+                                        }
+                                        let submit_requested = dialog_default_submit_requested(ui);
+                                        if ui
+                                            .add_enabled(
+                                                branch_actions_enabled,
+                                                egui::Button::new(self.tr("dialog.ok")),
+                                            )
+                                            .clicked()
+                                            || (submit_requested && branch_actions_enabled)
+                                        {
+                                            match validate_checkout_new_branch(
+                                                self.language,
+                                                remote_branch,
+                                                local_branch,
+                                                &remote_branch_choices,
+                                                &local_branch_names,
+                                            ) {
+                                                Some(error) => {
+                                                    *validation_error = Some(error);
+                                                }
+                                                None => {
+                                                    let remote_branch =
+                                                        remote_branch.trim().to_owned();
+                                                    let local_branch =
+                                                        local_branch.trim().to_owned();
+                                                    let track_remote = *track_remote;
+                                                    execute = Some(Box::new(move |root| {
+                                                        if track_remote {
+                                                            git::checkout_remote_branch(
+                                                                root,
+                                                                &remote_branch,
+                                                                &local_branch,
+                                                            )
+                                                        } else {
+                                                            git::create_branch(
+                                                                root,
+                                                                &local_branch,
+                                                                &remote_branch,
+                                                                true,
+                                                            )
+                                                        }
+                                                    }));
+                                                    close_after = true;
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    },
+                );
+            }
+            BranchActionDialog::ConfirmDetachedCheckout {
+                hash,
+                short_hash,
+                discard_changes,
+            } => {
+                compact_action_dialog(
+                    ctx,
+                    self.tr("checkout.detached_confirm_title"),
+                    CHECKOUT_DIALOG_WIDTH,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            paint_ui_icon(
+                                ui,
+                                icon_rect.shrink(2.0),
+                                UiIcon::Warning,
+                                theme::warning(),
+                            );
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        self.tr("checkout.detached_target"),
+                                        short_hash
+                                    ))
+                                    .color(theme::text()),
+                                );
+                                ui.label(
+                                    RichText::new(self.tr("checkout.detached_warning_detail"))
+                                        .color(theme::muted()),
+                                );
+                            });
+                        });
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button(self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                                let submit_requested = dialog_default_submit_requested(ui);
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled,
+                                        egui::Button::new(self.tr("dialog.ok")),
+                                    )
+                                    .clicked()
+                                    || (submit_requested && branch_actions_enabled)
+                                {
+                                    let hash = hash.clone();
+                                    let discard_changes = *discard_changes;
+                                    execute = Some(Box::new(move |root| {
+                                        if discard_changes {
+                                            git::discard_all_changes(root)?;
+                                        }
+                                        git::checkout_commit(root, &hash)
+                                    }));
+                                    close_after = true;
+                                }
+                            });
+                        });
+                    },
+                );
+            }
+            _ => {}
+        }
+
+        if let Some(next_dialog) = next_dialog {
+            *dialog = next_dialog;
+        }
+        if hash_copied {
+            self.show_toast(self.tr("status.hash_copied"));
+        }
+
+        (close_after, execute)
     }
 
     fn tag_action_modal(&mut self, ctx: &egui::Context) {
@@ -7925,9 +10982,10 @@ impl GitAgentApp {
                             .small()
                             .color(theme::muted()),
                     );
+                    let name_hint = placeholder_for_label(self.language, self.tr("tag.name"));
                     themed_text_edit_selection(ui);
-                    ui.add(themed_singleline_text_edit(name, ""));
-                    ui.checkbox(push_after_create, self.tr("tag.push_after_create"));
+                    ui.add(themed_singleline_text_edit(name, &name_hint));
+                    action_checkbox(ui, push_after_create, self.tr("tag.push_after_create"));
                     if *push_after_create {
                         tag_remote_selector(ui, self.language, &remotes, remote);
                     }
@@ -8022,8 +11080,8 @@ impl GitAgentApp {
         let mut close_requested = false;
         let screen = ctx.screen_rect();
         let size = Vec2::new(
-            (screen.width() * 0.46).clamp(420.0, 620.0),
-            (screen.height() * 0.46).clamp(300.0, 420.0),
+            (screen.width() * 0.68).clamp(760.0, SETTINGS_DIALOG_WIDTH),
+            (screen.height() * 0.82).clamp(540.0, SETTINGS_DIALOG_HEIGHT),
         );
         let rect = Rect::from_min_size(
             Pos2::new(
@@ -8130,7 +11188,7 @@ impl GitAgentApp {
                                     SettingsTab::RepoAdvanced => {
                                         self.repo_advanced_settings_page(ui)
                                     }
-                                    SettingsTab::General => {}
+                                    _ => {}
                                 });
                             });
                         ui.add_space(12.0);
@@ -8158,8 +11216,37 @@ impl GitAgentApp {
     }
 
     fn global_settings_page(&mut self, ui: &mut Ui) {
-        settings_section_title(ui, "Global Options");
-        settings_field(ui, "Theme", |ui| {
+        global_settings_tab_strip(ui, &mut self.settings_tab, self.language);
+        ui.add_space(12.0);
+        ScrollArea::vertical()
+            .id_salt("global_settings_content_scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| match self.settings_tab {
+                SettingsTab::General => self.global_general_settings(ui),
+                SettingsTab::Git => global_settings_empty_tab(
+                    ui,
+                    settings_tab_label(self.language, SettingsTab::Git),
+                    self.language,
+                ),
+                SettingsTab::CustomActions => global_settings_empty_tab(
+                    ui,
+                    settings_tab_label(self.language, SettingsTab::CustomActions),
+                    self.language,
+                ),
+                SettingsTab::Verification => global_settings_empty_tab(
+                    ui,
+                    settings_tab_label(self.language, SettingsTab::Verification),
+                    self.language,
+                ),
+                SettingsTab::Network => self.global_network_settings(ui),
+                _ => self.global_general_settings(ui),
+            });
+    }
+
+    fn global_general_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        settings_section_title(ui, i18n::t(language, "settings.appearance"));
+        settings_field(ui, i18n::t(language, "settings.theme"), |ui| {
             if settings_choice_button(
                 ui,
                 self.theme_mode == theme::ThemeMode::Light,
@@ -8182,7 +11269,7 @@ impl GitAgentApp {
             }
         });
         ui.add_space(8.0);
-        settings_field(ui, settings_theme_accent_title(self.language), |ui| {
+        settings_field(ui, settings_theme_accent_title(language), |ui| {
             for accent in theme::all_accents() {
                 if settings_accent_button(
                     ui,
@@ -8197,7 +11284,7 @@ impl GitAgentApp {
             }
         });
         ui.add_space(8.0);
-        settings_field(ui, "Language", |ui| {
+        settings_field(ui, i18n::t(language, "settings.language"), |ui| {
             if settings_choice_button(
                 ui,
                 self.language == Language::Chinese,
@@ -8214,8 +11301,111 @@ impl GitAgentApp {
                 self.set_language(Language::English);
             }
         });
+        ui.add_space(8.0);
+        self.global_refresh_settings(ui);
+        ui.add_space(12.0);
+        self.global_repository_workspaces_settings(ui);
+    }
+
+    fn global_network_settings(&mut self, ui: &mut Ui) {
+        settings_section_title(ui, settings_tab_label(self.language, SettingsTab::Network));
         ui.add_space(12.0);
         self.global_remote_accounts_settings(ui);
+    }
+
+    fn global_refresh_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        settings_section_title(ui, i18n::t(language, "settings.auto_refresh"));
+        let mut active_seconds = self.active_repo_refresh_seconds;
+        settings_field(
+            ui,
+            i18n::t(language, "settings.refresh_active_repo_seconds"),
+            |ui| {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut active_seconds)
+                            .range(MIN_REPO_REFRESH_SECONDS..=MAX_REPO_REFRESH_SECONDS)
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    self.set_active_repo_refresh_seconds(active_seconds);
+                }
+            },
+        );
+        ui.add_space(8.0);
+        let mut inactive_seconds = self.inactive_repo_refresh_seconds;
+        settings_field(
+            ui,
+            i18n::t(language, "settings.refresh_inactive_repo_seconds"),
+            |ui| {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut inactive_seconds)
+                            .range(MIN_REPO_REFRESH_SECONDS..=MAX_REPO_REFRESH_SECONDS)
+                            .suffix(" s"),
+                    )
+                    .changed()
+                {
+                    self.set_inactive_repo_refresh_seconds(inactive_seconds);
+                }
+            },
+        );
+    }
+
+    fn global_repository_workspaces_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        let mut remove_workspace = None;
+
+        settings_section_title(ui, i18n::t(language, "settings.repository_workspaces"));
+        ui.label(
+            RichText::new(i18n::t(language, "settings.repository_workspaces_hint"))
+                .small()
+                .color(theme::muted()),
+        );
+        let default_value = self
+            .repository_workspaces
+            .first()
+            .map(|workspace| user_facing_path_string(workspace))
+            .unwrap_or_else(|| {
+                i18n::t(language, "settings.repository_workspaces_empty").to_owned()
+            });
+        ui.label(
+            RichText::new(format!(
+                "{} {}",
+                i18n::t(language, "settings.repository_workspaces_default"),
+                default_value
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+        ui.add_space(4.0);
+
+        for (index, workspace) in self.repository_workspaces.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let path_width = (ui.available_width() - 84.0).clamp(160.0, 430.0);
+                let workspace_label = user_facing_path_string(workspace);
+                settings_path_label(ui, &workspace_label, path_width);
+                if ui
+                    .button(i18n::t(language, "repo.settings.remove"))
+                    .clicked()
+                {
+                    remove_workspace = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_workspace {
+            self.remove_repository_workspace(index);
+        }
+        ui.add_space(6.0);
+        if ui
+            .button(i18n::t(language, "settings.repository_workspace_add"))
+            .clicked()
+        {
+            if let Some(workspace) = self.repository_folder_dialog().pick_folder() {
+                self.add_repository_workspace(workspace);
+            }
+        }
     }
 
     fn global_remote_accounts_settings(&mut self, ui: &mut Ui) {
@@ -8249,20 +11439,24 @@ impl GitAgentApp {
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            let account_name_hint =
+                placeholder_for_label(language, i18n::t(language, "settings.remote_account_name"));
             themed_text_edit_selection(ui);
             ui.add_sized(
                 [SETTINGS_REMOTE_ACCOUNT_INPUT_WIDTH, 24.0],
                 themed_singleline_text_edit(
                     &mut self.remote_account_name_input,
-                    i18n::t(language, "settings.remote_account_name"),
+                    &account_name_hint,
                 ),
             );
+            let account_host_hint =
+                placeholder_for_label(language, i18n::t(language, "settings.remote_account_host"));
             themed_text_edit_selection(ui);
             ui.add_sized(
                 [SETTINGS_REMOTE_ACCOUNT_INPUT_WIDTH, 24.0],
                 themed_singleline_text_edit(
                     &mut self.remote_account_host_input,
-                    i18n::t(language, "settings.remote_account_host"),
+                    &account_host_hint,
                 ),
             );
             if ui.button(i18n::t(language, "repo.settings.add")).clicked() {
@@ -8428,8 +11622,18 @@ impl GitAgentApp {
                     ..
                 } => (name, url, account_index, validation_error),
             };
-            repo_settings_editable_text(ui, i18n::t(language, "repo.settings.remote_name"), name);
-            repo_settings_editable_text(ui, i18n::t(language, "repo.settings.url_path"), url);
+            repo_settings_editable_text(
+                ui,
+                language,
+                i18n::t(language, "repo.settings.remote_name"),
+                name,
+            );
+            repo_settings_editable_text(
+                ui,
+                language,
+                i18n::t(language, "repo.settings.url_path"),
+                url,
+            );
             repo_settings_account_dropdown(
                 ui,
                 language,
@@ -8617,17 +11821,18 @@ fn repo_settings_account_dropdown(
     });
 }
 
-fn repo_settings_editable_text(ui: &mut Ui, label: &str, value: &mut String) {
+fn repo_settings_editable_text(ui: &mut Ui, language: Language, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.set_min_height(30.0);
         ui.add_sized(
             [112.0, 22.0],
             egui::Label::new(RichText::new(label).color(theme::muted())),
         );
+        let hint = placeholder_for_label(language, label);
         themed_text_edit_selection(ui);
         ui.add_sized(
             [ui.available_width().max(80.0), 24.0],
-            themed_singleline_text_edit(value, ""),
+            themed_singleline_text_edit(value, &hint),
         );
     });
 }
@@ -8761,8 +11966,9 @@ fn tag_remote_selector(ui: &mut Ui, language: Language, remotes: &[String], remo
             .color(theme::muted()),
     );
     if remotes.is_empty() {
+        let remote_hint = placeholder_for_label(language, i18n::t(language, "tag.remote"));
         themed_text_edit_selection(ui);
-        ui.add(themed_singleline_text_edit(remote, "origin"));
+        ui.add(themed_singleline_text_edit(remote, &remote_hint));
         return;
     }
 
@@ -8843,6 +12049,31 @@ fn panel_shadow() -> egui::epaint::Shadow {
         spread: 0,
         color: theme::accent_shadow(),
     }
+}
+
+fn text_button_hover_shadow() -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset: [1, 2],
+        blur: 6,
+        spread: 0,
+        color: theme::accent_shadow().gamma_multiply(0.55),
+    }
+}
+
+fn paint_text_button_hover_shadow_for_response(ui: &Ui, response: &egui::Response) {
+    if response.hovered() || response.has_focus() {
+        paint_text_button_hover_shadow(ui, response.rect);
+    }
+}
+
+fn paint_text_button_hover_shadow(ui: &Ui, rect: Rect) {
+    let frame = egui::Frame::new()
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(4))
+        .shadow(text_button_hover_shadow());
+    ui.painter()
+        .add(frame.paint(rect.shrink2(Vec2::new(0.0, 1.0))));
 }
 
 fn workspace_card_frame(x: i8, y: i8) -> egui::Frame {
@@ -9066,7 +12297,7 @@ fn workspace_main_layout(
         body_rect.left_top(),
         Vec2::new(body_rect.width(), list_height),
     );
-    let table_gap = (LAYOUT_GAP as f32).min(list_rect.height());
+    let table_gap = WORKSPACE_TABLE_GAP.min(list_rect.height());
     let table_total = (list_rect.height() - table_gap).max(0.0);
     let desired_staged_height = (table_total * workspace_staged_pct)
         .round()
@@ -9149,6 +12380,65 @@ fn dialog_window_frame() -> egui::Frame {
 
 fn dialog_default_submit_requested(ui: &mut Ui) -> bool {
     ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+}
+
+fn dialog_primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    dialog_action_button(ui, label, enabled, true)
+}
+
+fn dialog_cancel_button(ui: &mut Ui, label: &str) -> egui::Response {
+    dialog_action_button(ui, label, true, false)
+}
+
+fn dialog_action_button(ui: &mut Ui, label: &str, enabled: bool, primary: bool) -> egui::Response {
+    let width = inline_button_width(ui, label, 12.0, 64.0, 144.0, 24.0);
+    let size = Vec2::new(width, 28.0);
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let response = if enabled {
+        pointing_hand_cursor(response)
+    } else {
+        response
+    };
+    let fill = if primary {
+        if !enabled {
+            theme::accent_deep().gamma_multiply(0.55)
+        } else if response.hovered() || response.has_focus() {
+            theme::accent()
+        } else {
+            theme::accent_deep()
+        }
+    } else if response.hovered() || response.has_focus() {
+        theme::hover()
+    } else {
+        theme::panel_soft()
+    };
+    let text = if primary {
+        if enabled {
+            Color32::WHITE
+        } else {
+            Color32::WHITE.gamma_multiply(0.72)
+        }
+    } else if enabled {
+        theme::text()
+    } else {
+        theme::muted()
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.0),
+        text,
+    );
+    response
 }
 
 fn compact_action_dialog(
@@ -9302,6 +12592,63 @@ fn full_row_click_response_enabled(
     }
 }
 
+fn workspace_repositories_drawer_rect(full: Rect) -> Rect {
+    let width = (full.width() * 0.42)
+        .clamp(520.0, 720.0)
+        .min((full.width() - 56.0).max(320.0))
+        .round();
+    Rect::from_min_max(
+        Pos2::new((full.right() - width).round(), full.top().round()),
+        full.right_bottom(),
+    )
+}
+
+fn workspace_repositories_drawer_at_rect(
+    ui: &mut Ui,
+    rect: Rect,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let x_margin = CONTENT_PANEL_INSET_X;
+    let y_margin = CONTENT_PANEL_INSET_Y;
+    let inner_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + x_margin as f32, rect.top() + y_margin as f32),
+        Pos2::new(
+            (rect.right() - x_margin as f32).max(rect.left()),
+            (rect.bottom() - y_margin as f32).max(rect.top()),
+        ),
+    );
+    let frame = egui::Frame::new()
+        .fill(theme::panel())
+        .corner_radius(CornerRadius::same(6))
+        .shadow(workspace_repositories_drawer_shadow())
+        .inner_margin(egui::Margin::symmetric(x_margin, y_margin));
+
+    ui.painter().add(frame.paint(inner_rect));
+    allocate_clipped_ui_at_rect(ui, inner_rect, |ui| {
+        safe_set_min_size(ui, inner_rect.size());
+        add_contents(ui);
+    });
+}
+
+fn workspace_repositories_drawer_shadow() -> egui::epaint::Shadow {
+    egui::epaint::Shadow {
+        offset: [-5, 5],
+        blur: 14,
+        spread: 0,
+        color: theme::accent_shadow(),
+    }
+}
+
+fn workspace_repositories_drawer_should_close(ui: &Ui, full: Rect, drawer: Rect) -> bool {
+    ui.input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| full.contains(pos) && !drawer.contains(pos))
+    })
+}
+
 fn resize_handle_rect(rect: Rect, vertical: bool) -> Rect {
     if vertical {
         Rect::from_center_size(
@@ -9334,6 +12681,7 @@ enum UiIcon {
     DeleteFile,
     RenameFile,
     File,
+    UnstagedFile,
     Workspace,
     History,
     Search,
@@ -9350,7 +12698,7 @@ enum UiIcon {
 enum AppButtonStyle {
     IconOnly,
     Toolbar,
-    RepoTab { selected: bool },
+    RepoTab { selected: bool, mode: TabVisualMode },
 }
 
 struct AppButton<'a> {
@@ -9384,11 +12732,30 @@ impl<'a> AppButton<'a> {
             icon,
             label,
             enabled: true,
-            style: AppButtonStyle::RepoTab { selected },
+            style: AppButtonStyle::RepoTab {
+                selected,
+                mode: TabVisualMode::Connected,
+            },
+        }
+    }
+
+    fn detached_tab(icon: UiIcon, label: &'a str, selected: bool) -> Self {
+        Self {
+            icon,
+            label,
+            enabled: true,
+            style: AppButtonStyle::RepoTab {
+                selected,
+                mode: TabVisualMode::Detached,
+            },
         }
     }
 
     fn show(self, ui: &mut Ui) -> egui::Response {
+        if let AppButtonStyle::RepoTab { selected, mode } = self.style {
+            return self.show_tab_button(ui, selected, mode);
+        }
+
         let (icon_size, text_size, min_width, max_width, height, fill, radius) = match self.style {
             AppButtonStyle::IconOnly => {
                 (11.0, 0.0, 18.0, 18.0, 18.0, toolbar_button_normal_fill(), 4)
@@ -9402,23 +12769,26 @@ impl<'a> AppButton<'a> {
                 toolbar_button_normal_fill(),
                 4,
             ),
-            AppButtonStyle::RepoTab { selected } => (
-                14.0,
-                12.0,
-                if self.icon == UiIcon::More {
-                    REPO_TAB_OVERFLOW_WIDTH
-                } else {
-                    110.0
-                },
-                if self.icon == UiIcon::More {
-                    REPO_TAB_OVERFLOW_WIDTH
-                } else {
-                    220.0
-                },
-                28.0,
-                repo_tab_fill(selected, false),
-                3,
-            ),
+            AppButtonStyle::RepoTab { selected, mode } => {
+                let visuals = tab_visual_state(mode, selected, false, connected_tab_content_fill());
+                (
+                    14.0,
+                    12.0,
+                    if self.icon == UiIcon::More {
+                        REPO_TAB_OVERFLOW_WIDTH
+                    } else {
+                        110.0
+                    },
+                    if self.icon == UiIcon::More {
+                        REPO_TAB_OVERFLOW_WIDTH
+                    } else {
+                        220.0
+                    },
+                    28.0,
+                    visuals.fill,
+                    3,
+                )
+            }
         };
 
         let tint = if self.enabled {
@@ -9433,7 +12803,9 @@ impl<'a> AppButton<'a> {
         let image = egui::Image::new(icon_source(self.icon))
             .fit_to_exact_size(Vec2::splat(icon_size))
             .tint(match self.style {
-                AppButtonStyle::RepoTab { selected } => repo_tab_icon_color(selected),
+                AppButtonStyle::RepoTab { selected, mode } => {
+                    tab_visual_state(mode, selected, false, connected_tab_content_fill()).icon
+                }
                 _ => tint,
             });
 
@@ -9459,7 +12831,10 @@ impl<'a> AppButton<'a> {
                 RichText::new(self.label)
                     .size(text_size)
                     .color(match self.style {
-                        AppButtonStyle::RepoTab { selected } => repo_tab_text_color(selected),
+                        AppButtonStyle::RepoTab { selected, mode } => {
+                            tab_visual_state(mode, selected, false, connected_tab_content_fill())
+                                .text
+                        }
                         _ => theme::text(),
                     }),
             )
@@ -9469,7 +12844,10 @@ impl<'a> AppButton<'a> {
             )),
         };
         let corner_radius = match self.style {
-            AppButtonStyle::RepoTab { .. } => top_corners(radius),
+            AppButtonStyle::RepoTab {
+                mode: TabVisualMode::Connected,
+                ..
+            } => top_corners(radius),
             _ => CornerRadius::same(radius),
         };
         let button = button.stroke(Stroke::NONE).corner_radius(corner_radius);
@@ -9498,9 +12876,71 @@ impl<'a> AppButton<'a> {
         } else {
             response
         };
-        if let AppButtonStyle::RepoTab { selected } = self.style {
-            paint_repo_tab_shadow(ui, response.rect, selected);
+        if let AppButtonStyle::RepoTab { selected, mode } = self.style {
+            let visuals = tab_visual_state(
+                mode,
+                selected,
+                response.hovered(),
+                connected_tab_content_fill(),
+            );
+            paint_connected_tab_shadow_for_state(ui, response.rect, visuals);
         }
+        response.on_hover_text(self.label)
+    }
+
+    fn show_tab_button(self, ui: &mut Ui, selected: bool, mode: TabVisualMode) -> egui::Response {
+        let min_width = if self.icon == UiIcon::More {
+            REPO_TAB_OVERFLOW_WIDTH
+        } else {
+            110.0
+        };
+        let max_width = if self.icon == UiIcon::More {
+            REPO_TAB_OVERFLOW_WIDTH
+        } else {
+            220.0
+        };
+        let width = inline_button_width(ui, self.label, 12.0, min_width, max_width, 38.0);
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(width, REPO_TAB_HEIGHT),
+            if self.enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let hovered = self.enabled && response.hovered();
+        let visuals = tab_visual_state(mode, selected, hovered, connected_tab_content_fill());
+        paint_connected_tab_shadow_for_state(ui, rect, visuals);
+        let corner_radius = match mode {
+            TabVisualMode::Connected => top_corners(3),
+            TabVisualMode::Detached => CornerRadius::same(3),
+        };
+        ui.painter().rect_filled(rect, corner_radius, visuals.fill);
+
+        let icon_rect = Rect::from_center_size(
+            Pos2::new(rect.left() + 17.0, rect.center().y),
+            Vec2::splat(14.0),
+        );
+        paint_ui_icon(ui, icon_rect, self.icon, visuals.icon);
+        let text_rect = Rect::from_min_max(
+            Pos2::new(icon_rect.right() + 7.0, rect.top()),
+            Pos2::new(rect.right() - 10.0, rect.bottom()),
+        );
+        ui.painter()
+            .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+            .text(
+                text_rect.left_center(),
+                Align2::LEFT_CENTER,
+                self.label,
+                FontId::proportional(12.0),
+                visuals.text,
+            );
+
+        let response = if self.enabled {
+            pointing_hand_cursor(response)
+        } else {
+            response
+        };
         response.on_hover_text(self.label)
     }
 }
@@ -9513,29 +12953,137 @@ fn toolbar_button_hover_fill() -> Color32 {
     theme::hover()
 }
 
-fn repo_tab_fill(selected: bool, hovered: bool) -> Color32 {
-    if selected {
-        theme::panel()
-    } else if hovered {
-        theme::accent()
-    } else {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TabVisualMode {
+    Connected,
+    Detached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TabVisualState {
+    fill: Color32,
+    text: Color32,
+    icon: Color32,
+    shadow: bool,
+    bottom_shadow: bool,
+}
+
+fn connected_tab_content_fill() -> Color32 {
+    theme::panel()
+}
+
+fn mix_tab_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |from: u8, to: u8| from as f32 + (to as f32 - from as f32) * t;
+    Color32::from_rgba_unmultiplied(
+        mix(a.r(), b.r()).round() as u8,
+        mix(a.g(), b.g()).round() as u8,
+        mix(a.b(), b.b()).round() as u8,
+        mix(a.a(), b.a()).round() as u8,
+    )
+}
+
+fn inactive_tab_base_fill() -> Color32 {
+    mix_tab_color(theme::panel(), theme::accent_soft(), 0.58)
+}
+
+fn inactive_tab_fill(hovered: bool) -> Color32 {
+    if hovered {
         theme::accent_deep()
+    } else {
+        inactive_tab_base_fill()
     }
 }
 
-fn repo_tab_text_color(selected: bool) -> Color32 {
-    if selected {
+fn tab_visual_state(
+    mode: TabVisualMode,
+    selected: bool,
+    hovered: bool,
+    connected_fill: Color32,
+) -> TabVisualState {
+    match (mode, selected) {
+        (TabVisualMode::Connected, true) => TabVisualState {
+            fill: connected_fill,
+            text: theme::text(),
+            icon: theme::accent(),
+            shadow: true,
+            bottom_shadow: false,
+        },
+        (TabVisualMode::Connected, false) => TabVisualState {
+            fill: inactive_tab_fill(hovered),
+            text: if hovered {
+                Color32::WHITE
+            } else {
+                theme::text()
+            },
+            icon: if hovered {
+                Color32::WHITE
+            } else {
+                theme::accent()
+            },
+            shadow: true,
+            bottom_shadow: true,
+        },
+        (TabVisualMode::Detached, true) => TabVisualState {
+            fill: theme::accent_deep(),
+            text: Color32::WHITE,
+            icon: Color32::WHITE,
+            shadow: false,
+            bottom_shadow: false,
+        },
+        (TabVisualMode::Detached, false) => TabVisualState {
+            fill: inactive_tab_fill(hovered),
+            text: if hovered {
+                Color32::WHITE
+            } else {
+                theme::text()
+            },
+            icon: if hovered {
+                Color32::WHITE
+            } else {
+                theme::accent()
+            },
+            shadow: true,
+            bottom_shadow: true,
+        },
+    }
+}
+
+fn repo_tab_fill(selected: bool, hovered: bool) -> Color32 {
+    tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        hovered,
+        connected_tab_content_fill(),
+    )
+    .fill
+}
+
+fn repo_tab_text_color(selected: bool, hovered: bool) -> Color32 {
+    tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        hovered,
+        connected_tab_content_fill(),
+    )
+    .text
+}
+
+fn repo_tab_icon_color(selected: bool, hovered: bool) -> Color32 {
+    tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        hovered,
+        connected_tab_content_fill(),
+    )
+    .icon
+}
+
+fn repo_tab_close_color(selected: bool, tab_hovered: bool, close_hovered: bool) -> Color32 {
+    if !selected && (tab_hovered || close_hovered) {
+        Color32::WHITE
+    } else {
         theme::text()
-    } else {
-        Color32::WHITE
-    }
-}
-
-fn repo_tab_icon_color(selected: bool) -> Color32 {
-    if selected {
-        theme::accent()
-    } else {
-        Color32::WHITE
     }
 }
 
@@ -9887,6 +13435,14 @@ fn themed_text_edit_selection(ui: &mut Ui) {
     ui.visuals_mut().selection.stroke = Stroke::new(1.0, theme::accent_deep());
 }
 
+fn placeholder_for_label(language: Language, label: &str) -> String {
+    let label = label.trim().trim_end_matches([':', '\u{ff1a}']).trim();
+    match language {
+        Language::Chinese => format!("\u{8bf7}\u{8f93}\u{5165}{label}"),
+        Language::English => format!("Enter {label}"),
+    }
+}
+
 fn themed_singleline_text_edit<'a>(text: &'a mut String, hint: &str) -> TextEdit<'a> {
     TextEdit::singleline(text)
         .hint_text(RichText::new(hint.to_owned()).color(theme::muted()))
@@ -9991,13 +13547,14 @@ fn commit_checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> egui::Response
             theme::panel()
         },
     );
+    let edge_stroke = Stroke::new(1.0, theme::inset_shadow());
     ui.painter().line_segment(
         [square.left_top(), Pos2::new(square.right(), square.top())],
-        Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.7)),
+        edge_stroke,
     );
     ui.painter().line_segment(
         [square.left_top(), Pos2::new(square.left(), square.bottom())],
-        Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.7)),
+        edge_stroke,
     );
     if *value {
         let check_color = Color32::WHITE;
@@ -10025,6 +13582,136 @@ fn commit_checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> egui::Response
     );
 
     response
+}
+
+fn action_checkbox(ui: &mut Ui, value: &mut bool, label: &str) -> egui::Response {
+    let font = FontId::proportional(13.0);
+    let text_width = if label.is_empty() {
+        0.0
+    } else {
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(label.to_owned(), font.clone(), theme::text())
+                .rect
+                .width()
+        })
+    };
+    let width = if label.is_empty() {
+        18.0
+    } else {
+        text_width + 28.0
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
+    let enabled = ui.is_enabled();
+    let mut response = if enabled {
+        pointing_hand_cursor(response)
+    } else {
+        response
+    };
+    if enabled && response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+
+    let square = Rect::from_center_size(
+        Pos2::new(rect.left() + 7.0, rect.center().y),
+        Vec2::splat(12.0),
+    );
+    paint_action_checkbox_square(ui, square, *value, enabled, &response);
+    if !label.is_empty() {
+        let text_color = if enabled {
+            theme::text()
+        } else {
+            theme::muted()
+        };
+        ui.painter().text(
+            Pos2::new(square.right() + 7.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            font,
+            text_color,
+        );
+    }
+
+    response
+}
+
+fn action_icon_checkbox(
+    ui: &mut Ui,
+    rect: Rect,
+    id_salt: impl std::hash::Hash,
+    value: &mut bool,
+) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, ui.id().with(id_salt), sense);
+    let mut response = if enabled {
+        pointing_hand_cursor(response)
+    } else {
+        response
+    };
+    if enabled && response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+
+    let square = Rect::from_center_size(rect.center(), Vec2::splat(12.0));
+    paint_action_checkbox_square(ui, square, *value, enabled, &response);
+    response
+}
+
+fn paint_action_checkbox_square(
+    ui: &mut Ui,
+    rect: Rect,
+    checked: bool,
+    enabled: bool,
+    response: &egui::Response,
+) {
+    let fill = if checked {
+        theme::accent_deep()
+    } else if response.hovered() || response.has_focus() {
+        theme::hover()
+    } else {
+        theme::panel_soft()
+    };
+    let fill = if enabled {
+        fill
+    } else {
+        fill.gamma_multiply(0.72)
+    };
+    let shadow = rect.translate(Vec2::new(1.0, 1.5));
+    ui.painter().rect_filled(
+        shadow.expand(0.5),
+        CornerRadius::same(2),
+        theme::accent_shadow().gamma_multiply(0.28),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(2), fill);
+
+    if checked {
+        let check_color = if enabled {
+            Color32::WHITE
+        } else {
+            theme::muted()
+        };
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.left() + 2.5, rect.center().y),
+                Pos2::new(rect.left() + 5.0, rect.bottom() - 3.0),
+            ],
+            Stroke::new(1.6, check_color),
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.left() + 5.0, rect.bottom() - 3.0),
+                Pos2::new(rect.right() - 2.0, rect.top() + 3.0),
+            ],
+            Stroke::new(1.6, check_color),
+        );
+    }
 }
 
 fn toolbar_icon(raw: &str, _label: &str) -> UiIcon {
@@ -10066,10 +13753,11 @@ fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
         UiIcon::Settings => egui::include_image!("../assets/icons/settings.svg"),
         UiIcon::Plus => egui::include_image!("../assets/icons/plus.svg"),
         UiIcon::Edit => egui::include_image!("../assets/icons/edit.svg"),
-        UiIcon::AddFile => egui::include_image!("../assets/icons/plus.svg"),
+        UiIcon::AddFile => egui::include_image!("../assets/icons/add-file.svg"),
         UiIcon::DeleteFile => egui::include_image!("../assets/icons/delete-file.svg"),
         UiIcon::RenameFile => egui::include_image!("../assets/icons/rename-file.svg"),
         UiIcon::File => egui::include_image!("../assets/icons/file.svg"),
+        UiIcon::UnstagedFile => egui::include_image!("../assets/icons/unstaged-file.svg"),
         UiIcon::Workspace => egui::include_image!("../assets/icons/workspace.svg"),
         UiIcon::History => egui::include_image!("../assets/icons/history.svg"),
         UiIcon::Search => egui::include_image!("../assets/icons/search.svg"),
@@ -10129,20 +13817,114 @@ fn window_control_button(ui: &mut Ui, label: &str, close: bool) -> egui::Respons
     pointing_hand_cursor(response)
 }
 
-fn menu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+fn top_menu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
     ui.scope(|ui| {
-        ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
-        ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
-        ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-        ui.visuals_mut().widgets.hovered.bg_fill = theme::hover().gamma_multiply(0.35);
-        ui.visuals_mut().widgets.hovered.weak_bg_fill = ui.visuals().widgets.hovered.bg_fill;
-        ui.visuals_mut().widgets.open.bg_fill = theme::hover().gamma_multiply(0.42);
-        ui.visuals_mut().widgets.open.weak_bg_fill = ui.visuals().widgets.open.bg_fill;
-        ui.menu_button(
-            RichText::new(label).color(theme::text()).size(13.0),
-            add_contents,
+        apply_menu_visuals(ui);
+        let popup_id = ui.make_persistent_id(("top_menu_popup", label));
+        let popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+        let fill = if popup_open {
+            menu_text_button_hover_fill()
+        } else {
+            Color32::TRANSPARENT
+        };
+        let response = ui.add(
+            egui::Button::new(RichText::new(label).color(theme::text()).size(13.0))
+                .fill(fill)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(4)),
+        );
+        let response = pointing_hand_cursor(response);
+        if response.clicked() {
+            ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+        }
+        if popup_open {
+            paint_text_button_hover_shadow(ui, response.rect);
+        } else {
+            paint_text_button_hover_shadow_for_response(ui, &response);
+        }
+        apply_menu_visuals(ui);
+        ui.visuals_mut().window_stroke = Stroke::NONE;
+        ui.visuals_mut().popup_shadow = panel_shadow();
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &response,
+            egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                apply_menu_visuals(ui);
+                ui.set_min_width(220.0);
+                add_contents(ui);
+            },
         );
     });
+}
+
+fn close_top_menu_popup(ui: &mut Ui) {
+    ui.close_menu();
+    ui.memory_mut(|memory| memory.close_popup());
+}
+
+fn menu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+    ui.scope(|ui| {
+        apply_menu_visuals(ui);
+        let response = ui.menu_button(RichText::new(label).color(theme::text()).size(13.0), |ui| {
+            apply_menu_visuals(ui);
+            add_contents(ui);
+        });
+        paint_text_button_hover_shadow_for_response(ui, &response.response);
+    });
+}
+
+fn apply_menu_visuals(ui: &mut Ui) {
+    ui.spacing_mut().button_padding = Vec2::new(6.0, 2.0);
+    ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
+    ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
+    ui.visuals_mut().widgets.hovered.bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.hovered.weak_bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::NONE;
+    ui.visuals_mut().widgets.open.bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.open.weak_bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.open.bg_stroke = Stroke::NONE;
+    ui.visuals_mut().widgets.active.bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.active.weak_bg_fill = menu_text_button_hover_fill();
+    ui.visuals_mut().widgets.active.bg_stroke = Stroke::NONE;
+    ui.visuals_mut().selection.stroke = Stroke::NONE;
+    ui.visuals_mut().window_stroke = Stroke::NONE;
+    ui.visuals_mut().window_shadow = panel_shadow();
+    ui.visuals_mut().popup_shadow = panel_shadow();
+}
+
+fn menu_text_button_hover_fill() -> Color32 {
+    theme::accent_soft()
+}
+
+fn menu_text_button(ui: &mut Ui, enabled: bool, label: &str) -> egui::Response {
+    menu_text_button_with_text(ui, enabled, label.to_owned())
+}
+
+fn menu_text_button_with_text(ui: &mut Ui, enabled: bool, text: String) -> egui::Response {
+    ui.scope(|ui| {
+        apply_menu_visuals(ui);
+        let response = ui.add_enabled(
+            enabled,
+            egui::Button::new(text)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(4)),
+        );
+        if enabled {
+            paint_text_button_hover_shadow_for_response(ui, &response);
+        }
+        if response.clicked() {
+            close_top_menu_popup(ui);
+        }
+        response
+    })
+    .inner
+}
+
+fn menu_shortcut_button(ui: &mut Ui, enabled: bool, label: &str, shortcut: &str) -> egui::Response {
+    menu_text_button_with_text(ui, enabled, format!("{label}\t{shortcut}"))
 }
 
 fn menu_label(language: Language, key: &str) -> &'static str {
@@ -10157,6 +13939,94 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "options") => "\u{9009}\u{9879}(O)",
         (Language::Chinese, "light_theme") => "\u{65e5}\u{95f4}\u{4e3b}\u{9898}",
         (Language::Chinese, "dark_theme") => "\u{591c}\u{95f4}\u{4e3b}\u{9898}",
+        (Language::Chinese, "next_tab") => "\u{4e0b}\u{4e00}\u{4e2a}\u{6807}\u{7b7e}\u{9875}",
+        (Language::Chinese, "previous_tab") => "\u{4e0a}\u{4e00}\u{4e2a}\u{6807}\u{7b7e}\u{9875}",
+        (Language::Chinese, "view_workspace") => "\u{5de5}\u{4f5c}\u{533a}",
+        (Language::Chinese, "view_history") => "\u{65e5}\u{5fd7}",
+        (Language::Chinese, "view_search") => "\u{641c}\u{7d22}",
+        (Language::Chinese, "show_workspace_repositories") => {
+            "\u{663e}\u{793a}\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}\u{4ed3}\u{5e93}"
+        }
+        (Language::Chinese, "hide_workspace_repositories") => {
+            "\u{9690}\u{85cf}\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}\u{4ed3}\u{5e93}"
+        }
+        (Language::Chinese, "workspace_repositories") => {
+            "\u{5de5}\u{4f5c}\u{7a7a}\u{95f4}\u{4ed3}\u{5e93}"
+        }
+        (Language::Chinese, "show_branch_labels") => {
+            "\u{663e}\u{793a}\u{5206}\u{652f}\u{6807}\u{7b7e}"
+        }
+        (Language::Chinese, "show_tag_labels") => "\u{663e}\u{793a} Tag \u{6807}\u{7b7e}",
+        (Language::Chinese, "repo_status_unloaded") => "\u{672a}\u{52a0}\u{8f7d}\u{72b6}\u{6001}",
+        (Language::Chinese, "repo_settings") => "\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}...",
+        (Language::Chinese, "repo_details") => "\u{4ed3}\u{5e93}\u{8be6}\u{60c5}...",
+        (Language::Chinese, "repo_refresh_remote_status") => {
+            "\u{5237}\u{65b0}\u{8fdc}\u{7a0b}\u{4ed3}\u{5e93}\u{72b6}\u{6001}"
+        }
+        (Language::Chinese, "repo_view_online") => {
+            "\u{5728}\u{7ebf}\u{67e5}\u{770b}\u{4ed3}\u{5e93}"
+        }
+        (Language::Chinese, "repo_stage_toggle") => {
+            "\u{6682}\u{5b58}\u{6240}\u{6709}/\u{53d6}\u{6d88}\u{6682}\u{5b58}\u{6240}\u{6709}"
+        }
+        (Language::Chinese, "repo_commit_all") => "\u{63d0}\u{4ea4}\u{6240}\u{6709}...",
+        (Language::Chinese, "repo_commit_staged") => {
+            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}..."
+        }
+        (Language::Chinese, "repo_discard") => "\u{4e22}\u{5f03}...",
+        (Language::Chinese, "repo_stash_changes") => "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}...",
+        (Language::Chinese, "repo_push") => "\u{63a8}\u{9001}...",
+        (Language::Chinese, "repo_pull") => "\u{62c9}\u{53d6}...",
+        (Language::Chinese, "repo_fetch") => "\u{83b7}\u{53d6}...",
+        (Language::Chinese, "repo_checkout") => "\u{68c0}\u{51fa}...",
+        (Language::Chinese, "repo_branch") => "\u{5206}\u{652f}...",
+        (Language::Chinese, "repo_merge") => "\u{5408}\u{5e76}...",
+        (Language::Chinese, "repo_tag") => "\u{6807}\u{7b7e}...",
+        (Language::Chinese, "repo_archive") => "\u{5b58}\u{6863}...",
+        (Language::Chinese, "repo_interactive_rebase") => {
+            "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}..."
+        }
+        (Language::Chinese, "repo_add_remote") => "\u{6dfb}\u{52a0}\u{8fdc}\u{7aef}...",
+        (Language::Chinese, "repo_add_submodule") => "\u{6dfb}\u{52a0}\u{5b50}\u{6a21}\u{5757}...",
+        (Language::Chinese, "repo_add_link_subtree") => {
+            "\u{6dfb}\u{52a0}/\u{94fe}\u{63a5}\u{5b50}\u{6811}..."
+        }
+        (Language::Chinese, "repo_git_lfs") => "Git LFS",
+        (Language::Chinese, "repo_lfs_initialize") => "\u{521d}\u{59cb}\u{5316}\u{4ed3}\u{5e93}",
+        (Language::Chinese, "repo_lfs_track_untrack") => {
+            "\u{8ddf}\u{8e2a}/\u{53d6}\u{6d88}\u{8ddf}\u{8e2a}\u{6587}\u{4ef6}"
+        }
+        (Language::Chinese, "repo_lfs_pull") => "\u{62c9}\u{53d6} LFS \u{5185}\u{5bb9}",
+        (Language::Chinese, "repo_lfs_fetch") => "\u{6293}\u{53d6} LFS \u{5185}\u{5bb9}",
+        (Language::Chinese, "repo_lfs_checkout") => "\u{68c0}\u{51fa} LFS \u{5185}\u{5bb9}",
+        (Language::Chinese, "repo_lfs_prune") => "\u{4fee}\u{526a} LFS \u{5185}\u{5bb9}",
+        (Language::Chinese, "repo_git_flow") => "Git\u{5de5}\u{4f5c}\u{6d41}",
+        (Language::Chinese, "repo_git_flow_initialize") => {
+            "\u{521d}\u{59cb}\u{5316}\u{4ed3}\u{5e93}"
+        }
+        (Language::Chinese, "repo_git_flow_next_action") => "\u{4e0b}\u{4e2a}\u{64cd}\u{4f5c}...",
+        (Language::Chinese, "repo_git_flow_start_feature") => {
+            "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{529f}\u{80fd}"
+        }
+        (Language::Chinese, "repo_git_flow_finish_feature") => "\u{5b8c}\u{6210}\u{529f}\u{80fd}",
+        (Language::Chinese, "repo_git_flow_start_release") => {
+            "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{53d1}\u{5e03}\u{7248}\u{672c}"
+        }
+        (Language::Chinese, "repo_git_flow_finish_release") => {
+            "\u{5b8c}\u{6210}\u{53d1}\u{5e03}\u{7248}\u{672c}"
+        }
+        (Language::Chinese, "repo_git_flow_start_hotfix") => {
+            "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{4fee}\u{590d}\u{8865}\u{4e01}"
+        }
+        (Language::Chinese, "repo_git_flow_finish_hotfix") => {
+            "\u{5b8c}\u{6210}\u{4fee}\u{590d}\u{8865}\u{4e01}"
+        }
+        (Language::Chinese, "repo_create_pull_request") => {
+            "\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}..."
+        }
+        (Language::Chinese, "repo_benchmark_performance") => {
+            "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}"
+        }
         (Language::Chinese, "undo") => "\u{64a4}\u{9500}",
         (Language::Chinese, "redo") => "\u{91cd}\u{505a}",
         (Language::Chinese, "ssh_agent") => "\u{542f}\u{52a8}SSH\u{52a9}\u{624b}...",
@@ -10172,6 +14042,56 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "options") => "Options(O)",
         (_, "light_theme") => "Light Theme",
         (_, "dark_theme") => "Dark Theme",
+        (_, "next_tab") => "Next Tab",
+        (_, "previous_tab") => "Previous Tab",
+        (_, "view_workspace") => "Workspace",
+        (_, "view_history") => "History",
+        (_, "view_search") => "Search",
+        (_, "show_workspace_repositories") => "Show Workspace Repositories",
+        (_, "hide_workspace_repositories") => "Hide Workspace Repositories",
+        (_, "workspace_repositories") => "Workspace Repositories",
+        (_, "show_branch_labels") => "Show Branch Labels",
+        (_, "show_tag_labels") => "Show Tag Labels",
+        (_, "repo_status_unloaded") => "Status not loaded",
+        (_, "repo_settings") => "Repository Settings...",
+        (_, "repo_details") => "Repository Details...",
+        (_, "repo_refresh_remote_status") => "Refresh Remote Status",
+        (_, "repo_view_online") => "View repository online",
+        (_, "repo_stage_toggle") => "Stage/Unstage All",
+        (_, "repo_commit_all") => "Commit All...",
+        (_, "repo_commit_staged") => "Commit Staged Changes...",
+        (_, "repo_discard") => "Discard...",
+        (_, "repo_stash_changes") => "Stash Changes...",
+        (_, "repo_push") => "Push...",
+        (_, "repo_pull") => "Pull...",
+        (_, "repo_fetch") => "Fetch...",
+        (_, "repo_checkout") => "Checkout...",
+        (_, "repo_branch") => "Branch...",
+        (_, "repo_merge") => "Merge...",
+        (_, "repo_tag") => "Tag...",
+        (_, "repo_archive") => "Archive...",
+        (_, "repo_interactive_rebase") => "Interactive Rebase...",
+        (_, "repo_add_remote") => "Add Remote...",
+        (_, "repo_add_submodule") => "Add Submodule...",
+        (_, "repo_add_link_subtree") => "Add/Link Subtree...",
+        (_, "repo_git_lfs") => "Git LFS",
+        (_, "repo_lfs_initialize") => "Initialize Repository",
+        (_, "repo_lfs_track_untrack") => "Track/Untrack Files",
+        (_, "repo_lfs_pull") => "Pull LFS Content",
+        (_, "repo_lfs_fetch") => "Fetch LFS Content",
+        (_, "repo_lfs_checkout") => "Checkout LFS Content",
+        (_, "repo_lfs_prune") => "Prune LFS Content",
+        (_, "repo_git_flow") => "Git Workflow",
+        (_, "repo_git_flow_initialize") => "Initialize Repository",
+        (_, "repo_git_flow_next_action") => "Next Action...",
+        (_, "repo_git_flow_start_feature") => "Start New Feature",
+        (_, "repo_git_flow_finish_feature") => "Finish Feature",
+        (_, "repo_git_flow_start_release") => "Start New Release",
+        (_, "repo_git_flow_finish_release") => "Finish Release",
+        (_, "repo_git_flow_start_hotfix") => "Start New Hotfix",
+        (_, "repo_git_flow_finish_hotfix") => "Finish Hotfix",
+        (_, "repo_create_pull_request") => "Create Pull Request...",
+        (_, "repo_benchmark_performance") => "Benchmark Repo Performance",
         (_, "undo") => "Undo",
         (_, "redo") => "Redo",
         (_, "ssh_agent") => "Start SSH Agent...",
@@ -10319,13 +14239,6 @@ fn source_tree_panel_frame() -> egui::Frame {
         .fill(theme::bg())
         .shadow(panel_shadow())
         .inner_margin(egui::Margin::symmetric(8, 8))
-}
-
-fn diff_panel_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(theme::panel_recessed())
-        .corner_radius(CornerRadius::same(WORKSPACE_CARD_RADIUS))
-        .inner_margin(egui::Margin::same(0))
 }
 
 fn worktree_diff_panel_frame() -> egui::Frame {
@@ -10820,6 +14733,14 @@ fn history_column_widths(width: f32, graph_width: f32, prefs: &LayoutPrefs) -> H
     }
 }
 
+fn history_batch_selected_row_fill() -> Color32 {
+    theme::accent_soft()
+}
+
+fn history_batch_selected_text_color() -> Color32 {
+    theme::accent_deep()
+}
+
 fn history_table_header(
     ui: &mut Ui,
     language: Language,
@@ -10984,6 +14905,258 @@ fn adjust_history_column_widths(
     prefs.clamp();
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HistoryCommitBrowserConfig {
+    id_salt: &'static str,
+    show_view_controls: bool,
+    show_search: bool,
+    show_cherry_pick: bool,
+    show_jump: bool,
+    show_context_menu: bool,
+    select_rows: bool,
+    max_height: Option<f32>,
+}
+
+impl Default for HistoryCommitBrowserConfig {
+    fn default() -> Self {
+        Self {
+            id_salt: "history_commit_browser",
+            show_view_controls: true,
+            show_search: true,
+            show_cherry_pick: true,
+            show_jump: true,
+            show_context_menu: true,
+            select_rows: false,
+            max_height: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistoryCommitBrowserOutcome {
+    picked_commit: Option<Commit>,
+    hash_copied: bool,
+    toggled_cherry_pick_hash: Option<String>,
+    context_menu_action: Option<CommitMenuAction>,
+    search_changed: bool,
+    prefs_changed: bool,
+}
+
+fn history_commit_browser(
+    ui: &mut Ui,
+    commits: &[Commit],
+    selected_hash: &str,
+    branch_scope: &mut HistoryBranchScope,
+    sort_order: &mut HistorySortOrder,
+    search: &mut String,
+    show_remote_refs: &mut bool,
+    show_branch_refs: bool,
+    show_tag_refs: bool,
+    prefs: &mut LayoutPrefs,
+    language: Language,
+    selected_cherry_pick_hashes: &HashSet<String>,
+    disabled_hashes: &HashSet<String>,
+    cache: &mut HistoryCommitBrowserCache,
+    config: HistoryCommitBrowserConfig,
+) -> HistoryCommitBrowserOutcome {
+    let mut outcome = HistoryCommitBrowserOutcome::default();
+
+    let (toolbar_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+    let control_top = toolbar_rect.top() + 2.0;
+    let control_height = 24.0;
+    let mut control_left = toolbar_rect.left();
+
+    if config.show_view_controls {
+        let branch_rect = Rect::from_min_size(
+            Pos2::new(control_left, control_top),
+            Vec2::new(102.0, control_height),
+        );
+        if let Some(scope) = history_branch_scope_dropdown(ui, branch_rect, language, *branch_scope)
+        {
+            *branch_scope = scope;
+        }
+        control_left = branch_rect.right() + 8.0;
+
+        let remote_label = if language == Language::Chinese {
+            "\u{663e}\u{793a}\u{8fdc}\u{7aef}\u{5206}\u{652f}"
+        } else {
+            "Show remote branches"
+        };
+        let remote_rect = Rect::from_min_size(
+            Pos2::new(control_left, control_top),
+            Vec2::new(134.0, control_height),
+        );
+        if history_toolbar_checkbox_at(ui, remote_rect, show_remote_refs, remote_label).changed() {
+            ui.ctx().request_repaint();
+        }
+        control_left = remote_rect.right() + 8.0;
+
+        let sort_rect = Rect::from_min_size(
+            Pos2::new(control_left, control_top),
+            Vec2::new(112.0, control_height),
+        );
+        if let Some(order) = history_sort_order_dropdown(ui, sort_rect, language, *sort_order) {
+            *sort_order = order;
+        }
+        control_left = sort_rect.right() + 8.0;
+    }
+
+    if config.show_cherry_pick {
+        let cherry_pick_label = i18n::t(language, "commit.cherry_pick_batch");
+        let cherry_rect = Rect::from_min_size(
+            Pos2::new(control_left, control_top),
+            Vec2::new(30.0, control_height),
+        );
+        let _ =
+            history_toolbar_icon_button_at(ui, cherry_rect, UiIcon::CherryPick, cherry_pick_label);
+        control_left = cherry_rect.right() + 8.0;
+    }
+
+    if config.show_jump {
+        let jump_rect = Rect::from_min_size(
+            Pos2::new(control_left, control_top),
+            Vec2::new(68.0, control_height),
+        );
+        history_toolbar_label_at(
+            ui,
+            jump_rect,
+            if language == Language::Chinese {
+                "\u{8df3}\u{8f6c}\u{5230}:"
+            } else {
+                "Jump to:"
+            },
+        );
+        control_left = jump_rect.right() + 8.0;
+    }
+
+    if config.show_search {
+        let search_hint = if language == Language::Chinese {
+            "\u{641c}\u{7d22}"
+        } else {
+            "Author Name"
+        };
+        let search_width = 260.0_f32.min((toolbar_rect.right() - control_left - 8.0).max(120.0));
+        let search_rect = Rect::from_min_size(
+            Pos2::new(toolbar_rect.right() - search_width, control_top),
+            Vec2::new(search_width, control_height),
+        );
+        let response = ui.put(
+            search_rect,
+            TextEdit::singleline(search).hint_text(search_hint),
+        );
+        if response.changed() {
+            outcome.search_changed = true;
+        }
+    }
+
+    ui.add_space(4.0);
+
+    if commits.is_empty() {
+        ui.label(RichText::new(i18n::t(language, "commit.no_commits")).color(theme::muted()));
+        return outcome;
+    }
+
+    cache.refresh(commits, search);
+    let layout = &cache.layout;
+    let lane_count = layout.lanes.max(1);
+    let graph_width = history_graph_width(ui.available_width(), lane_count, prefs);
+    let visible_indexes = &cache.visible_indexes;
+    if history_table_header(ui, language, graph_width, prefs, config.select_rows) {
+        outcome.prefs_changed = true;
+    }
+
+    if visible_indexes.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label(RichText::new(i18n::t(language, "commit.no_matches")).color(theme::muted()));
+        });
+        return outcome;
+    }
+
+    let body_height = config
+        .max_height
+        .unwrap_or_else(|| ui.available_height())
+        .max(0.0);
+    ScrollArea::vertical()
+        .id_salt((
+            config.id_salt,
+            *branch_scope,
+            *sort_order,
+            search.as_str(),
+            visible_indexes.len(),
+        ))
+        .max_height(body_height)
+        .min_scrolled_height(body_height)
+        .auto_shrink([false, false])
+        .show_rows(
+            ui,
+            HISTORY_TABLE_ROW_HEIGHT,
+            visible_indexes.len(),
+            |ui, row_range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for row_index in row_range.clone() {
+                    let Some(index) = visible_indexes.get(row_index).copied() else {
+                        continue;
+                    };
+                    let Some(commit) = commits.get(index) else {
+                        continue;
+                    };
+                    let selected = selected_hash == commit.hash;
+                    let row = layout.rows.get(index);
+                    let cherry_pick_selected = selected_cherry_pick_hashes.contains(&commit.hash);
+                    let disabled = disabled_hashes.contains(&commit.hash);
+                    let (response, copied_hash, select_for_cherry_pick) = history_commit_table_row(
+                        ui,
+                        commit,
+                        row,
+                        graph_width,
+                        lane_count,
+                        prefs,
+                        language,
+                        selected,
+                        *show_remote_refs,
+                        show_branch_refs,
+                        show_tag_refs,
+                        config.select_rows,
+                        cherry_pick_selected,
+                        disabled,
+                    );
+                    outcome.hash_copied |= copied_hash;
+                    if select_for_cherry_pick {
+                        outcome.toggled_cherry_pick_hash = Some(commit.hash.clone());
+                    } else if !disabled && response.clicked() {
+                        outcome.picked_commit = Some(commit.clone());
+                    }
+                    if config.show_context_menu {
+                        response.context_menu(|ui| {
+                            outcome.context_menu_action = commit_context_menu(ui, commit, language);
+                        });
+                    }
+                }
+            },
+        );
+
+    outcome
+}
+
+fn history_browser_visible_indexes_for_query(commits: &[Commit], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..commits.len()).collect();
+    }
+
+    commits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, commit)| {
+            (commit.subject.to_lowercase().contains(query)
+                || commit.author.to_lowercase().contains(query)
+                || commit.hash.starts_with(query)
+                || commit.short_hash.starts_with(query))
+            .then_some(index)
+        })
+        .collect()
+}
+
 fn history_commit_table_row(
     ui: &mut Ui,
     commit: &Commit,
@@ -10994,21 +15167,33 @@ fn history_commit_table_row(
     language: Language,
     selected: bool,
     show_remote_refs: bool,
+    show_branch_refs: bool,
+    show_tag_refs: bool,
     select_for_cherry_pick: bool,
     cherry_pick_selected: bool,
+    disabled: bool,
 ) -> (egui::Response, bool, bool) {
-    let response = pointing_hand_cursor(ui.allocate_response(
+    let response = ui.allocate_response(
         Vec2::new(ui.available_width(), HISTORY_TABLE_ROW_HEIGHT),
-        Sense::click(),
-    ));
+        if disabled {
+            Sense::hover()
+        } else {
+            Sense::click()
+        },
+    );
+    let response = if disabled {
+        response
+    } else {
+        pointing_hand_cursor(response)
+    };
     let rect = response.rect;
     let selection_width = if select_for_cherry_pick { 30.0 } else { 0.0 };
     let painter = ui.painter();
-    let row_bg = if selected {
+    let row_bg = if selected && !disabled {
         Color32::from_rgb(42, 137, 232)
-    } else if cherry_pick_selected {
-        Color32::from_rgb(32, 56, 38)
-    } else if response.hovered() {
+    } else if cherry_pick_selected && !disabled {
+        history_batch_selected_row_fill()
+    } else if response.hovered() && !disabled {
         theme::accent_soft()
     } else {
         Color32::TRANSPARENT
@@ -11022,7 +15207,7 @@ fn history_commit_table_row(
     );
 
     let mut cherry_pick_clicked = false;
-    if select_for_cherry_pick {
+    if select_for_cherry_pick && !disabled {
         let checkbox_rect = Rect::from_center_size(
             Pos2::new(rect.left() + selection_width / 2.0, rect.center().y),
             Vec2::splat(16.0),
@@ -11040,12 +15225,20 @@ fn history_commit_table_row(
     let width = rect.width() - selection_width;
     let cols = history_column_widths(width, graph_width, prefs);
     let mut x = rect.left() + selection_width + graph_width;
-    let text_color = if selected {
+    let text_color = if cherry_pick_selected && !selected && !disabled {
+        history_batch_selected_text_color()
+    } else if disabled {
+        theme::muted()
+    } else if selected {
         Color32::WHITE
     } else {
         theme::text()
     };
-    let muted_color = if selected {
+    let muted_color = if cherry_pick_selected && !selected && !disabled {
+        history_batch_selected_text_color()
+    } else if disabled {
+        theme::muted()
+    } else if selected {
         Color32::from_rgb(232, 245, 255)
     } else {
         theme::muted()
@@ -11055,7 +15248,18 @@ fn history_commit_table_row(
         Pos2::new(x + 4.0, rect.top()),
         Vec2::new(cols.desc - 8.0, rect.height()),
     );
-    draw_history_description(ui, desc_rect, commit, selected, show_remote_refs);
+    draw_history_description(
+        ui,
+        desc_rect,
+        commit,
+        row,
+        selected,
+        show_remote_refs,
+        show_branch_refs,
+        show_tag_refs,
+        disabled,
+        cherry_pick_selected,
+    );
     x += cols.desc;
     draw_clipped_cell(
         ui,
@@ -11187,43 +15391,62 @@ fn draw_history_description(
     ui: &mut Ui,
     rect: Rect,
     commit: &Commit,
+    row: Option<&graph::GraphRow>,
     selected: bool,
     show_remote_refs: bool,
+    show_branch_refs: bool,
+    show_tag_refs: bool,
+    disabled: bool,
+    batch_selected: bool,
 ) {
     let painter = ui.painter().with_clip_rect(rect);
     let mut x = rect.left();
-    let refs = commit_refs_for_display(commit, show_remote_refs);
+    let refs = commit_refs_for_display(commit, show_remote_refs, show_branch_refs, show_tag_refs);
     let badge_font = FontId::monospace(11.0);
-    let badge_text_color = Color32::from_rgb(26, 65, 112);
-    for name in refs.iter().take(3) {
+    for ref_label in refs.iter().take(3) {
+        let badge_text_color = history_ref_badge_text_color(ref_label, row, selected);
+        let icon_extra = if ref_label.kind == HistoryRefKind::Tag {
+            12.0
+        } else {
+            0.0
+        };
         let label = history_ref_badge_label_for_width(
             ui,
-            name,
+            &ref_label.name,
             badge_font.clone(),
             badge_text_color,
-            HISTORY_REF_BADGE_MAX_WIDTH - HISTORY_REF_BADGE_X_PADDING * 2.0,
+            HISTORY_REF_BADGE_MAX_WIDTH - HISTORY_REF_BADGE_X_PADDING * 2.0 - icon_extra,
         );
         let galley = ui
             .painter()
             .layout_no_wrap(label, badge_font.clone(), badge_text_color);
-        let width = (galley.size().x + HISTORY_REF_BADGE_X_PADDING * 2.0)
+        let width = (galley.size().x + HISTORY_REF_BADGE_X_PADDING * 2.0 + icon_extra)
             .clamp(HISTORY_REF_BADGE_MIN_WIDTH, HISTORY_REF_BADGE_MAX_WIDTH);
         if x + width + HISTORY_REF_BADGE_GAP > rect.right() {
             break;
         }
         let badge_rect =
             Rect::from_min_size(Pos2::new(x, rect.center().y - 8.5), Vec2::new(width, 17.0));
-        let fill = if selected {
-            Color32::from_rgb(232, 245, 255)
-        } else if name.starts_with("tag:") {
-            Color32::from_rgb(246, 226, 160)
-        } else if name.starts_with("origin/") {
-            Color32::from_rgb(214, 232, 255)
-        } else {
-            Color32::from_rgb(218, 236, 255)
-        };
+        let fill = history_ref_badge_fill(ref_label, row, selected);
         painter.rect_filled(badge_rect, CornerRadius::same(3), fill);
-        let text_rect = badge_rect.shrink2(Vec2::new(HISTORY_REF_BADGE_X_PADDING, 0.0));
+        if ref_label.kind == HistoryRefKind::Tag {
+            let icon_rect = Rect::from_center_size(
+                Pos2::new(
+                    badge_rect.left() + HISTORY_REF_BADGE_X_PADDING + 4.0,
+                    badge_rect.center().y,
+                ),
+                Vec2::splat(10.0),
+            );
+            paint_ui_icon(ui, icon_rect, UiIcon::Tag, badge_text_color);
+        }
+        let text_left_padding = HISTORY_REF_BADGE_X_PADDING + icon_extra;
+        let text_rect = Rect::from_min_max(
+            Pos2::new(badge_rect.left() + text_left_padding, badge_rect.top()),
+            Pos2::new(
+                badge_rect.right() - HISTORY_REF_BADGE_X_PADDING,
+                badge_rect.bottom(),
+            ),
+        );
         let text_pos = Pos2::new(
             text_rect.left(),
             text_rect.center().y - galley.size().y / 2.0,
@@ -11241,12 +15464,63 @@ fn draw_history_description(
         Align2::LEFT_CENTER,
         &commit.subject,
         FontId::proportional(12.5),
-        if selected {
+        if batch_selected && !selected && !disabled {
+            history_batch_selected_text_color()
+        } else if disabled {
+            theme::muted()
+        } else if selected {
             Color32::WHITE
         } else {
             theme::text()
         },
     );
+}
+
+fn history_ref_badge_fill(
+    label: &HistoryRefLabel,
+    row: Option<&graph::GraphRow>,
+    selected: bool,
+) -> Color32 {
+    if selected {
+        return Color32::from_rgb(232, 245, 255);
+    }
+    match label.kind {
+        HistoryRefKind::Tag => Color32::from_rgb(246, 226, 160),
+        HistoryRefKind::Branch => {
+            let lane = history_ref_lane_color(&label.name, row);
+            Color32::from_rgba_unmultiplied(lane.r(), lane.g(), lane.b(), 64)
+        }
+    }
+}
+
+fn history_ref_badge_text_color(
+    label: &HistoryRefLabel,
+    row: Option<&graph::GraphRow>,
+    selected: bool,
+) -> Color32 {
+    if selected {
+        return Color32::from_rgb(26, 65, 112);
+    }
+    match label.kind {
+        HistoryRefKind::Tag => Color32::from_rgb(112, 77, 8),
+        HistoryRefKind::Branch => {
+            let lane = history_ref_lane_color(&label.name, row);
+            Color32::from_rgb(
+                (lane.r() as f32 * 0.72) as u8,
+                (lane.g() as f32 * 0.72) as u8,
+                (lane.b() as f32 * 0.72) as u8,
+            )
+        }
+    }
+}
+
+fn history_ref_lane_color(name: &str, row: Option<&graph::GraphRow>) -> Color32 {
+    let lane = row.map(|row| row.lane).unwrap_or_else(|| {
+        name.bytes().fold(0usize, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(byte as usize)
+        })
+    });
+    theme::LANES[lane % theme::LANES.len()]
 }
 
 fn history_ref_badge_label_for_width(
@@ -11272,22 +15546,36 @@ fn history_ref_badge_label_for_width(
     }
 }
 
-fn commit_refs_for_display(commit: &Commit, show_remote_refs: bool) -> Vec<String> {
+fn commit_refs_for_display(
+    commit: &Commit,
+    show_remote_refs: bool,
+    show_branch_refs: bool,
+    show_tag_refs: bool,
+) -> Vec<HistoryRefLabel> {
     commit
         .refs
         .iter()
         .filter_map(|raw| {
-            let name = raw
-                .trim()
-                .strip_prefix("HEAD -> ")
-                .unwrap_or(raw.trim())
-                .strip_prefix("tag: ")
-                .unwrap_or_else(|| raw.trim().strip_prefix("HEAD -> ").unwrap_or(raw.trim()))
-                .to_owned();
+            let trimmed = raw.trim();
+            let without_head = trimmed.strip_prefix("HEAD -> ").unwrap_or(trimmed).trim();
+            let (kind, name) = if let Some(tag) = without_head.strip_prefix("tag: ") {
+                (HistoryRefKind::Tag, tag.trim())
+            } else {
+                (HistoryRefKind::Branch, without_head)
+            };
+            if kind == HistoryRefKind::Branch && !show_branch_refs {
+                return None;
+            }
+            if kind == HistoryRefKind::Tag && !show_tag_refs {
+                return None;
+            }
             if !show_remote_refs && (name.starts_with("origin/") || name.contains("/origin/")) {
                 return None;
             }
-            (!name.is_empty()).then_some(name)
+            (!name.is_empty()).then_some(HistoryRefLabel {
+                name: name.to_owned(),
+                kind,
+            })
         })
         .collect()
 }
@@ -11662,36 +15950,7 @@ fn history_cherry_pick_checkbox_at(ui: &mut Ui, rect: Rect, checked: bool) -> eg
             Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let stroke = Stroke::new(
-        1.2,
-        if checked {
-            theme::accent()
-        } else {
-            theme::muted()
-        },
-    );
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(3),
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-    if checked {
-        ui.painter().line_segment(
-            [
-                Pos2::new(rect.left() + 3.5, rect.center().y),
-                Pos2::new(rect.center().x - 1.0, rect.bottom() - 4.0),
-            ],
-            Stroke::new(1.7, theme::accent()),
-        );
-        ui.painter().line_segment(
-            [
-                Pos2::new(rect.center().x - 1.0, rect.bottom() - 4.0),
-                Pos2::new(rect.right() - 3.0, rect.top() + 4.0),
-            ],
-            Stroke::new(1.7, theme::accent()),
-        );
-    }
+    paint_action_checkbox_square(ui, rect, checked, true, &response);
     response
 }
 
@@ -11886,25 +16145,21 @@ fn sidebar_nav_card(
     label: &str,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
-    let fill = if selected {
-        theme::accent_deep()
-    } else if response.hovered() {
-        theme::panel()
-    } else {
-        theme::panel_soft()
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let visuals = tab_visual_state(
+        TabVisualMode::Detached,
+        selected,
+        response.hovered(),
+        theme::panel(),
+    );
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(6), visuals.fill);
     let icon_rect = Rect::from_center_size(
         Pos2::new(rect.center().x, rect.top() + 18.0),
         Vec2::splat(18.0),
     );
     egui::Image::new(icon_source(icon))
         .fit_to_exact_size(icon_rect.size())
-        .tint(if selected {
-            Color32::WHITE
-        } else {
-            theme::accent()
-        })
+        .tint(visuals.icon)
         .paint_at(ui, icon_rect);
 
     let text_rect = Rect::from_min_max(
@@ -11918,11 +16173,7 @@ fn sidebar_nav_card(
             Align2::CENTER_TOP,
             label,
             FontId::proportional(11.0),
-            if selected {
-                Color32::WHITE
-            } else {
-                theme::text()
-            },
+            visuals.text,
         );
 
     pointing_hand_cursor(response).on_hover_text(label)
@@ -11933,19 +16184,26 @@ enum RepoTabShadowSide {
     Top,
     Left,
     Right,
+    Bottom,
 }
 
-fn paint_repo_tab_shadow(ui: &mut Ui, rect: Rect, selected: bool) {
+fn paint_connected_tab_shadow_for_state(ui: &mut Ui, rect: Rect, visuals: TabVisualState) {
+    if visuals.shadow {
+        paint_repo_tab_shadow(ui, rect, visuals.bottom_shadow);
+    }
+}
+
+fn paint_repo_tab_shadow(ui: &mut Ui, rect: Rect, include_bottom: bool) {
     let shadow = egui::epaint::Shadow {
         offset: [2, 3],
         blur: 6,
         spread: 0,
         color: theme::accent_shadow(),
     };
-    let base_alpha = if selected {
-        shadow.color.a().max(42)
-    } else {
+    let base_alpha = if include_bottom {
         shadow.color.a().saturating_sub(16).max(24)
+    } else {
+        shadow.color.a().max(42)
     };
 
     for layer in 0..3 {
@@ -11974,6 +16232,16 @@ fn paint_repo_tab_shadow(ui: &mut Ui, rect: Rect, selected: bool) {
             0.58,
             repo_tab_shadow_color(shadow.color, base_alpha, layer),
         );
+        if include_bottom {
+            paint_repo_tab_shadow_side(
+                ui,
+                rect,
+                RepoTabShadowSide::Bottom,
+                layer,
+                0.42,
+                repo_tab_shadow_color(shadow.color, base_alpha, layer),
+            );
+        }
     }
 }
 
@@ -12032,6 +16300,10 @@ fn repo_tab_shadow_rect(rect: Rect, side: RepoTabShadowSide, layer: usize) -> Re
             Pos2::new(rect.right(), rect.top() + 2.0),
             Pos2::new(rect.right() + shadow_spread, rect.bottom() - 0.6),
         ),
+        RepoTabShadowSide::Bottom => Rect::from_min_max(
+            Pos2::new(rect.left() + 1.0, rect.bottom() - shadow_spread),
+            Pos2::new(rect.right() - 1.0, rect.bottom()),
+        ),
     }
 }
 
@@ -12059,9 +16331,15 @@ fn repo_tab_with_close(
     let close_hovered = repo_tab_close_hovered(ui, close_rect);
     let tab_hovered = response.hovered() || close_hovered;
     let show_close = selected || tab_hovered;
+    let visuals = tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        tab_hovered,
+        connected_tab_content_fill(),
+    );
     let fill = repo_tab_fill(selected, tab_hovered);
-    let text_color = repo_tab_text_color(selected);
-    let icon_color = repo_tab_icon_color(selected);
+    let text_color = repo_tab_text_color(selected, tab_hovered);
+    let icon_color = repo_tab_icon_color(selected, tab_hovered);
     let icon_rect = Rect::from_center_size(
         Pos2::new(rect.left() + 17.0, rect.center().y),
         Vec2::splat(14.0),
@@ -12071,7 +16349,7 @@ fn repo_tab_with_close(
         Pos2::new(close_rect.left() - 2.0, rect.bottom()),
     );
 
-    paint_repo_tab_shadow(ui, rect, selected);
+    paint_connected_tab_shadow_for_state(ui, rect, visuals);
     ui.painter().rect_filled(rect, top_corners(3), fill);
     egui::Image::new(icon_source(icon))
         .fit_to_exact_size(icon_rect.size())
@@ -12098,16 +16376,15 @@ fn repo_tab_with_close(
             .on_hover_text(close_label);
         close_clicked = close_response.clicked();
         let close_hovering = close_response.hovered();
-        let close_color = if close_hovering {
-            theme::text()
-        } else if selected {
-            theme::muted()
-        } else {
-            Color32::WHITE
-        };
+        let close_color = repo_tab_close_color(selected, tab_hovered, close_hovering);
         if close_hovering {
+            let close_fill = if !selected && tab_hovered {
+                Color32::from_white_alpha(36)
+            } else {
+                theme::panel_soft()
+            };
             ui.painter()
-                .rect_filled(close_rect, CornerRadius::same(3), theme::panel_soft());
+                .rect_filled(close_rect, CornerRadius::same(3), close_fill);
         }
         ui.painter().text(
             close_rect.center(),
@@ -12200,7 +16477,47 @@ fn repo_tab_close_hovered(ui: &Ui, close_rect: Rect) -> bool {
 }
 
 fn source_tab_button(ui: &mut Ui, selected: bool, icon: UiIcon, label: &str) -> egui::Response {
+    AppButton::detached_tab(icon, label, selected).show(ui)
+}
+
+fn workspace_repository_tab_button(
+    ui: &mut Ui,
+    selected: bool,
+    icon: UiIcon,
+    label: &str,
+) -> egui::Response {
     AppButton::repo_tab(icon, label, selected).show(ui)
+}
+
+fn repository_workspace_tab_strip(ui: &mut Ui, workspaces: &[PathBuf], current: &mut usize) {
+    if workspaces.is_empty() {
+        return;
+    }
+    if *current >= workspaces.len() {
+        *current = workspaces.len() - 1;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(16.0);
+        for (index, workspace) in workspaces.iter().enumerate() {
+            let label = repository_workspace_tab_label(workspace);
+            let response =
+                workspace_repository_tab_button(ui, *current == index, UiIcon::Workspace, &label)
+                    .on_hover_text(user_facing_path_string(workspace));
+            if response.clicked() {
+                *current = index;
+            }
+        }
+    });
+}
+
+fn repository_workspace_tab_label(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| user_facing_path_string(workspace))
 }
 
 fn known_repository_row(ui: &mut Ui, repository: &KnownRepository) -> egui::Response {
@@ -12236,12 +16553,385 @@ fn known_repository_row(ui: &mut Ui, repository: &KnownRepository) -> egui::Resp
     ui.painter().text(
         Pos2::new(rect.left() + 46.0, rect.top() + 32.0),
         Align2::LEFT_CENTER,
-        repository.root.display().to_string(),
+        user_facing_path_string(&repository.root),
         FontId::proportional(11.0),
         theme::muted(),
     );
 
     response
+}
+
+fn workspace_repository_status_row(
+    ui: &mut Ui,
+    rect: Rect,
+    repository: &KnownRepository,
+    snapshot: Option<&RepositorySnapshot>,
+    language: Language,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id()
+            .with(("workspace_repository_status_row", &repository.root)),
+        Sense::click(),
+    );
+    let body_rect = workspace_repository_row_body_rect(rect);
+    let fill = if response.hovered() {
+        theme::accent_soft()
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(
+            workspace_repository_row_hover_rect(rect),
+            CornerRadius::same(5),
+            fill,
+        );
+    }
+
+    draw_ui_icon(
+        ui,
+        Rect::from_center_size(
+            Pos2::new(body_rect.left() + 18.0, body_rect.top() + 16.0),
+            Vec2::splat(18.0),
+        ),
+        UiIcon::Folder,
+        theme::accent(),
+    );
+    let text_left = body_rect.left() + 42.0;
+    let text_right = body_rect.right() - 8.0;
+    let top_line_top = body_rect.top() + 3.0;
+    let top_line_bottom = body_rect.top() + 21.0;
+    let branch_line_top = body_rect.top() + 25.0;
+    let branch_line_bottom = body_rect.top() + 43.0;
+    let path_left = workspace_repository_path_left(text_left, text_right);
+    let name_rect = Rect::from_min_max(
+        Pos2::new(text_left, top_line_top),
+        Pos2::new((path_left - 10.0).max(text_left), top_line_bottom),
+    );
+    let path_rect = Rect::from_min_max(
+        Pos2::new(path_left, top_line_top),
+        Pos2::new(text_right, top_line_bottom),
+    );
+    let branch_rect = Rect::from_min_max(
+        Pos2::new(text_left, branch_line_top),
+        Pos2::new(text_right, branch_line_bottom),
+    );
+    paint_workspace_repository_row_debug_guides(
+        ui,
+        rect,
+        body_rect,
+        name_rect,
+        branch_rect,
+        path_rect,
+    );
+
+    if let Some(snapshot) = snapshot {
+        workspace_repository_unstaged_badge_line(
+            ui,
+            name_rect,
+            &repository.name,
+            snapshot.unstaged.len(),
+        );
+        workspace_repository_branch_sync_line(
+            ui,
+            branch_rect,
+            &snapshot.branch,
+            upstream_sync_counts(Some(snapshot)),
+        );
+    } else {
+        workspace_repository_path_text_line(
+            ui,
+            name_rect,
+            &repository.name,
+            FontId::proportional(13.5),
+            theme::text(),
+        );
+        workspace_repository_text_line(
+            ui,
+            branch_rect,
+            menu_label(language, "repo_status_unloaded"),
+            FontId::monospace(11.0),
+            theme::muted(),
+        );
+    }
+    workspace_repository_path_text_line(
+        ui,
+        path_rect,
+        &user_facing_path_string(&repository.root),
+        FontId::proportional(10.5),
+        theme::muted(),
+    );
+
+    pointing_hand_cursor(response)
+}
+
+fn workspace_repository_unstaged_color() -> Color32 {
+    Color32::from_rgb(213, 139, 28)
+}
+
+fn workspace_repository_path_left(text_left: f32, text_right: f32) -> f32 {
+    let top_line_width = (text_right - text_left).max(0.0);
+    let desired_path_width = (top_line_width * 0.46).clamp(176.0, 250.0);
+    (text_right - desired_path_width)
+        .max(text_left + 180.0)
+        .min(text_right)
+}
+
+fn workspace_repository_unstaged_badge_text(count: usize) -> Option<String> {
+    (count > 0).then(|| count.to_string())
+}
+
+fn workspace_repository_unstaged_badge_width(ui: &Ui, count: usize) -> f32 {
+    let Some(text) = workspace_repository_unstaged_badge_text(count) else {
+        return 0.0;
+    };
+    let font = FontId::monospace(11.0);
+    let icon_size = 9.0;
+    let icon_gap = 3.0;
+    icon_size + icon_gap + text_width(ui, &text, font, workspace_repository_unstaged_color())
+}
+
+fn workspace_repository_unstaged_badge_line(ui: &Ui, rect: Rect, name: &str, count: usize) {
+    let name_font = FontId::proportional(13.5);
+    let name_color = theme::text();
+    let badge_gap = 5.0;
+    let badge_text = workspace_repository_unstaged_badge_text(count);
+    let badge_width = workspace_repository_unstaged_badge_width(ui, count);
+    let badge_reserve = if badge_text.is_some() {
+        badge_width + badge_gap
+    } else {
+        0.0
+    };
+    let name_max_width = (rect.width() - badge_reserve).max(0.0);
+    let name_text = elide_end_to_width(ui, name, name_max_width, name_font.clone(), name_color);
+    let name_width = text_width(ui, &name_text, name_font.clone(), name_color);
+    let name_rect =
+        Rect::from_min_max(rect.min, Pos2::new(rect.left() + name_width, rect.bottom()));
+    workspace_repository_text_line(ui, name_rect, &name_text, name_font, name_color);
+
+    if let Some(badge_text) = badge_text {
+        let badge_left = (name_rect.right() + badge_gap).min(rect.right());
+        let badge_rect = Rect::from_min_max(
+            Pos2::new(badge_left, rect.top()),
+            Pos2::new(rect.right(), rect.bottom()),
+        );
+        workspace_repository_unstaged_badge(ui, badge_rect, &badge_text);
+    }
+}
+
+fn workspace_repository_unstaged_badge(ui: &Ui, rect: Rect, text: &str) {
+    let font = FontId::monospace(11.0);
+    let color = workspace_repository_unstaged_color();
+    let icon_size = 9.0;
+    let icon_gap = 3.0;
+    let icon_center_x = rect.left() + icon_size * 0.5;
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(icon_center_x, rect.center().y),
+        Vec2::splat(icon_size),
+    );
+    paint_ui_icon(ui, icon_rect, UiIcon::UnstagedFile, color);
+
+    let tail_rect = Rect::from_min_max(
+        Pos2::new(icon_rect.right() + icon_gap, rect.top()),
+        rect.right_bottom(),
+    );
+    workspace_repository_text_line(ui, tail_rect, text, font, color);
+}
+
+fn workspace_repository_branch_badges(counts: UpstreamSyncCounts) -> String {
+    let mut badges = Vec::new();
+    if let Some(pull) = upstream_pull_badge(Some(counts)) {
+        badges.push(pull);
+    }
+    if let Some(push) = upstream_push_badge(Some(counts)) {
+        badges.push(push);
+    }
+    badges.join("  ")
+}
+
+fn workspace_repository_branch_sync_line(
+    ui: &Ui,
+    rect: Rect,
+    branch: &str,
+    counts: UpstreamSyncCounts,
+) {
+    let font = FontId::monospace(11.0);
+    let color = theme::muted();
+    let badge_gap = 6.0;
+    let badges = workspace_repository_branch_badges(counts);
+    let badges_width = text_width(ui, &badges, font.clone(), color);
+    let badge_reserve = if badges.is_empty() {
+        0.0
+    } else {
+        badges_width + badge_gap
+    };
+    let branch_max_width = (rect.width() - badge_reserve).max(0.0);
+    let branch_text = elide_end_to_width(ui, branch, branch_max_width, font.clone(), color);
+    let branch_width = text_width(ui, &branch_text, font.clone(), color);
+    let branch_rect = Rect::from_min_max(
+        rect.min,
+        Pos2::new(rect.left() + branch_width, rect.bottom()),
+    );
+    workspace_repository_text_line(ui, branch_rect, &branch_text, font.clone(), color);
+
+    if !badges.is_empty() {
+        let badges_left = (branch_rect.right() + badge_gap).min(rect.right());
+        let badges_rect = Rect::from_min_max(
+            Pos2::new(badges_left, rect.top()),
+            Pos2::new(rect.right(), rect.bottom()),
+        );
+        workspace_repository_text_line(ui, badges_rect, &badges, font, color);
+    }
+}
+
+fn text_width(ui: &Ui, text: &str, font: FontId, color: Color32) -> f32 {
+    ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font, color)
+            .rect
+            .width()
+    })
+}
+
+fn workspace_repository_row_body_rect(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            rect.left() + 1.0,
+            rect.top() + WORKSPACE_REPOSITORY_ROW_VERTICAL_INSET,
+        ),
+        Vec2::new(
+            (rect.width() - 2.0).max(0.0),
+            WORKSPACE_REPOSITORY_ROW_BODY_HEIGHT,
+        ),
+    )
+}
+
+fn workspace_repository_row_hover_rect(rect: Rect) -> Rect {
+    workspace_repository_row_body_rect(rect)
+}
+
+fn paint_workspace_repository_row_debug_guides(
+    ui: &Ui,
+    row_rect: Rect,
+    body_rect: Rect,
+    name_rect: Rect,
+    meta_rect: Rect,
+    path_rect: Rect,
+) {
+    if !layout_debug_enabled() {
+        return;
+    }
+    workspace_repository_debug_line(
+        ui,
+        row_rect.left(),
+        row_rect.right(),
+        row_rect.top(),
+        format!(
+            "repo.row.top {:.0}/{:.0}",
+            row_rect.height(),
+            WORKSPACE_REPOSITORY_ROW_HEIGHT
+        ),
+        Color32::from_rgb(255, 40, 40),
+    );
+    workspace_repository_debug_line(
+        ui,
+        row_rect.left(),
+        row_rect.right(),
+        row_rect.bottom(),
+        "repo.row.bottom",
+        Color32::from_rgb(255, 40, 40),
+    );
+    workspace_repository_debug_line(
+        ui,
+        body_rect.left(),
+        body_rect.right(),
+        body_rect.top(),
+        "repo.body.top",
+        Color32::from_rgb(40, 220, 80),
+    );
+    workspace_repository_debug_line(
+        ui,
+        body_rect.left(),
+        body_rect.right(),
+        body_rect.bottom(),
+        "repo.body.bottom",
+        Color32::from_rgb(40, 220, 80),
+    );
+    paint_layout_debug_rect(ui, row_rect, "repo.row", Color32::from_rgb(255, 80, 80));
+    paint_layout_debug_rect(ui, body_rect, "repo.body", Color32::from_rgb(80, 220, 120));
+    paint_layout_debug_rect(ui, name_rect, "repo.name", Color32::from_rgb(255, 220, 80));
+    paint_layout_debug_rect(ui, meta_rect, "repo.meta", Color32::from_rgb(80, 180, 255));
+    paint_layout_debug_rect(ui, path_rect, "repo.path", Color32::from_rgb(210, 130, 255));
+}
+
+fn workspace_repository_debug_line(
+    ui: &Ui,
+    left: f32,
+    right: f32,
+    y: f32,
+    label: impl ToString,
+    color: Color32,
+) {
+    let label = label.to_string();
+    let stroke = Stroke::new(2.0, color);
+    ui.painter()
+        .line_segment([Pos2::new(left, y), Pos2::new(right, y)], stroke);
+    ui.painter().text(
+        Pos2::new(left + 4.0, y + 2.0),
+        Align2::LEFT_TOP,
+        label,
+        FontId::monospace(10.0),
+        color,
+    );
+}
+
+fn workspace_repository_text_line(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) {
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .text(rect.left_center(), Align2::LEFT_CENTER, text, font, color);
+}
+
+fn workspace_repository_path_text_line(
+    ui: &Ui,
+    rect: Rect,
+    text: &str,
+    font: FontId,
+    color: Color32,
+) {
+    let text = elide_end_to_width(ui, text, rect.width().max(0.0), font.clone(), color);
+    workspace_repository_text_line(ui, rect, &text, font, color);
+}
+
+fn elide_end_to_width(ui: &Ui, text: &str, max_width: f32, font: FontId, color: Color32) -> String {
+    let text_width = |value: &str| {
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(value.to_owned(), font.clone(), color)
+                .rect
+                .width()
+        })
+    };
+    if text_width(text) <= max_width {
+        return text.to_owned();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = chars.len();
+    let mut best = String::from("...");
+    while low <= high {
+        let keep = (low + high) / 2;
+        let candidate = format!("{}...", chars[..keep].iter().collect::<String>());
+        if text_width(&candidate) <= max_width {
+            best = candidate;
+            low = keep + 1;
+        } else if keep == 0 {
+            break;
+        } else {
+            high = keep - 1;
+        }
+    }
+    best
 }
 
 fn form_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
@@ -12255,11 +16945,15 @@ fn form_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn add_known_repository(repositories: &mut Vec<KnownRepository>, path: PathBuf) {
+fn add_known_repository(
+    repositories: &mut Vec<KnownRepository>,
+    path: PathBuf,
+    workspace_index: Option<usize>,
+) {
     if !is_git_repository_dir(&path) {
         return;
     }
-    let root = path.canonicalize().unwrap_or(path);
+    let root = user_facing_path_buf(&path.canonicalize().unwrap_or(path));
     if repositories
         .iter()
         .any(|repository| paths_equal(&repository.root, &root))
@@ -12272,19 +16966,35 @@ fn add_known_repository(repositories: &mut Vec<KnownRepository>, path: PathBuf) 
         .filter(|name| !name.is_empty())
         .unwrap_or("Repository")
         .to_owned();
-    repositories.push(KnownRepository { root, name });
+    repositories.push(KnownRepository {
+        root,
+        name,
+        workspace_index,
+    });
 }
 
-fn scan_repository_children(base: &Path, repositories: &mut Vec<KnownRepository>) {
+fn scan_repository_children(
+    workspace_index: usize,
+    base: &Path,
+    repositories: &mut Vec<KnownRepository>,
+) {
     let Ok(children) = fs::read_dir(base) else {
         return;
     };
     for child in children.flatten().take(240) {
         let path = child.path();
         if path.is_dir() {
-            add_known_repository(repositories, path);
+            add_known_repository(repositories, path, Some(workspace_index));
         }
     }
+}
+
+fn known_repository_workspace_index(path: &Path, workspaces: &[PathBuf]) -> Option<usize> {
+    let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let parent = root.parent()?;
+    workspaces
+        .iter()
+        .position(|workspace| paths_equal(parent, workspace))
 }
 
 fn is_git_repository_dir(path: &Path) -> bool {
@@ -12339,13 +17049,84 @@ fn settings_dialog_title_row(
 
 fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
     match (language, tab) {
-        (Language::Chinese, SettingsTab::General) => "\u{901a}\u{7528}",
+        (Language::Chinese, SettingsTab::General) => "\u{5e38}\u{89c4}",
+        (Language::Chinese, SettingsTab::Git) => "Git",
+        (Language::Chinese, SettingsTab::CustomActions) => {
+            "\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}"
+        }
+        (Language::Chinese, SettingsTab::Verification) => "\u{9a8c}\u{8bc1}",
+        (Language::Chinese, SettingsTab::Network) => "\u{7f51}\u{7edc}",
         (Language::Chinese, SettingsTab::RepoRemotes) => "\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
         (Language::Chinese, SettingsTab::RepoAdvanced) => "\u{9ad8}\u{7ea7}",
         (_, SettingsTab::General) => "General",
+        (_, SettingsTab::Git) => "Git",
+        (_, SettingsTab::CustomActions) => "Custom Actions",
+        (_, SettingsTab::Verification) => "Verification",
+        (_, SettingsTab::Network) => "Network",
         (_, SettingsTab::RepoRemotes) => "Remote Repositories",
         (_, SettingsTab::RepoAdvanced) => "Advanced",
     }
+}
+
+fn global_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: Language) {
+    const GLOBAL_TAB_COUNT: f32 = 5.0;
+    let width = REPO_SETTINGS_TAB_WIDTH * GLOBAL_TAB_COUNT + LAYOUT_GAP as f32 * 4.0;
+    soft_panel_frame(theme::panel_soft(), 4, 4)
+        .stroke(Stroke::NONE)
+        .shadow(panel_shadow())
+        .show(ui, |ui| {
+            safe_set_min_size(ui, frame_inner_size(width, REPO_SETTINGS_TABS_HEIGHT, 4, 4));
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, REPO_SETTINGS_TAB_HEIGHT),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    repo_settings_tab_button(
+                        ui,
+                        current,
+                        SettingsTab::General,
+                        UiIcon::Settings,
+                        settings_tab_label(language, SettingsTab::General),
+                    );
+                    ui.add_space(LAYOUT_GAP as f32);
+                    repo_settings_tab_button(
+                        ui,
+                        current,
+                        SettingsTab::Git,
+                        UiIcon::Branch,
+                        settings_tab_label(language, SettingsTab::Git),
+                    );
+                    ui.add_space(LAYOUT_GAP as f32);
+                    repo_settings_tab_button(
+                        ui,
+                        current,
+                        SettingsTab::CustomActions,
+                        UiIcon::Terminal,
+                        settings_tab_label(language, SettingsTab::CustomActions),
+                    );
+                    ui.add_space(LAYOUT_GAP as f32);
+                    repo_settings_tab_button(
+                        ui,
+                        current,
+                        SettingsTab::Verification,
+                        UiIcon::Warning,
+                        settings_tab_label(language, SettingsTab::Verification),
+                    );
+                    ui.add_space(LAYOUT_GAP as f32);
+                    repo_settings_tab_button(
+                        ui,
+                        current,
+                        SettingsTab::Network,
+                        UiIcon::Globe,
+                        settings_tab_label(language, SettingsTab::Network),
+                    );
+                },
+            );
+        });
+}
+
+fn global_settings_empty_tab(ui: &mut Ui, title: &str, language: Language) {
+    settings_section_title(ui, title);
+    ui.label(RichText::new(i18n::t(language, "settings.tab_empty")).color(theme::muted()));
 }
 
 fn repo_settings_card(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
@@ -12367,7 +17148,7 @@ fn repo_settings_dialog_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 330.0,
         SettingsTab::RepoAdvanced => REPO_SETTINGS_DIALOG_HEIGHT,
-        SettingsTab::General => 330.0,
+        _ => 330.0,
     }
 }
 
@@ -12375,7 +17156,7 @@ fn repo_settings_content_max_height(tab: SettingsTab) -> f32 {
     match tab {
         SettingsTab::RepoRemotes => 190.0,
         SettingsTab::RepoAdvanced => 320.0,
-        SettingsTab::General => 190.0,
+        _ => 190.0,
     }
 }
 
@@ -12432,32 +17213,21 @@ fn repo_settings_tab_button(
         Vec2::new(REPO_SETTINGS_TAB_WIDTH, REPO_SETTINGS_TAB_HEIGHT),
         Sense::click(),
     );
-    let fill = if selected {
-        theme::panel()
-    } else if response.hovered() {
-        theme::hover()
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter()
-            .rect_filled(rect.shrink(1.0), CornerRadius::same(5), fill);
-    }
+    let visuals = tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        response.hovered(),
+        connected_tab_content_fill(),
+    );
+    paint_connected_tab_shadow_for_state(ui, rect.shrink(1.0), visuals);
+    ui.painter()
+        .rect_filled(rect.shrink(1.0), CornerRadius::same(5), visuals.fill);
 
     let icon_rect = Rect::from_center_size(
         Pos2::new(rect.left() + 15.0, rect.center().y),
         Vec2::splat(13.0),
     );
-    paint_ui_icon(
-        ui,
-        icon_rect,
-        icon,
-        if selected {
-            theme::accent()
-        } else {
-            theme::muted()
-        },
-    );
+    paint_ui_icon(ui, icon_rect, icon, visuals.icon);
     let text_clip = Rect::from_min_max(
         Pos2::new(icon_rect.right() + 5.0, rect.top()),
         Pos2::new(rect.right() - 6.0, rect.bottom()),
@@ -12468,11 +17238,47 @@ fn repo_settings_tab_button(
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(11.0),
-        if selected {
-            theme::text()
-        } else {
-            theme::muted()
-        },
+        visuals.text,
+    );
+    if response.clicked() {
+        *current = tab;
+    }
+    pointing_hand_cursor(response)
+}
+
+fn checkout_tab_button(
+    ui: &mut Ui,
+    current: &mut CheckoutDialogTab,
+    tab: CheckoutDialogTab,
+    icon: UiIcon,
+    label: &str,
+) -> egui::Response {
+    let selected = *current == tab;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(CHECKOUT_TAB_WIDTH, CHECKOUT_TAB_HEIGHT),
+        Sense::click(),
+    );
+    let visuals = tab_visual_state(
+        TabVisualMode::Connected,
+        selected,
+        response.hovered(),
+        connected_tab_content_fill(),
+    );
+    paint_connected_tab_shadow_for_state(ui, rect.shrink(1.0), visuals);
+    ui.painter()
+        .rect_filled(rect.shrink(1.0), CornerRadius::same(4), visuals.fill);
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + 18.0, rect.center().y),
+        Vec2::splat(14.0),
+    );
+    paint_ui_icon(ui, icon_rect, icon, visuals.icon);
+    let text_pos = Pos2::new(icon_rect.right() + 7.0, rect.center().y);
+    ui.painter().text(
+        text_pos,
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        visuals.text,
     );
     if response.clicked() {
         *current = tab;
@@ -12496,6 +17302,17 @@ fn settings_field(ui: &mut Ui, label: &str, content: impl FnOnce(&mut Ui)) {
     });
 }
 
+fn settings_path_label(ui: &mut Ui, text: &str, width: f32) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 22.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.add(egui::Label::new(RichText::new(text).color(theme::text())).truncate());
+        },
+    );
+}
+
 fn settings_choice_button(ui: &mut Ui, selected: bool, label: &str, width: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     let fill = if selected {
@@ -12505,6 +17322,7 @@ fn settings_choice_button(ui: &mut Ui, selected: bool, label: &str, width: f32) 
     } else {
         Color32::TRANSPARENT
     };
+    paint_text_button_hover_shadow_for_response(ui, &response);
     if fill != Color32::TRANSPARENT {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(1.0, 2.0)),
@@ -12540,6 +17358,7 @@ fn settings_accent_button(
     } else {
         Color32::TRANSPARENT
     };
+    paint_text_button_hover_shadow_for_response(ui, &response);
     if fill != Color32::TRANSPARENT {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(1.0, 2.0)),
@@ -12571,7 +17390,7 @@ fn settings_checkbox_row(ui: &mut Ui, value: &mut bool, label: &str) {
     ui.horizontal(|ui| {
         ui.set_min_height(28.0);
         ui.add_space(6.0);
-        ui.checkbox(value, label);
+        action_checkbox(ui, value, label);
     });
 }
 
@@ -12600,6 +17419,20 @@ fn draw_tree_arrow(ui: &mut Ui, rect: Rect, open: bool) {
         theme::muted(),
         Stroke::NONE,
     ));
+}
+
+fn paint_sidebar_row_text(
+    ui: &mut Ui,
+    clip_rect: Rect,
+    pos: Pos2,
+    align: Align2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+) {
+    ui.painter()
+        .with_clip_rect(clip_rect.intersect(ui.clip_rect()))
+        .text(pos, align, text, font, color);
 }
 
 fn tree_header(ui: &mut Ui, open: &mut bool, icon: UiIcon, label: &str) -> bool {
@@ -12635,6 +17468,102 @@ fn tree_header_with_action_enabled(
     )
 }
 
+const TREE_HEADER_HEIGHT: f32 = 30.0;
+const TREE_HEADER_LEFT_INSET: f32 = 8.0;
+const TREE_HEADER_ARROW_SLOT: f32 = 18.0;
+const TREE_HEADER_ICON_SLOT: f32 = 18.0;
+const TREE_HEADER_ACTION_SLOT: f32 = 18.0;
+const TREE_HEADER_GAP: f32 = 5.0;
+const TREE_HEADER_ICON_LABEL_GAP: f32 = 14.0;
+const TREE_GROUP_ROW_HEIGHT: f32 = 24.0;
+const TREE_GROUP_LEFT_INSET: f32 = 12.0;
+const TREE_GROUP_DEPTH_INDENT: f32 = 14.0;
+const TREE_GROUP_ARROW_SLOT: f32 = 12.0;
+const TREE_GROUP_LABEL_GAP: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug)]
+struct TreeHeaderLayout {
+    arrow: Rect,
+    icon: Rect,
+    label: Rect,
+    action: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BranchGroupHeaderLayout {
+    arrow: Rect,
+    label: Rect,
+}
+
+fn tree_header_layout(rect: Rect, has_action: bool) -> TreeHeaderLayout {
+    let center_y = rect.center().y;
+    let arrow = Rect::from_center_size(
+        Pos2::new(
+            rect.left() + TREE_HEADER_LEFT_INSET + TREE_HEADER_ARROW_SLOT / 2.0,
+            center_y,
+        ),
+        Vec2::new(12.0, 18.0),
+    );
+    let icon = Rect::from_center_size(
+        Pos2::new(
+            rect.left()
+                + TREE_HEADER_LEFT_INSET
+                + TREE_HEADER_ARROW_SLOT
+                + TREE_HEADER_GAP
+                + TREE_HEADER_ICON_SLOT / 2.0,
+            center_y,
+        ),
+        Vec2::splat(16.0),
+    );
+    let action = has_action.then(|| {
+        Rect::from_center_size(
+            Pos2::new(
+                rect.right() - TREE_HEADER_LEFT_INSET - TREE_HEADER_ACTION_SLOT / 2.0,
+                center_y,
+            ),
+            Vec2::splat(18.0),
+        )
+    });
+    let label_left = rect.left()
+        + TREE_HEADER_LEFT_INSET
+        + TREE_HEADER_ARROW_SLOT
+        + TREE_HEADER_GAP
+        + TREE_HEADER_ICON_SLOT
+        + TREE_HEADER_ICON_LABEL_GAP;
+    let label_right = action
+        .map_or(rect.right() - TREE_HEADER_LEFT_INSET, |action| {
+            action.left() - TREE_HEADER_ICON_LABEL_GAP
+        })
+        .max(label_left + 24.0);
+
+    TreeHeaderLayout {
+        arrow,
+        icon,
+        label: Rect::from_min_max(
+            Pos2::new(label_left, rect.top()),
+            Pos2::new(label_right, rect.bottom()),
+        ),
+        action,
+    }
+}
+
+fn branch_group_header_layout(rect: Rect, depth: usize) -> BranchGroupHeaderLayout {
+    let center_y = rect.center().y;
+    let left = rect.left() + TREE_GROUP_LEFT_INSET + depth as f32 * TREE_GROUP_DEPTH_INDENT;
+    let arrow = Rect::from_center_size(
+        Pos2::new(left + TREE_GROUP_ARROW_SLOT / 2.0, center_y),
+        Vec2::new(TREE_GROUP_ARROW_SLOT, 18.0),
+    );
+    let label_left = left + TREE_GROUP_ARROW_SLOT + TREE_GROUP_LABEL_GAP;
+    BranchGroupHeaderLayout {
+        arrow,
+        label: Rect::from_min_max(
+            Pos2::new(label_left, rect.top()),
+            Pos2::new(rect.right() - TREE_HEADER_LEFT_INSET, rect.bottom()),
+        ),
+    }
+}
+
 fn tree_header_inner(
     ui: &mut Ui,
     open: &mut bool,
@@ -12642,35 +17571,58 @@ fn tree_header_inner(
     label: &str,
     action: Option<(UiIcon, &str, bool)>,
 ) -> (bool, bool) {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), TREE_HEADER_HEIGHT),
+        Sense::click(),
+    );
     let response = pointing_hand_cursor(response);
     let mut action_clicked = false;
-    allocate_clipped_ui_at_rect(ui, rect, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(10.0);
-            let (arrow_rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 18.0), Sense::hover());
-            draw_tree_arrow(ui, arrow_rect, *open);
-            let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-            draw_ui_icon(ui, icon_rect, icon, theme::accent());
-            let label_width = if action.is_some() {
-                (ui.available_width() - 38.0).max(32.0)
+    let mut action_area_hit = false;
+    let layout = tree_header_layout(rect, action.is_some());
+    draw_tree_arrow(ui, layout.arrow, *open);
+    paint_ui_icon(ui, layout.icon.shrink(1.0), icon, theme::accent());
+    paint_sidebar_row_text(
+        ui,
+        layout.label,
+        layout.label.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        theme::text(),
+    );
+    if let Some((action_icon, action_label, action_enabled)) = action {
+        if let Some(action_rect) = layout.action {
+            let sense = if action_enabled {
+                Sense::click()
             } else {
-                ui.available_width().max(32.0)
+                Sense::hover()
             };
-            ui.add_sized(
-                [label_width, 24.0],
-                egui::Label::new(RichText::new(label).strong().color(theme::text())).truncate(),
+            let action_response = ui.interact(
+                action_rect,
+                ui.id().with(("tree_header_action", label)),
+                sense,
             );
-            if let Some((action_icon, action_label, action_enabled)) = action {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let response = icon_button(ui, action_icon, action_label, action_enabled);
-                    action_clicked = response.clicked();
-                });
+            let action_response = if action_enabled {
+                pointing_hand_cursor(action_response)
+            } else {
+                action_response
             }
-        });
-    });
-    if response.clicked() && !action_clicked {
+            .on_hover_text(action_label);
+            action_area_hit = action_response.hovered();
+            action_clicked = action_enabled && action_response.clicked();
+            let action_color = if action_enabled {
+                if action_response.hovered() {
+                    theme::accent_deep()
+                } else {
+                    theme::text()
+                }
+            } else {
+                theme::muted()
+            };
+            paint_ui_icon(ui, action_rect.shrink(2.0), action_icon, action_color);
+        }
+    }
+    if response.clicked() && !action_area_hit {
         *open = !*open;
     }
     (*open, action_clicked)
@@ -12710,7 +17662,7 @@ fn worktree_header_action_button(
     label: &str,
     enabled: bool,
 ) -> egui::Response {
-    let height = 30.0;
+    let height = 26.0;
     let text_width = ui.fonts(|fonts| {
         fonts
             .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), theme::text())
@@ -12748,6 +17700,7 @@ fn worktree_header_action_button(
 
     let response = ui.add_enabled(enabled, button);
     if enabled {
+        paint_text_button_hover_shadow_for_response(ui, &response);
         pointing_hand_cursor(response)
     } else {
         response
@@ -12866,6 +17819,7 @@ fn conflict_resolution_action_button(ui: &mut Ui, text: &str, enabled: bool) -> 
         .corner_radius(CornerRadius::same(4));
     let response = ui.add_enabled(enabled, button);
     if enabled {
+        paint_text_button_hover_shadow_for_response(ui, &response);
         pointing_hand_cursor(response)
     } else {
         response
@@ -13657,7 +18611,7 @@ fn branch_row(
     let badge_left =
         paint_branch_row_badges(ui, row_rect, current, remote, sync_counts, language, color)
             .unwrap_or(row_rect.right());
-    let name_left = rect.left() + if current { 22.0 } else { 16.0 } + depth as f32 * 14.0;
+    let name_left = rect.left() + 16.0 + depth as f32 * 14.0;
     let name_right = (badge_left - 6.0).max(name_left);
     let name_rect = Rect::from_min_max(
         Pos2::new(name_left, rect.top()),
@@ -14041,7 +18995,10 @@ fn remote_branch_group_row(
     depth: usize,
     collapsed: bool,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), TREE_GROUP_ROW_HEIGHT),
+        Sense::hover(),
+    );
     if row_rect_hovered(ui, rect) {
         ui.painter().rect_filled(
             rect.shrink2(Vec2::new(2.0, 1.0)),
@@ -14050,14 +19007,17 @@ fn remote_branch_group_row(
         );
     }
 
-    allocate_clipped_ui_at_rect(ui, rect, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(12.0 + depth as f32 * 14.0);
-            let (arrow_rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 18.0), Sense::hover());
-            draw_tree_arrow(ui, arrow_rect, !collapsed);
-            ui.label(RichText::new(&node.name).strong().color(theme::text()));
-        });
-    });
+    let layout = branch_group_header_layout(rect, depth);
+    draw_tree_arrow(ui, layout.arrow, !collapsed);
+    paint_sidebar_row_text(
+        ui,
+        layout.label,
+        layout.label.left_center(),
+        Align2::LEFT_CENTER,
+        &node.name,
+        FontId::proportional(12.0),
+        theme::text(),
+    );
 
     let response = full_row_click_response(ui, rect, ("remote_branch_group_row", &node.path));
     response
@@ -14081,12 +19041,20 @@ fn remote_branch_row(
         );
     }
 
-    allocate_clipped_ui_at_rect(ui, rect, |ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(34.0 + depth as f32 * 14.0);
-            ui.label(RichText::new(display_name).color(theme::muted()));
-        });
-    });
+    let text_left = rect.left() + 34.0 + depth as f32 * 14.0;
+    let text_rect = Rect::from_min_max(
+        Pos2::new(text_left, rect.top()),
+        Pos2::new(rect.right() - TREE_HEADER_LEFT_INSET, rect.bottom()),
+    );
+    paint_sidebar_row_text(
+        ui,
+        text_rect,
+        text_rect.left_center(),
+        Align2::LEFT_CENTER,
+        display_name,
+        FontId::proportional(12.0),
+        theme::muted(),
+    );
 
     let response =
         full_row_click_response_enabled(ui, rect, ("remote_branch_row", full_name), enabled);
@@ -14155,27 +19123,48 @@ fn stash_row(
         );
     }
 
-    allocate_clipped_ui_at_rect(ui, rect, |ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                ui.label(
-                    RichText::new(&stash.selector)
-                        .monospace()
-                        .color(theme::accent()),
-                );
-                ui.label(
-                    RichText::new(&stash.relative_time)
-                        .small()
-                        .color(theme::muted()),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                ui.label(RichText::new(&stash.message).small().color(theme::text()));
-            });
-        });
+    let clip_rect = rect.shrink2(Vec2::new(16.0, 2.0));
+    let selector_font = FontId::monospace(12.0);
+    let selector_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                stash.selector.clone(),
+                selector_font.clone(),
+                theme::accent(),
+            )
+            .rect
+            .width()
     });
+    let first_line_y = rect.top() + 12.0;
+    let second_line_y = rect.top() + 29.0;
+    let left = rect.left() + 16.0;
+    paint_sidebar_row_text(
+        ui,
+        clip_rect,
+        Pos2::new(left, first_line_y),
+        Align2::LEFT_CENTER,
+        &stash.selector,
+        selector_font,
+        theme::accent(),
+    );
+    paint_sidebar_row_text(
+        ui,
+        clip_rect,
+        Pos2::new(left + selector_width + 8.0, first_line_y),
+        Align2::LEFT_CENTER,
+        &stash.relative_time,
+        FontId::proportional(11.0),
+        theme::muted(),
+    );
+    paint_sidebar_row_text(
+        ui,
+        clip_rect,
+        Pos2::new(left, second_line_y),
+        Align2::LEFT_CENTER,
+        &stash.message,
+        FontId::proportional(11.0),
+        theme::text(),
+    );
 
     response.context_menu(|ui| {
         ui.set_min_width(180.0);
@@ -14227,26 +19216,46 @@ fn tag_row(
         );
     }
 
-    allocate_clipped_ui_at_rect(ui, rect, |ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                ui.label(RichText::new(&tag.name).color(theme::accent()));
-                ui.label(
-                    RichText::new(&tag.target)
-                        .monospace()
-                        .small()
-                        .color(theme::muted()),
-                );
-            });
-            if !tag.subject.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new(&tag.subject).small().color(theme::muted()));
-                });
-            }
-        });
+    let clip_rect = rect.shrink2(Vec2::new(16.0, 2.0));
+    let name_font = FontId::proportional(12.0);
+    let name_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(tag.name.clone(), name_font.clone(), theme::accent())
+            .rect
+            .width()
     });
+    let first_line_y = rect.top() + 12.0;
+    let second_line_y = rect.top() + 28.0;
+    let left = rect.left() + 16.0;
+    paint_sidebar_row_text(
+        ui,
+        clip_rect,
+        Pos2::new(left, first_line_y),
+        Align2::LEFT_CENTER,
+        &tag.name,
+        name_font,
+        theme::accent(),
+    );
+    paint_sidebar_row_text(
+        ui,
+        clip_rect,
+        Pos2::new(left + name_width + 8.0, first_line_y),
+        Align2::LEFT_CENTER,
+        &tag.target,
+        FontId::monospace(11.0),
+        theme::muted(),
+    );
+    if !tag.subject.is_empty() {
+        paint_sidebar_row_text(
+            ui,
+            clip_rect,
+            Pos2::new(left, second_line_y),
+            Align2::LEFT_CENTER,
+            &tag.subject,
+            FontId::proportional(11.0),
+            theme::muted(),
+        );
+    }
 
     response.context_menu(|ui| {
         ui.set_min_width(180.0);
@@ -15025,6 +20034,8 @@ fn diff_row(
     }
 
     let selected = selected_rows.iter().any(|selected| selected == &key);
+    let row_clip = diff_row_clip_rect(ui, rect);
+    let painter = ui.painter().with_clip_rect(row_clip);
     let fill = if selected {
         Color32::from_rgb(82, 168, 236)
     } else {
@@ -15044,7 +20055,7 @@ fn diff_row(
         }
     };
     if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, CornerRadius::ZERO, fill);
+        painter.rect_filled(rect, CornerRadius::ZERO, fill);
     }
 
     response.context_menu(|ui| {
@@ -15058,7 +20069,7 @@ fn diff_row(
         rect.left_top(),
         Pos2::new(rect.left() + 96.0, rect.bottom()),
     );
-    ui.painter().rect_filled(
+    painter.rect_filled(
         gutter_bg,
         CornerRadius::ZERO,
         if selected {
@@ -15067,7 +20078,7 @@ fn diff_row(
             Color32::from_rgb(248, 250, 252)
         },
     );
-    ui.painter().line_segment(
+    painter.line_segment(
         [
             Pos2::new(gutter_bg.right(), rect.top()),
             Pos2::new(gutter_bg.right(), rect.bottom()),
@@ -15086,14 +20097,14 @@ fn diff_row(
     } else {
         Color32::from_rgb(124, 135, 148)
     };
-    ui.painter().text(
+    painter.text(
         Pos2::new(rect.left() + 36.0, rect.center().y),
         Align2::RIGHT_CENTER,
         &line.left_no,
         FontId::monospace(12.0),
         gutter,
     );
-    ui.painter().text(
+    painter.text(
         Pos2::new(rect.left() + 74.0, rect.center().y),
         Align2::RIGHT_CENTER,
         &line.right_no,
@@ -15105,7 +20116,7 @@ fn diff_row(
         DiffKind::Removed => "-",
         DiffKind::Context => " ",
     };
-    ui.painter().text(
+    painter.text(
         Pos2::new(rect.left() + 104.0, rect.center().y),
         Align2::LEFT_CENTER,
         sign,
@@ -15119,13 +20130,18 @@ fn diff_row(
     if !selected {
         draw_diff_indent_guides(ui, text_rect, &line.body);
     }
-    ui.painter().with_clip_rect(text_rect).text(
+    let text_clip = text_rect.intersect(row_clip);
+    ui.painter().with_clip_rect(text_clip).text(
         text_rect.left_center(),
         Align2::LEFT_CENTER,
         &line.body,
         FontId::monospace(12.0),
         text_color,
     );
+}
+
+fn diff_row_clip_rect(ui: &Ui, rect: Rect) -> Rect {
+    rect.intersect(ui.clip_rect())
 }
 
 fn selected_diff_rows_text(selected_rows: &[DiffLineKey]) -> String {
@@ -15148,6 +20164,9 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
             .width()
             .max(1.0)
     });
+    let painter = ui
+        .painter()
+        .with_clip_rect(text_rect.intersect(ui.clip_rect()));
     let dot_color = Color32::from_rgb(190, 198, 210);
     let mut column = 0usize;
     for ch in body.chars() {
@@ -15155,8 +20174,7 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
             ' ' => {
                 let x = text_rect.left() + column as f32 * char_width + char_width * 0.5;
                 if x < text_rect.right() {
-                    ui.painter()
-                        .circle_filled(Pos2::new(x, text_rect.center().y), 1.0, dot_color);
+                    painter.circle_filled(Pos2::new(x, text_rect.center().y), 1.0, dot_color);
                 }
                 column += 1;
             }
@@ -15165,11 +20183,7 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
                 while column < next_tab {
                     let x = text_rect.left() + column as f32 * char_width + char_width * 0.5;
                     if x < text_rect.right() {
-                        ui.painter().circle_filled(
-                            Pos2::new(x, text_rect.center().y),
-                            1.0,
-                            dot_color,
-                        );
+                        painter.circle_filled(Pos2::new(x, text_rect.center().y), 1.0, dot_color);
                     }
                     column += 1;
                 }
@@ -15547,6 +20561,534 @@ fn split_remote_branch_name(name: &str) -> Option<(String, String)> {
     Some((remote.to_owned(), branch.to_owned()))
 }
 
+fn checkout_local_branch_default(remote_branch: &str) -> String {
+    remote_branch
+        .rsplit_once('/')
+        .map(|(_, branch)| branch)
+        .filter(|branch| !branch.trim().is_empty())
+        .unwrap_or(remote_branch)
+        .to_owned()
+}
+
+fn validate_checkout_new_branch(
+    language: Language,
+    remote_branch: &str,
+    local_branch: &str,
+    remote_branch_choices: &[String],
+    local_branch_names: &[String],
+) -> Option<String> {
+    let remote_branch = remote_branch.trim();
+    let local_branch = local_branch.trim();
+    let mut issues = Vec::new();
+
+    if remote_branch.is_empty()
+        || !remote_branch_choices
+            .iter()
+            .any(|branch| branch == remote_branch)
+    {
+        issues.push(i18n::t(language, "checkout.error.remote_branch_invalid"));
+    }
+    if !valid_checkout_local_branch_name(local_branch) {
+        issues.push(i18n::t(language, "checkout.error.local_branch_invalid"));
+    } else if local_branch_names
+        .iter()
+        .any(|branch| branch == local_branch)
+    {
+        issues.push(i18n::t(language, "checkout.error.local_branch_exists"));
+    }
+
+    if issues.is_empty() {
+        None
+    } else {
+        let mut message = i18n::t(language, "checkout.error.fix_inputs").to_owned();
+        for (index, issue) in issues.iter().enumerate() {
+            message.push_str(&format!("\n{}. {}", index + 1, issue));
+        }
+        Some(message)
+    }
+}
+
+fn valid_checkout_local_branch_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "HEAD"
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+    {
+        return false;
+    }
+    !name
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
+fn history_dialog_commits(
+    snapshot: &RepositorySnapshot,
+    scope: HistoryBranchScope,
+    order: HistorySortOrder,
+) -> Vec<Commit> {
+    let commits = match (scope, order) {
+        (HistoryBranchScope::Current, HistorySortOrder::Date) => &snapshot.date_commits,
+        (HistoryBranchScope::Current, HistorySortOrder::Topology) => &snapshot.topology_commits,
+        (HistoryBranchScope::All, HistorySortOrder::Date) => &snapshot.all_date_commits,
+        (HistoryBranchScope::All, HistorySortOrder::Topology) => &snapshot.all_topology_commits,
+    };
+    if commits.is_empty() {
+        snapshot.commits.clone()
+    } else {
+        commits.clone()
+    }
+}
+
+fn merge_dialog_commits(snapshot: &RepositorySnapshot, order: HistorySortOrder) -> Vec<Commit> {
+    history_dialog_commits(snapshot, HistoryBranchScope::All, order)
+}
+
+fn current_named_local_branch(snapshot: &RepositorySnapshot) -> Option<&git::Branch> {
+    let branch_name = snapshot.branch.trim();
+    if branch_name.is_empty() || branch_name == "HEAD" || branch_name.starts_with("(HEAD detached")
+    {
+        return None;
+    }
+    snapshot
+        .branches
+        .iter()
+        .find(|branch| !branch.remote && branch.name == branch_name)
+}
+
+fn github_authentication_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let auth_error =
+        message.contains("authentication required") || message.contains("authentication error");
+    let github_context = message.contains("github")
+        || message.contains("push access to verify locks")
+        || message.contains("git push");
+    auth_error && github_context
+}
+
+#[allow(dead_code)]
+fn interactive_rebase_has_targets(snapshot: &RepositorySnapshot) -> bool {
+    !snapshot.rebase_in_progress
+        && current_named_local_branch(snapshot).is_some()
+        && interactive_rebase_dialog_commits(snapshot, HistorySortOrder::Date)
+            .iter()
+            .any(|commit| !interactive_rebase_commit_is_merge(commit))
+}
+
+fn interactive_rebase_dialog_commits(
+    snapshot: &RepositorySnapshot,
+    order: HistorySortOrder,
+) -> Vec<Commit> {
+    let first_parent_hashes = interactive_rebase_first_parent_hashes(snapshot);
+    let mut commits = history_dialog_commits(snapshot, HistoryBranchScope::Current, order)
+        .into_iter()
+        .filter(|commit| first_parent_hashes.contains(&commit.hash))
+        .collect::<Vec<_>>();
+    let limit = match snapshot.upstream.as_ref() {
+        Some(upstream) if upstream.ahead == 0 => return Vec::new(),
+        Some(upstream) => upstream.ahead.clamp(1, 256),
+        None => 32,
+    };
+    commits.truncate(limit);
+    commits
+}
+
+fn interactive_rebase_first_parent_hashes(snapshot: &RepositorySnapshot) -> HashSet<String> {
+    let topology = history_dialog_commits(
+        snapshot,
+        HistoryBranchScope::Current,
+        HistorySortOrder::Topology,
+    );
+    let commits_by_hash = topology
+        .iter()
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let mut hashes = HashSet::new();
+    let Some(mut current_hash) = interactive_rebase_head_hash(snapshot, &topology) else {
+        return hashes;
+    };
+
+    while hashes.insert(current_hash.clone()) {
+        let Some(commit) = commits_by_hash.get(current_hash.as_str()) else {
+            break;
+        };
+        let Some(parent) = commit.parents.first() else {
+            break;
+        };
+        current_hash = parent.clone();
+    }
+
+    hashes
+}
+
+fn interactive_rebase_head_hash(
+    snapshot: &RepositorySnapshot,
+    topology: &[Commit],
+) -> Option<String> {
+    let branch_name = current_named_local_branch(snapshot).map(|branch| branch.name.as_str());
+    if let Some(branch_name) = branch_name {
+        if let Some(commit) = topology
+            .iter()
+            .find(|commit| commit.refs.iter().any(|label| label == branch_name))
+        {
+            return Some(commit.hash.clone());
+        }
+    }
+    topology.first().map(|commit| commit.hash.clone())
+}
+
+fn interactive_rebase_commit_is_merge(commit: &Commit) -> bool {
+    commit.parents.len() > 1
+}
+
+fn interactive_rebase_actionable_commits(commits: &[Commit]) -> Vec<Commit> {
+    commits
+        .iter()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .cloned()
+        .collect()
+}
+
+fn interactive_rebase_disabled_hashes(commits: &[Commit]) -> HashSet<String> {
+    commits
+        .iter()
+        .filter(|commit| interactive_rebase_commit_is_merge(commit))
+        .map(|commit| commit.hash.clone())
+        .collect()
+}
+
+fn interactive_rebase_selected_actionable_hashes(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<String> {
+    commits
+        .iter()
+        .filter(|commit| {
+            !interactive_rebase_commit_is_merge(commit)
+                && dialog.selected_hashes.contains(&commit.hash)
+        })
+        .map(|commit| commit.hash.clone())
+        .collect()
+}
+
+fn interactive_rebase_base_for_commits(commits: &[Commit]) -> Option<String> {
+    let actionable = interactive_rebase_actionable_commits(commits);
+    let oldest = actionable.last()?;
+    Some(
+        oldest
+            .parents
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "--root".to_owned()),
+    )
+}
+
+fn interactive_rebase_todo_items(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<git::InteractiveRebaseTodoItem> {
+    commits
+        .iter()
+        .rev()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| {
+            let action = dialog
+                .actions
+                .get(&commit.hash)
+                .copied()
+                .unwrap_or(InteractiveRebaseTodoAction::Pick);
+            git::InteractiveRebaseTodoItem {
+                action: action.to_git_action(),
+                hash: commit.hash.clone(),
+                subject: commit.subject.clone(),
+            }
+        })
+        .collect()
+}
+
+fn validate_interactive_rebase_dialog(
+    language: Language,
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Option<String> {
+    let actionable = interactive_rebase_actionable_commits(commits);
+    if actionable.is_empty() {
+        return Some(i18n::t(language, "interactive_rebase.error.no_commits").to_owned());
+    }
+    if actionable.last().is_some_and(|commit| {
+        dialog.actions.get(&commit.hash) == Some(&InteractiveRebaseTodoAction::Squash)
+    }) {
+        return Some(i18n::t(language, "interactive_rebase.error.first_squash").to_owned());
+    }
+    None
+}
+
+fn interactive_rebase_dirty_message(language: Language) -> String {
+    i18n::t(language, "interactive_rebase.error.dirty").to_owned()
+}
+
+fn lfs_pattern_list(
+    ui: &mut Ui,
+    patterns: &mut Vec<String>,
+    selected: &mut Option<usize>,
+    language: Language,
+) {
+    soft_panel_frame(theme::panel_soft(), 4, 4)
+        .stroke(Stroke::NONE)
+        .show(ui, |ui| {
+            ui.set_min_size(Vec2::new(270.0, 200.0));
+            ScrollArea::vertical()
+                .id_salt("lfs_pattern_list")
+                .max_height(200.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if patterns.is_empty() {
+                        ui.label(
+                            RichText::new(i18n::t(language, "lfs.pattern_empty"))
+                                .color(theme::muted()),
+                        );
+                    }
+                    for index in 0..patterns.len() {
+                        let is_selected = *selected == Some(index);
+                        ui.horizontal(|ui| {
+                            let select_response = ui.selectable_label(is_selected, "");
+                            if select_response.clicked() {
+                                *selected = Some(index);
+                            }
+                            let hint = i18n::t(language, "lfs.pattern_placeholder");
+                            themed_text_edit_selection(ui);
+                            let response = ui.add_sized(
+                                [220.0, 22.0],
+                                themed_singleline_text_edit(&mut patterns[index], hint),
+                            );
+                            if response.clicked() {
+                                *selected = Some(index);
+                            }
+                        });
+                    }
+                });
+        });
+}
+
+fn validate_lfs_patterns(language: Language, patterns: &[String]) -> Option<String> {
+    let mut seen = HashSet::<String>::new();
+    for pattern in patterns {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Some(i18n::t(language, "lfs.error.pattern_required").to_owned());
+        }
+        if !seen.insert(pattern.to_owned()) {
+            return Some(i18n::t(language, "lfs.error.duplicate_pattern").to_owned());
+        }
+    }
+    None
+}
+
+fn dependency_source_row(
+    ui: &mut Ui,
+    language: Language,
+    label: &str,
+    value: &mut String,
+    dialog_root: Option<&Path>,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 24.0],
+            egui::Label::new(RichText::new(label).color(theme::text())),
+        );
+        let hint = placeholder_for_label(language, label);
+        themed_text_edit_selection(ui);
+        ui.add_sized(
+            [ui.available_width() - 42.0, 24.0],
+            themed_singleline_text_edit(value, &hint),
+        );
+        if ui.button("...").clicked() {
+            let mut file_dialog = rfd::FileDialog::new();
+            if let Some(root) = dialog_root {
+                file_dialog = file_dialog.set_directory(root);
+            }
+            if let Some(path) = file_dialog.pick_folder() {
+                *value = user_facing_path_string(&path);
+            }
+        }
+    });
+}
+
+fn dependency_local_path_row(
+    ui: &mut Ui,
+    language: Language,
+    label: &str,
+    value: &mut String,
+    dialog_root: Option<&Path>,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 24.0],
+            egui::Label::new(RichText::new(label).color(theme::text())),
+        );
+        let hint = placeholder_for_label(language, label);
+        themed_text_edit_selection(ui);
+        ui.add_sized(
+            [ui.available_width() - 42.0, 24.0],
+            themed_singleline_text_edit(value, &hint),
+        );
+        if ui.button("...").clicked() {
+            let mut file_dialog = rfd::FileDialog::new();
+            if let Some(root) = dialog_root {
+                file_dialog = file_dialog.set_directory(root);
+            }
+            if let Some(path) = file_dialog.pick_folder() {
+                *value = dependency_relative_path(dialog_root, &path);
+            }
+        }
+    });
+}
+
+fn dependency_text_row(ui: &mut Ui, language: Language, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 24.0],
+            egui::Label::new(RichText::new(label).color(theme::text())),
+        );
+        let hint = placeholder_for_label(language, label);
+        themed_text_edit_selection(ui);
+        ui.add_sized(
+            [ui.available_width(), 24.0],
+            themed_singleline_text_edit(value, &hint),
+        );
+    });
+}
+
+fn dependency_repo_type_row(ui: &mut Ui, language: Language, label: &str, source: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 22.0],
+            egui::Label::new(RichText::new(label).color(theme::text())),
+        );
+        ui.label(
+            RichText::new(dependency_repo_type_label(language, source))
+                .small()
+                .color(theme::muted()),
+        );
+    });
+}
+
+fn dependency_advanced_toggle(ui: &mut Ui, open: &mut bool, label: &str) {
+    ui.horizontal(|ui| {
+        let symbol = if *open { "v" } else { ">" };
+        if ui.button(symbol).clicked() {
+            *open = !*open;
+        }
+        ui.label(RichText::new(label).color(theme::text()));
+    });
+}
+
+fn dependency_repo_type_label(language: Language, source: &str) -> &'static str {
+    let source = source.trim();
+    if source.is_empty() {
+        return i18n::t(language, "dependency.repo_type_missing");
+    }
+    if source.contains("://") || source.starts_with("git@") || source.ends_with(".git") {
+        i18n::t(language, "dependency.repo_type_git")
+    } else {
+        i18n::t(language, "dependency.repo_type_local")
+    }
+}
+
+fn dependency_relative_path(root: Option<&Path>, path: &Path) -> String {
+    let relative = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    normalize_dialog_relative_path(&user_facing_path_string(relative))
+}
+
+fn normalize_dialog_relative_path(path: &str) -> String {
+    path.trim().trim_matches(['/', '\\']).replace('\\', "/")
+}
+
+fn validate_dependency_relative_path(language: Language, path: &str) -> Option<String> {
+    let normalized = normalize_dialog_relative_path(path);
+    if normalized.is_empty() {
+        return Some(i18n::t(language, "dependency.error.local_path_required").to_owned());
+    }
+    let path = Path::new(&normalized);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Some(i18n::t(language, "dependency.error.local_path_relative").to_owned());
+    }
+    None
+}
+
+fn validate_submodule_action_dialog(
+    language: Language,
+    dialog: &SubmoduleActionDialog,
+) -> Option<String> {
+    if dialog.source.trim().is_empty() {
+        return Some(i18n::t(language, "dependency.error.source_required").to_owned());
+    }
+    validate_dependency_relative_path(language, &dialog.local_path)
+}
+
+fn validate_subtree_action_dialog(
+    language: Language,
+    dialog: &SubtreeActionDialog,
+) -> Option<String> {
+    if dialog.source.trim().is_empty() {
+        return Some(i18n::t(language, "dependency.error.source_required").to_owned());
+    }
+    if dialog.ref_name.trim().is_empty() {
+        return Some(i18n::t(language, "subtree.error.ref_required").to_owned());
+    }
+    validate_dependency_relative_path(language, &dialog.local_path)
+}
+
+fn parse_merge_rename_threshold(value: &str) -> u8 {
+    value.trim().parse::<u8>().unwrap_or(90).clamp(1, 100)
+}
+
+fn default_archive_output_path(root: &Path) -> String {
+    user_facing_path_string(&root.join("archive.zip"))
+}
+
+fn archive_target_ref(dialog: &ArchiveActionDialog) -> String {
+    match dialog.target {
+        ArchiveTarget::Worktree => "HEAD".to_owned(),
+        ArchiveTarget::Commit => dialog.target_commit.trim().to_owned(),
+    }
+}
+
+fn validate_archive_dialog(language: Language, dialog: &ArchiveActionDialog) -> Option<String> {
+    let mut issues = Vec::new();
+    if dialog.output_path.trim().is_empty() {
+        issues.push(i18n::t(language, "archive.error.output_required"));
+    }
+    if dialog.target == ArchiveTarget::Commit && dialog.target_commit.trim().is_empty() {
+        issues.push(i18n::t(language, "archive.error.commit_required"));
+    }
+
+    if issues.is_empty() {
+        None
+    } else {
+        let mut message = i18n::t(language, "checkout.error.fix_inputs").to_owned();
+        for (index, issue) in issues.iter().enumerate() {
+            message.push_str(&format!("\n{}. {}", index + 1, issue));
+        }
+        Some(message)
+    }
+}
+
 fn push_remote_branch_default(
     branch: &git::Branch,
     remote: &str,
@@ -15626,6 +21168,7 @@ fn push_remote_branch_column_width(table_width: f32) -> f32 {
 fn push_remote_form_row(
     ui: &mut Ui,
     label: &str,
+    url_hint: &str,
     remote_url_display: &mut String,
     add_remote_selector: impl FnOnce(&mut Ui),
 ) {
@@ -15670,7 +21213,7 @@ fn push_remote_form_row(
         url_ui.add_enabled_ui(false, |url_ui| {
             url_ui.add_sized(
                 [url_width, PUSH_REMOTE_FORM_CONTROL_HEIGHT],
-                themed_singleline_text_edit(remote_url_display, "").desired_width(url_width),
+                themed_singleline_text_edit(remote_url_display, url_hint).desired_width(url_width),
             );
         });
     });
@@ -15765,9 +21308,11 @@ fn push_branch_table_row(
         push_branch_cell_rects(row_rect, remote_width);
 
     let was_selected = row.selected;
-    ui.put(
+    action_icon_checkbox(
+        ui,
         Rect::from_center_size(select_rect.center(), Vec2::splat(20.0)),
-        egui::Checkbox::new(&mut row.selected, ""),
+        ("push_branch_selected", row.local_branch.as_str()),
+        &mut row.selected,
     );
     if row.selected && !was_selected && row.remote_branch.trim().is_empty() {
         row.remote_branch = row.local_branch.clone();
@@ -15800,9 +21345,11 @@ fn push_branch_table_row(
             });
     });
 
-    ui.put(
+    action_icon_checkbox(
+        ui,
         Rect::from_center_size(track_rect.center(), Vec2::splat(20.0)),
-        egui::Checkbox::new(&mut row.track, ""),
+        ("push_branch_track", row.local_branch.as_str()),
+        &mut row.track,
     );
 }
 
@@ -15847,6 +21394,32 @@ fn strip_git_suffix(value: &str) -> &str {
 mod ui_tests {
     use super::*;
 
+    fn color_brightness(color: Color32) -> f32 {
+        (0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32) / 255.0
+    }
+
+    fn sample_commit(hash: &str, parents: &[&str], subject: &str) -> Commit {
+        Commit {
+            hash: hash.to_owned(),
+            short_hash: hash.to_owned(),
+            parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
+            author: "Test Author".to_owned(),
+            date: "2026-07-01 10:00".to_owned(),
+            relative_time: "now".to_owned(),
+            subject: subject.to_owned(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn sample_branch(name: &str, current: bool) -> git::Branch {
+        git::Branch {
+            name: name.to_owned(),
+            current,
+            remote: false,
+            upstream: None,
+        }
+    }
+
     #[test]
     fn top_bar_has_two_fixed_rows() {
         assert_eq!(TOP_BAR_TAB_TOOL_JOIN_OVERLAP, 6.0);
@@ -15868,7 +21441,7 @@ mod ui_tests {
         assert!(top_bar_source.contains("let top_island_rect = top_island_rect("));
         assert!(top_bar_source.contains("let tab_strip_row = repo_tab_strip_rect("));
         assert!(top_bar_source.contains(".rect_filled(full, CornerRadius::ZERO, theme::bg())"));
-        assert!(top_bar_source.contains(".fill(theme::panel_soft())"));
+        assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
         assert!(top_bar_source.contains(".shadow(panel_shadow())"));
         assert!(top_bar_source.contains(".paint(top_island_rect)"));
         assert!(
@@ -15895,6 +21468,7 @@ mod ui_tests {
         assert!(top_bar_source.contains("tool_row_panel_rect"));
         assert!(top_bar_source.contains("tool_row_corners()"));
         assert!(top_bar_source.contains("theme::panel()"));
+        assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
         assert!(top_bar_source.contains(".paint(tool_row_panel_rect)"));
         assert!(
             top_bar_source
@@ -16240,13 +21814,32 @@ mod ui_tests {
             theme: SettingsThemeMode::Light,
             theme_accent: SettingsThemeAccent::Purple,
             language: SettingsLanguage::English,
+            workspaces: vec![PathBuf::from(r"D:\code"), PathBuf::from(r"D:\work")],
+            active_repo_refresh_seconds: 30,
+            inactive_repo_refresh_seconds: 90,
             remote_accounts: vec![RemoteAccountSettings::default()],
         };
         let raw = serde_json::to_string(&settings).unwrap();
         assert!(raw.contains("\"theme\":\"Light\""));
         assert!(raw.contains("\"theme_accent\":\"Purple\""));
         assert!(raw.contains("\"language\":\"English\""));
+        assert!(raw.contains("\"workspaces\""));
+        assert!(raw.contains("\"active_repo_refresh_seconds\":30"));
+        assert!(raw.contains("\"inactive_repo_refresh_seconds\":90"));
+        assert!(raw.contains(r#"D:\\code"#));
         let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let app_settings_default_start = implementation_source
+            .find("impl Default for AppSettings")
+            .unwrap();
+        let app_settings_default_end = implementation_source[app_settings_default_start..]
+            .find("impl AppSettings")
+            .unwrap();
+        let app_settings_default_source = &implementation_source
+            [app_settings_default_start..app_settings_default_start + app_settings_default_end];
+        assert!(app_settings_default_source.contains("theme: SettingsThemeMode::Light"));
+        assert!(app_settings_default_source.contains("theme_accent: SettingsThemeAccent::Blue"));
+
         let app_data_start = source.find("fn app_data_dir()").unwrap();
         let app_data_end = source[app_data_start..]
             .find("fn app_settings_path()")
@@ -16324,9 +21917,36 @@ mod ui_tests {
         assert!(open_points[2].y > open_points[0].y);
         assert!(closed_points[2].x > closed_points[0].x);
 
+        let header_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, TREE_HEADER_HEIGHT));
+        let layout = tree_header_layout(header_rect, true);
+        assert_eq!(layout.arrow.center().y, header_rect.center().y);
+        assert_eq!(layout.icon.center().y, header_rect.center().y);
+        assert_eq!(layout.label.center().y, header_rect.center().y);
+        assert_eq!(layout.action.unwrap().center().y, header_rect.center().y);
+        assert!(layout.icon.left() > layout.arrow.right());
+        assert!(layout.label.left() >= layout.icon.right() + 12.0);
+        assert!(layout.action.unwrap().right() <= header_rect.right() - TREE_HEADER_LEFT_INSET);
+
         let source = include_str!("app.rs");
         assert!(!source.contains("small_button(self.tr(\"branch.create\")"));
         assert!(!source.contains("small_button(self.tr(\"tag.create\")"));
+
+        let tree_start = source.find("fn tree_header_inner(").unwrap();
+        let tree_end = source[tree_start..].find("fn tree_empty(").unwrap();
+        let tree_source = &source[tree_start..tree_start + tree_end];
+        assert!(tree_source.contains("tree_header_layout(rect, action.is_some())"));
+        assert!(!tree_source.contains("ui.horizontal("));
+        assert!(!tree_source.contains("ui.add_space("));
+
+        let remote_group_start = source.find("fn remote_branch_group_row(").unwrap();
+        let remote_group_end = source[remote_group_start..]
+            .find("fn remote_branch_row(")
+            .unwrap();
+        let remote_group_source =
+            &source[remote_group_start..remote_group_start + remote_group_end];
+        assert!(remote_group_source.contains("branch_group_header_layout("));
+        assert!(!remote_group_source.contains("ui.horizontal("));
+        assert!(!remote_group_source.contains("ui.add_space("));
 
         let start = source.find("fn sidebar_nav_card(").unwrap();
         let end = source.find("fn repo_tab_with_close(").unwrap();
@@ -16345,6 +21965,23 @@ mod ui_tests {
         assert!(implementation_source.contains("fn allocate_clipped_ui_at_rect("));
         assert!(implementation_source.contains("rect.intersect(ui.clip_rect())"));
 
+        assert!(implementation_source.contains("fn paint_sidebar_row_text("));
+
+        let panel_start = implementation_source
+            .find("fn exact_panel_at_rect(")
+            .unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn panel_shadow(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        assert!(panel_source.contains("allocate_clipped_ui_at_rect(ui, inner_rect"));
+    }
+
+    #[test]
+    fn sidebar_fixed_tree_rows_do_not_run_nested_layouts_inside_row_rects() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
         for (start_marker, end_marker) in [
             ("fn tree_header_inner(", "fn tree_empty("),
             ("fn remote_branch_group_row(", "fn remote_branch_row("),
@@ -16360,21 +21997,14 @@ mod ui_tests {
                 .unwrap_or_else(|| panic!("{end_marker}"));
             let block = &implementation_source[start..start + end];
             assert!(
-                block.contains("allocate_clipped_ui_at_rect(ui, rect"),
-                "{start_marker} must keep row rendering clipped to the parent ScrollArea"
+                !block.contains("allocate_clipped_ui_at_rect(ui, rect"),
+                "{start_marker} must paint into its allocated rect without nested row Ui"
             );
-            assert!(!block.contains("ui.set_clip_rect(rect)"));
-            assert!(!block.contains("egui::UiBuilder::new().max_rect(rect)"));
+            assert!(
+                !block.contains("ui.horizontal(") && !block.contains("ui.vertical("),
+                "{start_marker} must not allocate child layouts inside a fixed sidebar row"
+            );
         }
-
-        let panel_start = implementation_source
-            .find("fn exact_panel_at_rect(")
-            .unwrap();
-        let panel_end = implementation_source[panel_start..]
-            .find("fn panel_shadow(")
-            .unwrap();
-        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
-        assert!(panel_source.contains("allocate_clipped_ui_at_rect(ui, inner_rect"));
     }
 
     #[test]
@@ -16461,6 +22091,10 @@ mod ui_tests {
         let branch_row_source =
             &implementation_source[branch_row_start..branch_row_start + branch_row_end];
 
+        assert!(
+            branch_row_source.contains("let name_left = rect.left() + 16.0 + depth as f32 * 14.0;")
+        );
+        assert!(!branch_row_source.contains("if current { 22.0 } else { 16.0 }"));
         assert!(branch_row_source.contains("paint_branch_name(ui, name_rect, name_text);"));
         assert!(!branch_row_source.contains("egui::Label::new(name_text).truncate()"));
         assert!(!branch_row_source.contains("ui.add_sized("));
@@ -16718,12 +22352,13 @@ mod ui_tests {
         let workspace_source =
             &implementation_source[workspace_start..workspace_start + workspace_end];
 
-        assert!(implementation_source.contains("const WORKSPACE_HEADER_TOP_GAP: f32 = 4.0;"));
-        assert!(implementation_source.contains("const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 6.0;"));
-        assert!(implementation_source.contains("const WORKSPACE_HEADER_TITLE_SIZE: f32 = 20.0;"));
+        assert!(implementation_source.contains("const WORKSPACE_HEADER_TOP_GAP: f32 = 1.0;"));
+        assert!(implementation_source.contains("const WORKSPACE_HEADER_BOTTOM_GAP: f32 = 3.0;"));
+        assert!(implementation_source.contains("const WORKSPACE_HEADER_TITLE_SIZE: f32 = 18.0;"));
         assert!(workspace_source.contains("ui.add_space(WORKSPACE_HEADER_TOP_GAP);"));
         assert!(workspace_source.contains("ui.add_space(WORKSPACE_HEADER_BOTTOM_GAP);"));
         assert!(workspace_source.contains(".size(WORKSPACE_HEADER_TITLE_SIZE)"));
+        assert!(implementation_source.contains("let height = 26.0;"));
         assert!(!workspace_source.contains(".heading()"));
     }
 
@@ -16938,6 +22573,82 @@ mod ui_tests {
     }
 
     #[test]
+    fn history_ref_labels_are_kind_filtered_and_colored() {
+        let commit = Commit {
+            refs: vec![
+                "HEAD -> main".to_owned(),
+                "origin/main".to_owned(),
+                "tag: v1.0.0".to_owned(),
+            ],
+            ..Commit::default()
+        };
+
+        assert_eq!(
+            commit_refs_for_display(&commit, true, true, true),
+            vec![
+                HistoryRefLabel {
+                    name: "main".to_owned(),
+                    kind: HistoryRefKind::Branch,
+                },
+                HistoryRefLabel {
+                    name: "origin/main".to_owned(),
+                    kind: HistoryRefKind::Branch,
+                },
+                HistoryRefLabel {
+                    name: "v1.0.0".to_owned(),
+                    kind: HistoryRefKind::Tag,
+                },
+            ]
+        );
+        assert_eq!(
+            commit_refs_for_display(&commit, false, true, true)
+                .into_iter()
+                .map(|label| label.name)
+                .collect::<Vec<_>>(),
+            vec!["main".to_owned(), "v1.0.0".to_owned()]
+        );
+        assert_eq!(
+            commit_refs_for_display(&commit, true, false, true)
+                .into_iter()
+                .map(|label| label.name)
+                .collect::<Vec<_>>(),
+            vec!["v1.0.0".to_owned()]
+        );
+        assert_eq!(
+            commit_refs_for_display(&commit, true, true, false)
+                .into_iter()
+                .map(|label| label.name)
+                .collect::<Vec<_>>(),
+            vec!["main".to_owned(), "origin/main".to_owned()]
+        );
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let desc_start = implementation_source
+            .find("fn draw_history_description(")
+            .unwrap();
+        let desc_end = implementation_source[desc_start..]
+            .find("fn history_ref_badge_label_for_width(")
+            .unwrap();
+        let desc_source = &implementation_source[desc_start..desc_start + desc_end];
+        let row_start = implementation_source
+            .find("fn history_commit_table_row(")
+            .unwrap();
+        let row_end = implementation_source[row_start..]
+            .find("fn draw_history_graph_cell(")
+            .unwrap();
+        let row_source = &implementation_source[row_start..row_start + row_end];
+
+        assert!(implementation_source.contains("history_show_branch_refs: bool"));
+        assert!(implementation_source.contains("history_show_tag_refs: bool"));
+        assert!(row_source.contains("show_branch_refs"));
+        assert!(row_source.contains("show_tag_refs"));
+        assert!(desc_source.contains("history_ref_badge_fill("));
+        assert!(desc_source.contains("HistoryRefKind::Tag"));
+        assert!(desc_source.contains("paint_ui_icon(ui, icon_rect, UiIcon::Tag"));
+    }
+
+    #[test]
     fn history_sort_dropdown_offers_date_and_topology_order() {
         assert_eq!(
             history_sort_order_label(Language::Chinese, HistorySortOrder::Date),
@@ -17040,6 +22751,28 @@ mod ui_tests {
             .unwrap();
         let row_source = &source[row_start..row_start + row_end];
         assert!(row_source.contains("history_cherry_pick_checkbox_at"));
+        assert!(row_source.contains("history_batch_selected_row_fill()"));
+        assert!(row_source.contains("history_batch_selected_text_color()"));
+        assert!(!row_source.contains("Color32::from_rgb(32, 56, 38)"));
+    }
+
+    #[test]
+    fn history_cherry_pick_checkboxes_use_shadow_not_border() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let checkbox_start = implementation_source
+            .find("fn history_cherry_pick_checkbox_at(")
+            .unwrap();
+        let checkbox_end = implementation_source[checkbox_start..]
+            .find("#[derive(Clone, Copy, Debug)]\nstruct SearchColumnWidths")
+            .unwrap();
+        let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
+
+        assert!(checkbox_source.contains("paint_action_checkbox_square("));
+        assert!(checkbox_source.contains("on_hover_cursor(egui::CursorIcon::PointingHand)"));
+        assert!(!checkbox_source.contains("rect_stroke("));
+        assert!(!checkbox_source.contains("StrokeKind::Inside"));
+        assert!(!checkbox_source.contains("theme::muted()"));
     }
 
     #[test]
@@ -17145,6 +22878,8 @@ mod ui_tests {
             .unwrap();
         let commit_source = &implementation_source[commit_start..commit_start + commit_end];
         assert!(commit_source.contains("self.loading_repo || self.remote_git_busy()"));
+        assert!(commit_source.contains("current_named_local_branch(snapshot)"));
+        assert!(commit_source.contains("push.detached_error"));
         assert!(commit_source.contains("self.start_remote_git_action(move |root|"));
         assert!(!commit_source.contains("self.execute_git_action(move |root|"));
 
@@ -17237,10 +22972,15 @@ mod ui_tests {
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
 
-        assert!(implementation_source.contains("const WORKSPACE_LIST_COMMIT_GAP: f32 = 2.0;"));
+        assert!(implementation_source.contains("const WORKSPACE_LIST_COMMIT_GAP: f32 = 7.0;"));
+        assert!(implementation_source.contains("const WORKSPACE_TABLE_GAP: f32 = 13.0;"));
         assert!(
             implementation_source
                 .contains("let list_commit_gap = WORKSPACE_LIST_COMMIT_GAP.min(available_height);")
+        );
+        assert!(
+            implementation_source
+                .contains("let table_gap = WORKSPACE_TABLE_GAP.min(list_rect.height());")
         );
         assert!(workspace_source.contains("workspace_main_layout("));
         assert!(
@@ -17303,6 +23043,66 @@ mod ui_tests {
         assert!(
             theme_source.contains("visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE)")
         );
+    }
+
+    #[test]
+    fn input_placeholder_for_label_is_localized() {
+        assert_eq!(
+            placeholder_for_label(Language::Chinese, "\u{5206}\u{652f}\u{540d}\u{79f0}:"),
+            "\u{8bf7}\u{8f93}\u{5165}\u{5206}\u{652f}\u{540d}\u{79f0}"
+        );
+        assert_eq!(
+            placeholder_for_label(Language::English, "Branch name:"),
+            "Enter Branch name"
+        );
+    }
+
+    #[test]
+    fn editable_text_inputs_have_non_empty_placeholders() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for missing in [
+            "TextEdit::singleline(&mut self.clone_url),",
+            "TextEdit::singleline(&mut self.clone_destination),",
+            "ui.add(TextEdit::singleline(name));",
+            "TextEdit::singleline(&mut dialog.output_path),",
+            "TextEdit::singleline(&mut dialog.folder_prefix),",
+            "TextEdit::singleline(&mut dialog.target_commit),",
+            "TextEdit::singleline(&mut dialog.rename_threshold),",
+            "ui.add(TextEdit::singleline(local_branch));",
+            "ui.add(TextEdit::singleline(new_name));",
+            "TextEdit::singleline(local_branch),",
+            "themed_singleline_text_edit(name, \"\")",
+            "themed_singleline_text_edit(value, \"\")",
+            "TextEdit::singleline(message).hint_text(hint)",
+        ] {
+            assert!(
+                !implementation_source.contains(missing),
+                "missing placeholder pattern still present: {missing}"
+            );
+        }
+
+        assert!(implementation_source.contains("placeholder_for_label(self.language"));
+        assert!(implementation_source.contains("placeholder_for_label(language"));
+    }
+
+    #[test]
+    fn commit_checkbox_unchecked_edges_use_theme_shadow_not_white_highlight() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let checkbox_start = implementation_source.find("fn commit_checkbox(").unwrap();
+        let checkbox_end = implementation_source[checkbox_start..]
+            .find("fn source_tab_button(")
+            .unwrap();
+        let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
+        let unchecked_edge_source =
+            &checkbox_source[..checkbox_source.find("let check_color").unwrap()];
+
+        assert!(unchecked_edge_source.contains("let edge_stroke ="));
+        assert!(unchecked_edge_source.contains("theme::inset_shadow()"));
+        assert!(!unchecked_edge_source.contains("Color32::WHITE"));
+        assert!(checkbox_source.contains("let check_color = Color32::WHITE;"));
     }
 
     #[test]
@@ -17472,6 +23272,22 @@ mod ui_tests {
     }
 
     #[test]
+    fn update_skips_reapplying_unchanged_theme_during_window_drag_frames() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let update_start = implementation_source
+            .find("impl App for GitAgentApp")
+            .unwrap();
+        let update_end = implementation_source[update_start..]
+            .find("impl GitAgentApp")
+            .unwrap();
+        let update_source = &implementation_source[update_start..update_start + update_end];
+
+        assert!(update_source.contains("theme::apply_if_needed("));
+        assert!(!update_source.contains("theme::apply(ctx"));
+    }
+
+    #[test]
     fn repository_source_list_filters_cached_repositories_without_disk_scan() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -17499,9 +23315,242 @@ mod ui_tests {
         let compact_filter_source = filter_source.split_whitespace().collect::<String>();
 
         assert!(app_source.contains("known_repositories: Vec<KnownRepository>"));
+        assert!(app_source.contains("repository_workspaces: Vec<PathBuf>"));
         assert!(compact_filter_source.contains("self.known_repositories.iter()"));
         assert!(!filter_source.contains("scan_repository_children("));
         assert!(refresh_source.contains("scan_repository_children("));
+    }
+
+    #[test]
+    fn local_repository_source_groups_repositories_by_workspace_tabs() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let known_start = implementation_source
+            .find("struct KnownRepository")
+            .unwrap();
+        let known_end = implementation_source[known_start..]
+            .find("type RemoteGitTaskResult")
+            .unwrap();
+        let known_source = &implementation_source[known_start..known_start + known_end];
+        let app_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let app_end = implementation_source[app_start..]
+            .find("#[derive(Clone, Debug)]")
+            .unwrap();
+        let app_source = &implementation_source[app_start..app_start + app_end];
+        let local_start = implementation_source
+            .find("fn local_repository_source_page(")
+            .unwrap();
+        let local_end = implementation_source[local_start..]
+            .find("fn remote_repository_source_page(")
+            .unwrap();
+        let local_source = &implementation_source[local_start..local_start + local_end];
+        let filter_start = implementation_source
+            .find("fn filtered_known_repositories(")
+            .unwrap();
+        let filter_end = implementation_source[filter_start..]
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let filter_source = &implementation_source[filter_start..filter_start + filter_end];
+        let refresh_start = implementation_source
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let refresh_end = implementation_source[refresh_start..]
+            .find("fn sidebar(")
+            .unwrap();
+        let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
+
+        assert!(known_source.contains("workspace_index: Option<usize>"));
+        assert!(app_source.contains("active_repository_workspace_index: usize"));
+        assert!(local_source.contains("repository_workspace_tab_strip("));
+        assert!(local_source.contains("self.active_repository_workspace_index"));
+        assert!(filter_source.contains("workspace_index == Some(workspace_index)"));
+        assert!(refresh_source.contains(".enumerate()"));
+        assert!(refresh_source.contains("scan_repository_children(workspace_index, workspace"));
+        assert!(implementation_source.contains("fn workspace_repository_tab_button("));
+        assert!(implementation_source.contains("fn repository_workspace_tab_label("));
+        assert!(implementation_source.contains("fn repository_workspace_tab_strip("));
+        assert!(implementation_source.contains("fn known_repository_workspace_index("));
+    }
+
+    #[test]
+    fn repository_source_uses_global_workspaces_and_default_folder_dialog() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let app_settings_start = implementation_source.find("struct AppSettings").unwrap();
+        let app_settings_end = implementation_source[app_settings_start..]
+            .find("impl Default for AppSettings")
+            .unwrap();
+        let app_settings_source =
+            &implementation_source[app_settings_start..app_settings_start + app_settings_end];
+        let refresh_start = implementation_source
+            .find("fn refresh_known_repositories(")
+            .unwrap();
+        let refresh_end = implementation_source[refresh_start..]
+            .find("fn sidebar(")
+            .unwrap();
+        let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
+        let view_start = implementation_source
+            .find("fn repository_source_view(")
+            .unwrap();
+        let view_end = implementation_source[view_start..]
+            .find("fn local_repository_source_page(")
+            .unwrap();
+        let view_source = &implementation_source[view_start..view_start + view_end];
+        let global_start = implementation_source
+            .find("fn global_settings_page")
+            .unwrap();
+        let global_end = implementation_source[global_start..]
+            .find("fn repo_remotes_settings_page")
+            .unwrap();
+        let global_source = &implementation_source[global_start..global_start + global_end];
+
+        assert!(app_settings_source.contains("workspaces: Vec<PathBuf>"));
+        assert!(implementation_source.contains(
+            "repository_workspaces: normalized_repository_workspaces(&app_settings.workspaces)"
+        ));
+        assert!(implementation_source.contains("workspaces: self.repository_workspaces.clone()"));
+        assert!(implementation_source.contains("fn normalized_repository_workspaces("));
+        assert!(implementation_source.contains("fn user_facing_path_string("));
+        assert!(implementation_source.contains("fn repository_folder_dialog("));
+        assert!(implementation_source.contains(".set_directory(workspace)"));
+        assert!(global_source.contains("self.global_repository_workspaces_settings(ui);"));
+        assert!(global_source.contains("user_facing_path_string(workspace)"));
+        assert!(global_source.contains("settings_path_label("));
+        assert!(refresh_source.contains("self.repository_workspaces.iter().enumerate()"));
+        assert!(refresh_source.contains("scan_repository_children(workspace_index, workspace"));
+        assert!(!refresh_source.contains("env::current_dir()"));
+        assert!(view_source.contains("self.repository_folder_dialog().pick_folder()"));
+
+        let path = PathBuf::from(r"\\?\D:\workspace");
+        assert_eq!(user_facing_path_string(&path), r"D:\workspace");
+        let unc_path = PathBuf::from(r"\\?\UNC\server\share");
+        assert_eq!(user_facing_path_string(&unc_path), r"\\server\share");
+    }
+
+    #[test]
+    fn workspace_repository_quick_panel_uses_workspace_tabs_and_cached_status() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let app_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let app_end = implementation_source[app_start..]
+            .find("#[derive(Clone, Debug)]")
+            .unwrap();
+        let app_source = &implementation_source[app_start..app_start + app_end];
+        let layout_start = implementation_source.find("fn main_layout(").unwrap();
+        let layout_end = implementation_source[layout_start..]
+            .find("fn top_bar(")
+            .unwrap();
+        let layout_source = &implementation_source[layout_start..layout_start + layout_end];
+        let panel_start = implementation_source
+            .find("fn workspace_repositories_panel(")
+            .unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn filtered_workspace_panel_repositories(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        let row_start = implementation_source
+            .find("fn workspace_repository_status_row(")
+            .unwrap();
+        let row_end = implementation_source[row_start..]
+            .find("fn form_row(")
+            .unwrap();
+        let row_source = &implementation_source[row_start..row_start + row_end];
+
+        assert!(app_source.contains("show_workspace_repositories: bool"));
+        assert!(app_source.contains("workspace_repository_search: String"));
+        assert!(app_source.contains("next_workspace_repo_status_load_at: Instant"));
+        assert!(layout_source.contains("workspace_repositories_panel("));
+        assert!(layout_source.contains("workspace_repositories_drawer_rect(full)"));
+        assert!(layout_source.contains("workspace_repositories_drawer_should_close("));
+        assert!(layout_source.contains("workspace_repositories_drawer_at_rect("));
+        assert!(implementation_source.contains("fn workspace_repositories_drawer_shadow("));
+        assert!(implementation_source.contains("offset: [-5, 5]"));
+        assert!(layout_source.contains("main_layout_rects(\n            full,"));
+        assert!(!layout_source.contains("let main_rect ="));
+        assert!(panel_source.contains("repository_workspace_tab_strip("));
+        assert!(panel_source.contains("self.maybe_start_workspace_repository_status_load("));
+        assert!(panel_source.contains(".show_rows("));
+        assert!(panel_source.contains("WORKSPACE_REPOSITORY_ROW_HEIGHT"));
+        assert!(panel_source.contains("repositories.len()"));
+        assert!(panel_source.contains("let row_origin = ui.cursor().min"));
+        assert!(panel_source.contains("for (row_offset, index) in row_range.enumerate()"));
+        assert!(panel_source.contains("row_offset as f32 * WORKSPACE_REPOSITORY_ROW_HEIGHT"));
+        assert!(panel_source.contains("Rect::from_min_size("));
+        assert!(!panel_source.contains("missing_status_paths"));
+        assert!(!panel_source.contains("for path in missing_status_paths"));
+        assert!(panel_source.contains("load_path = Some(repository.root.clone())"));
+        assert!(panel_source.contains("self.load_repository(path)"));
+        assert!(implementation_source.contains("fn workspace_repository_snapshot_for("));
+        assert!(implementation_source.contains("paths_equal(&snapshot.root, root)"));
+        assert!(implementation_source.contains("fn maybe_start_workspace_repository_status_load("));
+        assert!(implementation_source.contains("Duration::from_millis(250)"));
+        assert!(row_source.contains("snapshot.branch"));
+        assert!(row_source.contains("snapshot.unstaged.len()"));
+        assert!(row_source.contains("upstream_sync_counts(Some(snapshot))"));
+        assert!(row_source.contains("user_facing_path_string(&repository.root)"));
+        assert!(!row_source.contains("\\u{25cf}"));
+        assert!(!row_source.contains("workspace_repository_status_meta_line("));
+        assert!(!row_source.contains("workspace_repository_sync_counts_line("));
+        assert!(row_source.contains("workspace_repository_unstaged_badge_line("));
+        assert!(row_source.contains("workspace_repository_branch_sync_line("));
+        assert!(row_source.contains("workspace_repository_unstaged_color()"));
+        assert!(row_source.contains("workspace_repository_branch_badges("));
+        assert!(row_source.contains("let top_line_top = body_rect.top() + 3.0;"));
+        assert!(row_source.contains("let branch_line_top = body_rect.top() + 25.0;"));
+        assert!(row_source.contains("name_rect"));
+        assert!(!row_source.contains("sync_rect"));
+        assert!(implementation_source.contains("UiIcon::UnstagedFile"));
+        assert!(implementation_source.contains(
+            "UiIcon::UnstagedFile => egui::include_image!(\"../assets/icons/unstaged-file.svg\")"
+        ));
+        assert!(row_source.contains("WORKSPACE_REPOSITORY_ROW_HEIGHT"));
+        assert!(row_source.contains("ui.interact("));
+        assert!(!row_source.contains("allocate_exact_size("));
+        assert!(!row_source.contains("ui.advance_cursor_after_rect(rect)"));
+        assert!(row_source.contains("workspace_repository_row_body_rect(rect)"));
+        assert!(row_source.contains("body_rect.left()"));
+        assert!(row_source.contains("body_rect.top()"));
+        assert!(row_source.contains("paint_workspace_repository_row_debug_guides("));
+        assert!(row_source.contains("workspace_repository_text_line("));
+        assert!(row_source.contains("let path_rect = Rect::from_min_max("));
+        assert!(row_source.contains("workspace_repository_path_text_line("));
+        assert!(row_source.contains("workspace_repository_row_hover_rect(rect)"));
+        assert!(row_source.contains("elide_end_to_width("));
+        assert!(row_source.contains("with_clip_rect"));
+        assert!(!row_source.contains("rect.shrink2(Vec2::new(1.0, 2.0))"));
+        assert!(!row_source.contains("line_rect(44.0, 62.0)"));
+
+        let desktop = Rect::from_min_size(Pos2::ZERO, Vec2::new(1360.0, 760.0));
+        let drawer = workspace_repositories_drawer_rect(desktop);
+        assert!(drawer.width() >= 520.0);
+        assert!(drawer.width() <= 720.0);
+        let row = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(560.0, WORKSPACE_REPOSITORY_ROW_HEIGHT),
+        );
+        let hover = workspace_repository_row_hover_rect(row);
+        assert!((WORKSPACE_REPOSITORY_ROW_GAP - 0.0).abs() < f32::EPSILON);
+        assert!(WORKSPACE_REPOSITORY_ROW_HEIGHT <= 46.0);
+        assert!(hover.height() <= 44.0);
+        assert!(hover.top() >= row.top());
+        assert!(hover.bottom() <= row.bottom());
+        assert!(row.bottom() - hover.bottom() <= 1.0);
+        assert!(implementation_source.contains("fn paint_workspace_repository_row_debug_guides("));
+        assert!(
+            implementation_source.contains("paint_layout_debug_rect(ui, row_rect, \"repo.row\"")
+        );
+        assert!(
+            implementation_source.contains("paint_layout_debug_rect(ui, body_rect, \"repo.body\"")
+        );
+        assert!(implementation_source.contains("workspace_repository_debug_line("));
+        assert!(implementation_source.contains("repo.row.top"));
+        assert!(implementation_source.contains("\"repo.row.bottom\""));
+        assert!(implementation_source.contains("\"repo.body.top\""));
+        assert!(implementation_source.contains("\"repo.body.bottom\""));
     }
 
     #[test]
@@ -17835,6 +23884,1158 @@ mod ui_tests {
     }
 
     #[test]
+    fn view_menu_owns_refresh_navigation_and_history_label_toggles() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let file_start = menu_source
+            .find("menu_label(self.language, \"file\")")
+            .unwrap();
+        let view_start = menu_source
+            .find("menu_label(self.language, \"view\")")
+            .unwrap();
+        let file_source = &menu_source[file_start..view_start];
+        let view_end = menu_source[view_start..]
+            .find("menu_label(self.language, \"repo\")")
+            .unwrap();
+        let view_source = &menu_source[view_start..view_start + view_end];
+        let shortcut_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcut_end = implementation_source[shortcut_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcut_source = &implementation_source[shortcut_start..shortcut_start + shortcut_end];
+
+        assert!(!menu_source.contains("menu_label(self.language, \"edit\")"));
+        assert!(!file_source.contains("action.refresh"));
+        for required in [
+            "action.refresh",
+            "\"F5\"",
+            "\"Ctrl+Tab\"",
+            "\"Ctrl+Shift+Tab\"",
+            "\"Ctrl+1\"",
+            "\"Ctrl+2\"",
+            "\"Ctrl+3\"",
+            "\"Ctrl+B\"",
+            "view_workspace",
+            "view_history",
+            "view_search",
+            "show_branch_labels",
+            "show_tag_labels",
+            "history_show_branch_refs",
+            "history_show_tag_refs",
+            "show_workspace_repositories",
+        ] {
+            assert!(view_source.contains(required), "{required}");
+        }
+        assert!(!view_source.contains("dark_theme"));
+        assert!(!view_source.contains("light_theme"));
+        for required in [
+            "egui::Key::F5",
+            "egui::Key::Tab",
+            "egui::Key::Num1",
+            "egui::Key::Num2",
+            "egui::Key::Num3",
+            "egui::Key::B",
+            "self.switch_to_next_tab();",
+            "self.switch_to_previous_tab();",
+            "self.active_view = MainView::Workspace;",
+            "self.active_view = MainView::History;",
+            "self.active_view = MainView::Search;",
+            "self.show_workspace_repositories = !self.show_workspace_repositories;",
+        ] {
+            assert!(shortcut_source.contains(required), "{required}");
+        }
+
+        assert_eq!(
+            menu_label(Language::Chinese, "view_workspace"),
+            "\u{5de5}\u{4f5c}\u{533a}"
+        );
+        assert_eq!(menu_label(Language::English, "view_workspace"), "Workspace");
+    }
+
+    #[test]
+    fn repository_menu_exposes_sourcetree_actions_and_known_wirings() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let repo_start = menu_source
+            .find("menu_label(self.language, \"repo\")")
+            .unwrap();
+        let actions_start = menu_source[repo_start..]
+            .find("menu_label(self.language, \"actions\")")
+            .unwrap();
+        let repo_source = &menu_source[repo_start..repo_start + actions_start];
+        let normalized_repo_source = repo_source.replace("\r\n", "\n");
+
+        for required in [
+            "repo_settings",
+            "repo_view_online",
+            "repo_stage_toggle",
+            "repo_discard",
+            "repo_stash_changes",
+            "repo_push",
+            "repo_pull",
+            "repo_fetch",
+            "repo_checkout",
+            "repo_branch",
+            "repo_merge",
+            "repo_tag",
+            "repo_archive",
+            "repo_interactive_rebase",
+            "repo_add_submodule",
+            "repo_add_link_subtree",
+            "repo_git_lfs",
+            "repo_lfs_initialize",
+            "repo_git_flow",
+            "repo_git_flow_initialize",
+            "repo_git_flow_next_action",
+            "repo_create_pull_request",
+            "repo_benchmark_performance",
+            "self.open_repo_settings_from_menu();",
+            "self.open_remote_url();",
+            "self.stage_toggle_current_repository();",
+            "has_worktree_changes",
+            "WorktreeActionDialog::ConfirmDiscardAll",
+            "self.handle_stash_action(StashMenuAction::Create);",
+            "menu_shortcut_button(",
+            "\"Ctrl+Shift+C\"",
+            "\"Ctrl+P\"",
+            "\"Ctrl+L\"",
+            "\"Ctrl+F\"",
+            "self.push_current();",
+            "self.pull_current();",
+            "self.fetch_all();",
+            "self.open_merge_dialog();",
+            "self.open_archive_dialog();",
+            "self.open_submodule_dialog();",
+            "self.open_subtree_dialog();",
+            "self.handle_branch_action(BranchMenuAction::Create);",
+            "self.handle_tag_action(TagMenuAction::Create);",
+            "self.create_pull_request_current_branch();",
+        ] {
+            assert!(repo_source.contains(required), "{required}");
+        }
+        assert!(!repo_source.contains("repo_add_remote"));
+        assert!(!repo_source.contains("self.begin_add_remote_settings();"));
+        assert!(!repo_source.contains("repo_commit_all"));
+        assert!(!repo_source.contains("repo_commit_staged"));
+        assert!(!repo_source.contains("repo_details"));
+        assert!(!repo_source.contains("repo_refresh_remote_status"));
+        assert!(!repo_source.contains("ui.separator();"));
+        assert!(normalized_repo_source.contains("menu_text_button("));
+        assert!(normalized_repo_source.contains("git_dialog_enabled && has_worktree_changes"));
+        assert!(normalized_repo_source.contains("menu_label(self.language, \"repo_discard\")"));
+
+        let stage_toggle_start = implementation_source
+            .find("fn stage_toggle_current_repository(&mut self)")
+            .unwrap();
+        let stage_toggle_end = implementation_source[stage_toggle_start..]
+            .find("fn open_remote_url(")
+            .unwrap();
+        let stage_toggle_source =
+            &implementation_source[stage_toggle_start..stage_toggle_start + stage_toggle_end];
+        assert!(stage_toggle_source.contains("shortcut_stage_toggle_action"));
+        assert!(stage_toggle_source.contains("self.handle_worktree_action(action);"));
+        assert!(stage_toggle_source.contains("self.focus_commit_message = true;"));
+
+        let pr_start = implementation_source
+            .find("fn create_pull_request_current_branch(")
+            .unwrap();
+        let pr_end = implementation_source[pr_start..]
+            .find("fn default_remote_web_url(")
+            .unwrap();
+        let pr_source = &implementation_source[pr_start..pr_start + pr_end];
+        assert!(pr_source.contains("let branch = snapshot.branch.clone();"));
+        assert!(pr_source.contains("self.open_branch_pull_request_url(&branch);"));
+
+        assert_eq!(
+            menu_label(Language::Chinese, "repo_stash_changes"),
+            "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}..."
+        );
+        assert_eq!(
+            menu_label(Language::Chinese, "repo_stage_toggle"),
+            "\u{6682}\u{5b58}\u{6240}\u{6709}/\u{53d6}\u{6d88}\u{6682}\u{5b58}\u{6240}\u{6709}"
+        );
+        assert_eq!(
+            menu_label(Language::Chinese, "repo_view_online"),
+            "\u{5728}\u{7ebf}\u{67e5}\u{770b}\u{4ed3}\u{5e93}"
+        );
+        assert_eq!(
+            menu_label(Language::Chinese, "repo_benchmark_performance"),
+            "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}"
+        );
+        assert_eq!(
+            menu_label(Language::English, "repo_git_flow_next_action"),
+            "Next Action..."
+        );
+    }
+
+    #[test]
+    fn top_level_menus_use_no_border_shadow_popup_style() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let top_menu_button_start = implementation_source.find("fn top_menu_button(").unwrap();
+        let top_menu_button_end = implementation_source[top_menu_button_start..]
+            .find("fn menu_button(")
+            .unwrap();
+        let top_menu_button_source = &implementation_source
+            [top_menu_button_start..top_menu_button_start + top_menu_button_end];
+        let menu_button_start = implementation_source.find("fn menu_button(").unwrap();
+        let menu_button_end = implementation_source[menu_button_start..]
+            .find("fn menu_shortcut_button(")
+            .unwrap();
+        let menu_button_source =
+            &implementation_source[menu_button_start..menu_button_start + menu_button_end];
+        let shortcut_start = implementation_source
+            .find("fn menu_shortcut_button(")
+            .unwrap();
+        let shortcut_end = implementation_source[shortcut_start..]
+            .find("fn menu_label(")
+            .unwrap();
+        let shortcut_source = &implementation_source[shortcut_start..shortcut_start + shortcut_end];
+        let text_button_start = implementation_source
+            .find("fn menu_text_button_with_text(")
+            .unwrap();
+        let text_button_end = implementation_source[text_button_start..]
+            .find("fn menu_shortcut_button(")
+            .unwrap();
+        let text_button_source =
+            &implementation_source[text_button_start..text_button_start + text_button_end];
+        let menu_visuals_start = implementation_source
+            .find("fn apply_menu_visuals(")
+            .unwrap();
+        let menu_visuals_end = implementation_source[menu_visuals_start..]
+            .find("fn menu_text_button_hover_fill(")
+            .unwrap();
+        let menu_visuals_source =
+            &implementation_source[menu_visuals_start..menu_visuals_start + menu_visuals_end];
+        let desktop_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let desktop_end = implementation_source[desktop_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let desktop_source = &implementation_source[desktop_start..desktop_start + desktop_end];
+        let shadow = text_button_hover_shadow();
+
+        assert!(source.contains("fn top_menu_button("));
+        assert!(top_menu_button_source.contains("popup_below_widget("));
+        assert!(top_menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
+        assert!(!top_menu_button_source.contains("ui.menu_button("));
+        assert!(source.contains("fn menu_text_button("));
+        assert!(source.contains("fn menu_text_button_hover_fill("));
+        assert!(menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
+        assert!(menu_button_source.contains("ui.visuals_mut().window_shadow = panel_shadow()"));
+        assert!(menu_button_source.contains("ui.visuals_mut().popup_shadow = panel_shadow()"));
+        assert!(menu_button_source.contains("widgets.hovered.bg_stroke = Stroke::NONE"));
+        assert!(menu_button_source.contains("widgets.open.bg_stroke = Stroke::NONE"));
+        assert!(menu_button_source.contains("widgets.active.bg_stroke = Stroke::NONE"));
+        assert!(menu_button_source.contains("selection.stroke = Stroke::NONE"));
+        assert!(menu_button_source.contains("paint_text_button_hover_shadow_for_response"));
+        assert!(menu_visuals_source.contains("menu_text_button_hover_fill()"));
+        assert!(shortcut_source.contains("menu_text_button_with_text("));
+        assert!(text_button_source.contains(".stroke(Stroke::NONE)"));
+        assert!(!text_button_source.contains(".fill(Color32::TRANSPARENT)"));
+        assert!(text_button_source.contains("paint_text_button_hover_shadow_for_response"));
+        assert!(source.contains("fn close_top_menu_popup("));
+        assert!(source.contains("memory.close_popup()"));
+        assert!(text_button_source.contains("if response.clicked()"));
+        assert!(text_button_source.contains("close_top_menu_popup(ui);"));
+        assert!(!desktop_source.contains("ui.separator();"));
+        assert!(!desktop_source.contains("ui.button("));
+        assert!(!desktop_source.contains("egui::Button::new(menu_label"));
+        assert!(desktop_source.contains("top_menu_button("));
+        assert!(
+            !desktop_source
+                .contains("            menu_button(ui, menu_label(self.language, \"repo\")")
+        );
+        assert!(desktop_source.contains("menu_text_button("));
+        assert!(menu_text_button_hover_fill() != theme::panel_soft());
+        assert!(menu_text_button_hover_fill() != Color32::from_gray(230));
+        assert!(shadow.offset[0] > 0);
+        assert!(shadow.offset[1] > shadow.offset[0]);
+        assert!(shadow.blur >= 4);
+        assert_eq!(shadow.spread, 0);
+    }
+
+    #[test]
+    fn repository_merge_menu_opens_commit_picker_with_options() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_merge_action: Option<MergeActionDialog>",
+            "struct MergeActionDialog",
+            "fn open_merge_dialog(&mut self)",
+            "fn merge_action_modal(&mut self",
+            "self.merge_action_modal(ctx);",
+            "self.open_merge_dialog();",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("repo_merge"));
+        assert!(menu_source.contains("has_merge_targets"));
+        assert!(menu_source.contains("git_dialog_enabled && has_merge_targets"));
+        assert!(menu_source.contains("self.open_merge_dialog();"));
+
+        let dialog_start = implementation_source
+            .find("fn merge_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn stash_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "history_commit_browser(",
+            "merge.commit_immediately",
+            "merge.include_messages",
+            "merge.force_merge_commit",
+            "merge.rebase",
+            "merge.detect_renames",
+            "rename_threshold",
+            "git::MergeOptions",
+            "git::merge_commit(root, &hash, options)",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+        assert!(!dialog_source.contains("history_commit_table_row("));
+        assert!(!dialog_source.contains("history_commit_picker("));
+        assert!(dialog_source.contains("show_view_controls: true"));
+        assert!(dialog_source.contains("show_search: true"));
+        assert!(dialog_source.contains("show_cherry_pick: false"));
+        assert!(dialog_source.contains("show_jump: false"));
+        assert!(dialog_source.contains("merge_options_panel(ui, |ui|"));
+        assert!(!dialog_source.contains("ui.group(|ui|"));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "merge.title"),
+            "\u{9009}\u{62e9}\u{4e00}\u{4e2a}\u{63d0}\u{4ea4}\u{5408}\u{5e76}\u{5230}\u{5f53}\u{524d}\u{5206}\u{652f}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "merge.detect_renames"),
+            "\u{68c0}\u{6d4b}\u{76f8}\u{4f3c}\u{7684}\u{91cd}\u{547d}\u{540d}"
+        );
+    }
+
+    #[test]
+    fn repository_interactive_rebase_menu_opens_clean_worktree_dialog() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>",
+            "struct InteractiveRebaseActionDialog",
+            "fn open_interactive_rebase_dialog(&mut self)",
+            "fn interactive_rebase_action_modal(&mut self",
+            "self.interactive_rebase_action_modal(ctx);",
+            "self.open_interactive_rebase_dialog();",
+            "snapshot.unstaged.is_empty()",
+            "current_named_local_branch(snapshot)",
+            "snapshot.rebase_in_progress",
+            "pending_rebase_control_action: Option<RebaseControlDialog>",
+            "self.pending_rebase_control_action = Some(",
+            "fn rebase_control_modal(&mut self",
+            "interactive_rebase.error.detached",
+            "interactive_rebase_dirty_message",
+            "history_commit_browser(",
+            "git::interactive_rebase(root, &base, &todo_items)",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("repo_interactive_rebase"));
+        assert!(menu_source.contains(
+            "menu_text_button(\n                    ui,\n                    git_dialog_enabled,\n                    menu_label(self.language, \"repo_interactive_rebase\"),\n                )"
+        ));
+        assert!(!menu_source.contains("has_interactive_rebase_targets"));
+        assert!(!menu_source.contains("has_interactive_rebase_targets || rebase_in_progress"));
+        assert!(menu_source.contains(
+            "close_top_menu_popup(ui);\n                    self.open_interactive_rebase_dialog();"
+        ));
+        assert!(!menu_source.contains("menu_text_button(\n                    ui,\n                    false,\n                    menu_label(self.language, \"repo_interactive_rebase\"),\n                );"));
+
+        let dialog_start = implementation_source
+            .find("fn interactive_rebase_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn merge_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "show_view_controls: true",
+            "show_search: true",
+            "show_cherry_pick: false",
+            "show_jump: false",
+            "show_context_menu: false",
+            "interactive_rebase.todo.pick",
+            "interactive_rebase.todo.squash",
+            "interactive_rebase.todo.drop",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "interactive_rebase.title"),
+            "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}"
+        );
+        assert!(
+            i18n::t(Language::Chinese, "interactive_rebase.in_progress.detail")
+                .contains("git rebase")
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_requires_named_branch_and_excludes_merge_commits() {
+        let linear = sample_commit("linear", &["base"], "linear");
+        let side_branch = sample_commit("side", &["base"], "side branch");
+        let mut merge = sample_commit("merge", &["linear", "side"], "merge");
+        merge.refs.push("main".to_owned());
+        let snapshot = RepositorySnapshot {
+            branch: "main".to_owned(),
+            branches: vec![sample_branch("main", true)],
+            upstream: Some(git::UpstreamStatus {
+                name: "origin/main".to_owned(),
+                ahead: 2,
+                behind: 0,
+            }),
+            date_commits: vec![side_branch.clone(), merge.clone(), linear.clone()],
+            topology_commits: vec![merge.clone(), side_branch.clone(), linear.clone()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            current_named_local_branch(&snapshot).map(|branch| branch.name.as_str()),
+            Some("main")
+        );
+        assert_eq!(
+            interactive_rebase_dialog_commits(&snapshot, HistorySortOrder::Date)
+                .iter()
+                .map(|commit| commit.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["merge", "linear"]
+        );
+        assert!(interactive_rebase_commit_is_merge(&merge));
+        assert!(!interactive_rebase_commit_is_merge(&linear));
+        assert!(!interactive_rebase_first_parent_hashes(&snapshot).contains("side"));
+        assert_eq!(
+            interactive_rebase_actionable_commits(&interactive_rebase_dialog_commits(
+                &snapshot,
+                HistorySortOrder::Date
+            ))
+            .iter()
+            .map(|commit| commit.hash.as_str())
+            .collect::<Vec<_>>(),
+            vec!["linear"]
+        );
+        assert!(interactive_rebase_has_targets(&snapshot));
+
+        let mut no_local_commits = snapshot.clone();
+        no_local_commits.upstream = Some(git::UpstreamStatus {
+            name: "origin/main".to_owned(),
+            ahead: 0,
+            behind: 0,
+        });
+        assert!(
+            interactive_rebase_dialog_commits(&no_local_commits, HistorySortOrder::Date).is_empty()
+        );
+        assert!(!interactive_rebase_has_targets(&no_local_commits));
+
+        let mut rebasing = snapshot.clone();
+        rebasing.rebase_in_progress = true;
+        assert!(!interactive_rebase_has_targets(&rebasing));
+
+        let detached = RepositorySnapshot {
+            branch: "HEAD".to_owned(),
+            branches: vec![sample_branch("main", false)],
+            date_commits: vec![linear],
+            topology_commits: vec![merge],
+            ..Default::default()
+        };
+        assert!(current_named_local_branch(&detached).is_none());
+        assert!(!interactive_rebase_has_targets(&detached));
+    }
+
+    #[test]
+    fn interactive_rebase_omits_merge_commits_from_todo_and_batch_actions() {
+        let linear_old = sample_commit("old", &["base"], "old");
+        let merge = sample_commit("merge", &["left", "right"], "merge");
+        let linear_new = sample_commit("new", &["old"], "new");
+        let commits = vec![linear_new.clone(), merge.clone(), linear_old.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            selected_hash: linear_new.hash.clone(),
+            selected_short_hash: linear_new.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::new(),
+            selected_hashes: HashSet::new(),
+            validation_error: None,
+        };
+        dialog
+            .actions
+            .insert(merge.hash.clone(), InteractiveRebaseTodoAction::Drop);
+        dialog
+            .actions
+            .insert(linear_new.hash.clone(), InteractiveRebaseTodoAction::Squash);
+        dialog
+            .actions
+            .insert(linear_old.hash.clone(), InteractiveRebaseTodoAction::Pick);
+        dialog.selected_hashes.insert(linear_new.hash.clone());
+        dialog.selected_hashes.insert(merge.hash.clone());
+
+        assert_eq!(
+            interactive_rebase_base_for_commits(&commits),
+            Some("base".to_owned())
+        );
+        assert_eq!(
+            interactive_rebase_selected_actionable_hashes(&dialog, &commits),
+            vec!["new".to_owned()]
+        );
+        assert_eq!(
+            interactive_rebase_todo_items(&dialog, &commits)
+                .iter()
+                .map(|item| (item.hash.as_str(), item.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("old", git::InteractiveRebaseAction::Pick),
+                ("new", git::InteractiveRebaseAction::Squash)
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_dialog_exposes_batch_selection_and_disabled_merge_rows() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let struct_start = implementation_source
+            .find("struct InteractiveRebaseActionDialog")
+            .unwrap();
+        let struct_end = implementation_source[struct_start..]
+            .find("struct SubmoduleActionDialog")
+            .unwrap();
+        let struct_source = &implementation_source[struct_start..struct_start + struct_end];
+        assert!(struct_source.contains("selected_hashes: HashSet<String>"));
+
+        let modal_start = implementation_source
+            .find("fn interactive_rebase_action_modal(&mut self")
+            .unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn merge_action_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        for required in [
+            "interactive_rebase_disabled_hashes(&commits)",
+            "dialog.selected_hashes.retain",
+            "select_rows: true",
+            "disabled_hashes",
+            "interactive_rebase.selected_count",
+            "interactive_rebase.drop_selected",
+            "interactive_rebase.squash_selected",
+            "interactive_rebase.reset_selected",
+            "interactive_rebase.merge_commit_disabled",
+        ] {
+            assert!(modal_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn interactive_rebase_rechecks_stale_in_progress_snapshot_before_prompt() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let open_start = implementation_source
+            .find("fn open_interactive_rebase_dialog(&mut self)")
+            .unwrap();
+        let open_end = implementation_source[open_start..]
+            .find("fn open_archive_dialog(")
+            .unwrap();
+        let open_source = &implementation_source[open_start..open_start + open_end];
+
+        assert!(open_source.contains("git::repository_rebase_in_progress(&snapshot.root)"));
+        assert!(open_source.contains("self.load_repository_uncached(root);"));
+        assert!(open_source.contains("self.error = None;"));
+        assert!(
+            open_source
+                .find("git::repository_rebase_in_progress(&snapshot.root)")
+                .unwrap()
+                < open_source
+                    .find("self.pending_rebase_control_action = Some(")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_conflict_state_opens_control_dialog_and_reloads() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_rebase_control_action: Option<RebaseControlDialog>",
+            "struct RebaseControlDialog",
+            "fn rebase_control_modal(&mut self",
+            "self.rebase_control_modal(ctx);",
+            "git::rebase_continue(root)",
+            "git::rebase_skip(root)",
+            "git::rebase_abort(root)",
+            "interactive_rebase.in_progress.title",
+            "interactive_rebase.in_progress.continue",
+            "interactive_rebase.in_progress.skip",
+            "interactive_rebase.in_progress.abort",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let open_start = implementation_source
+            .find("fn open_interactive_rebase_dialog(&mut self)")
+            .unwrap();
+        let open_end = implementation_source[open_start..]
+            .find("fn open_archive_dialog(")
+            .unwrap();
+        let open_source = &implementation_source[open_start..open_start + open_end];
+        assert!(open_source.contains("self.pending_rebase_control_action = Some("));
+        assert!(
+            !open_source
+                .contains("interactive_rebase.error.in_progress")
+                .then_some(())
+                .is_some()
+        );
+
+        let task_start = implementation_source
+            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .unwrap();
+        let task_end = implementation_source[task_start..]
+            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .unwrap();
+        let task_source = &implementation_source[task_start..task_start + task_end];
+        assert!(task_source.contains("git::repository_rebase_in_progress(&root)"));
+        assert!(task_source.contains("self.load_repository_uncached(root);"));
+        assert!(task_source.contains("self.active_view = MainView::Workspace;"));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "interactive_rebase.in_progress.title"),
+            "\u{53d8}\u{57fa}\u{8fdb}\u{884c}\u{4e2d}"
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_success_prompts_for_safe_force_push_after_reload() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_rewritten_history_prompt_root: Option<PathBuf>",
+            "pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>",
+            "struct RewrittenHistoryPrompt",
+            "fn maybe_prepare_rewritten_history_prompt(&mut self",
+            "fn rewritten_history_prompt_modal(&mut self",
+            "self.rewritten_history_prompt_modal(ctx);",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let interactive_start = implementation_source
+            .find("fn interactive_rebase_action_modal(&mut self")
+            .unwrap();
+        let interactive_end = implementation_source[interactive_start..]
+            .find("fn lfs_action_modal(")
+            .unwrap();
+        let interactive_source =
+            &implementation_source[interactive_start..interactive_start + interactive_end];
+        assert!(
+            interactive_source.contains("self.pending_rewritten_history_prompt_root ="),
+            "interactive rebase execution should mark the repo for post-reload prompt"
+        );
+        assert!(
+            interactive_source.contains("git::interactive_rebase(root, &base, &todo_items)"),
+            "interactive rebase should still run through git::interactive_rebase"
+        );
+
+        let apply_start = implementation_source
+            .find("fn apply_repository_snapshot(&mut self")
+            .unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn apply_merge_commit_message_default(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+        assert!(
+            apply_source.contains("self.maybe_prepare_rewritten_history_prompt(&snapshot);"),
+            "fresh snapshot application should turn the pending marker into a visible prompt"
+        );
+
+        let prompt_start = implementation_source
+            .find("fn maybe_prepare_rewritten_history_prompt(&mut self")
+            .unwrap();
+        let prompt_end = implementation_source[prompt_start..]
+            .find("fn refresh(&mut self)")
+            .unwrap();
+        let prompt_source = &implementation_source[prompt_start..prompt_start + prompt_end];
+        for required in [
+            "upstream.ahead > 0 && upstream.behind > 0",
+            "current_named_local_branch(snapshot)",
+            "RewrittenHistoryPrompt",
+            "branch.name.clone()",
+            "upstream.name.clone()",
+        ] {
+            assert!(prompt_source.contains(required), "{required}");
+        }
+
+        let modal_start = implementation_source
+            .find("fn rewritten_history_prompt_modal(&mut self")
+            .unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn lfs_action_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        for required in [
+            "rewrite_prompt.title",
+            "rewrite_prompt.message",
+            "rewrite_prompt.open_push",
+            "self.open_push_dialog_with_force(Some(prompt.branch.clone()), None, true);",
+            "rewrite_prompt.later",
+        ] {
+            assert!(modal_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn merge_options_and_action_checkboxes_use_shadow_gap_no_border_style() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let panel_start = implementation_source
+            .find("fn merge_options_panel(")
+            .unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn stash_action_modal(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        assert!(panel_source.contains("soft_panel_frame(theme::panel_soft(),"));
+        assert!(panel_source.contains(".stroke(Stroke::NONE)"));
+        assert!(panel_source.contains(".shadow(panel_shadow())"));
+        assert!(!panel_source.contains("ui.group("));
+        assert!(!panel_source.contains("Frame::group"));
+
+        let checkbox_start = implementation_source
+            .find("fn paint_action_checkbox_square(")
+            .unwrap();
+        let checkbox_end = implementation_source[checkbox_start..]
+            .find("fn toolbar_icon(")
+            .unwrap();
+        let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
+        assert!(!checkbox_source.contains("rect_stroke("));
+        assert!(!checkbox_source.contains("edge_stroke"));
+        assert!(!checkbox_source.contains("theme::inset_shadow()"));
+    }
+
+    #[test]
+    fn repository_archive_menu_opens_git_archive_dialog() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_archive_action: Option<ArchiveActionDialog>",
+            "struct ArchiveActionDialog",
+            "enum ArchiveTarget",
+            "fn open_archive_dialog(&mut self)",
+            "fn archive_action_modal(&mut self",
+            "self.archive_action_modal(ctx);",
+            "self.open_archive_dialog();",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("repo_archive"));
+        assert!(menu_source.contains("has_archive_target"));
+        assert!(menu_source.contains("git_dialog_enabled && has_archive_target"));
+        assert!(menu_source.contains("self.open_archive_dialog();"));
+
+        let dialog_start = implementation_source
+            .find("fn archive_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn merge_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "archive.output_path",
+            "archive.folder_prefix",
+            "archive.target",
+            "archive.worktree",
+            "archive.commit",
+            "rfd::FileDialog::new()",
+            "git::archive(root, &output_path, &folder_prefix, &target)",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "archive.title"),
+            "\u{5b58}\u{6863}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "archive.output_path"),
+            "\u{5b58}\u{6863}\u{6587}\u{4ef6}:"
+        );
+    }
+
+    #[test]
+    fn repository_menu_opens_submodule_and_subtree_dialogs() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_submodule_action: Option<SubmoduleActionDialog>",
+            "pending_subtree_action: Option<SubtreeActionDialog>",
+            "struct SubmoduleActionDialog",
+            "struct SubtreeActionDialog",
+            "fn open_submodule_dialog(&mut self)",
+            "fn open_subtree_dialog(&mut self)",
+            "fn submodule_action_modal(&mut self",
+            "fn subtree_action_modal(&mut self",
+            "self.submodule_action_modal(ctx);",
+            "self.subtree_action_modal(ctx);",
+            "git::add_submodule(root, options)",
+            "git::add_subtree(root, options)",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("repo_add_submodule"));
+        assert!(menu_source.contains("repo_add_link_subtree"));
+        assert!(menu_source.contains("self.open_submodule_dialog();"));
+        assert!(menu_source.contains("self.open_subtree_dialog();"));
+        assert!(!menu_source.contains("repo_add_remote"));
+
+        let submodule_start = implementation_source
+            .find("fn submodule_action_modal(&mut self")
+            .unwrap();
+        let submodule_end = implementation_source[submodule_start..]
+            .find("fn subtree_action_modal(")
+            .unwrap();
+        let submodule_source =
+            &implementation_source[submodule_start..submodule_start + submodule_end];
+        for required in [
+            "submodule.source",
+            "submodule.local_path",
+            "submodule.repo_type",
+            "submodule.source_branch",
+            "submodule.recursive",
+            "dependency_source_row(",
+            "dependency_local_path_row(",
+            "dependency_text_row(",
+            "action_checkbox(ui, &mut dialog.recursive",
+        ] {
+            assert!(submodule_source.contains(required), "{required}");
+        }
+
+        let subtree_start = implementation_source
+            .find("fn subtree_action_modal(&mut self")
+            .unwrap();
+        let subtree_end = implementation_source[subtree_start..]
+            .find("fn merge_action_modal(")
+            .unwrap();
+        let subtree_source = &implementation_source[subtree_start..subtree_start + subtree_end];
+        for required in [
+            "subtree.source",
+            "subtree.local_path",
+            "subtree.repo_type",
+            "subtree.ref_name",
+            "subtree.squash",
+            "dependency_source_row(",
+            "dependency_local_path_row(",
+            "dependency_text_row(",
+            "action_checkbox(ui, &mut dialog.squash",
+        ] {
+            assert!(subtree_source.contains(required), "{required}");
+        }
+
+        let helper_start = implementation_source
+            .find("fn dependency_source_row(")
+            .unwrap();
+        let helper_end = implementation_source[helper_start..]
+            .find("fn parse_merge_rename_threshold(")
+            .unwrap();
+        let helper_source = &implementation_source[helper_start..helper_start + helper_end];
+        assert!(helper_source.contains("placeholder_for_label("));
+        assert!(helper_source.contains("rfd::FileDialog::new()"));
+        assert!(helper_source.contains("validate_dependency_relative_path("));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "submodule.title"),
+            "\u{6dfb}\u{52a0}\u{5b50}\u{6a21}\u{5757}..."
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "subtree.title"),
+            "\u{6dfb}\u{52a0}/\u{94fe}\u{63a5}\u{5b50}\u{6811}"
+        );
+    }
+
+    #[test]
+    fn repository_git_lfs_menu_wires_intro_tracking_and_content_actions() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_lfs_action: Option<LfsActionDialog>",
+            "enum LfsActionDialog",
+            "fn open_lfs_intro_dialog(&mut self)",
+            "fn open_lfs_track_dialog(&mut self)",
+            "fn lfs_action_modal(&mut self",
+            "self.lfs_action_modal(ctx);",
+            "git::configure_lfs_patterns(root, options)",
+            "git::lfs_pull(root)",
+            "git::lfs_fetch(root)",
+            "git::lfs_checkout(root)",
+            "git::lfs_prune(root)",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        for required in [
+            "repo_git_lfs",
+            "repo_lfs_initialize",
+            "repo_lfs_track_untrack",
+            "repo_lfs_pull",
+            "repo_lfs_fetch",
+            "repo_lfs_checkout",
+            "repo_lfs_prune",
+            "self.open_lfs_intro_dialog();",
+            "self.open_lfs_track_dialog();",
+            "git_dialog_enabled",
+        ] {
+            assert!(menu_source.contains(required), "{required}");
+        }
+        assert!(!menu_source.contains(
+            "menu_text_button(ui, false, menu_label(self.language, \"repo_lfs_initialize\""
+        ));
+
+        let dialog_start = implementation_source
+            .find("fn lfs_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn submodule_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "LfsActionDialog::Intro",
+            "LfsActionDialog::Track",
+            "lfs.intro.body",
+            "lfs.start",
+            "lfs.track.title",
+            "lfs.patterns_label",
+            "lfs.add",
+            "lfs.remove",
+            "lfs.track_files",
+            "lfs_pattern_list(",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "lfs.track.title"),
+            "Git LFS: \u{9009}\u{62e9}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}"
+        );
+    }
+
+    #[test]
+    fn repo_discard_menu_discards_all_changes_with_confirmation() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("ConfirmDiscardAll"));
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("let has_worktree_changes"));
+        assert!(menu_source.contains("!snapshot.status.is_empty()"));
+        assert!(menu_source.contains("git_dialog_enabled && has_worktree_changes"));
+        assert!(menu_source.contains(
+            "self.pending_worktree_action = Some(WorktreeActionDialog::ConfirmDiscardAll);"
+        ));
+
+        let dialog_start = implementation_source
+            .find("fn worktree_action_modal(")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn stash_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(dialog_source.contains("WorktreeActionDialog::ConfirmDiscardAll"));
+        assert!(dialog_source.contains("worktree.discard_all_confirm"));
+        assert!(dialog_source.contains("git::discard_all_changes(root)"));
+    }
+
+    #[test]
+    fn stash_create_dialog_exposes_sourcetree_options() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("StashActionDialog::Create {"));
+        for required in [
+            "staged_files: bool",
+            "keep_staged: bool",
+            "include_untracked: bool",
+            "include_ignored: bool",
+            "stash.staged_files",
+            "stash.keep_staged",
+            "stash.include_untracked",
+            "stash.include_ignored",
+            "git::StashOptions",
+            "git::stash_push(root, &message, options)",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let dialog_start = implementation_source
+            .find("fn stash_action_modal(")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn branch_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(dialog_source.contains("action_checkbox(ui, staged_files"));
+        assert!(dialog_source.contains("action_checkbox(ui, keep_staged"));
+        assert!(dialog_source.contains("action_checkbox(ui, include_untracked"));
+        assert!(dialog_source.contains("action_checkbox(ui, include_ignored"));
+        assert!(
+            dialog_source.contains("dialog_primary_button(ui, self.tr(\"stash.create\"), true)")
+        );
+        assert!(dialog_source.contains("dialog_cancel_button(ui, self.tr(\"dialog.cancel\"))"));
+        assert!(!dialog_source.contains("ui.checkbox(staged_files"));
+        assert!(!dialog_source.contains("ui.checkbox(keep_staged"));
+
+        let checkbox_start = implementation_source.find("fn action_checkbox(").unwrap();
+        let checkbox_end = implementation_source[checkbox_start..]
+            .find("fn toolbar_icon(")
+            .unwrap();
+        let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
+        assert!(checkbox_source.contains("theme::text()"));
+        assert!(checkbox_source.contains("theme::panel_soft()"));
+        assert!(checkbox_source.contains("theme::accent_deep()"));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "stash.staged_files"),
+            "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "stash.keep_staged"),
+            "\u{4fdd}\u{7559}\u{6682}\u{5b58}\u{7684}\u{66f4}\u{6539}"
+        );
+    }
+
+    #[test]
+    fn action_dialog_checkboxes_use_painted_theme_control() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let checkbox_start = implementation_source.find("fn action_checkbox(").unwrap();
+        let checkbox_end = implementation_source[checkbox_start..]
+            .find("fn toolbar_icon(")
+            .unwrap();
+        let checkbox_source = &implementation_source[checkbox_start..checkbox_start + checkbox_end];
+        for required in [
+            "ui.allocate_exact_size(",
+            "rect_filled(",
+            "theme::text()",
+            "theme::panel_soft()",
+            "theme::accent_deep()",
+        ] {
+            assert!(checkbox_source.contains(required), "{required}");
+        }
+        assert!(!checkbox_source.contains("ui.checkbox("));
+        assert!(!checkbox_source.contains("egui::Checkbox::new("));
+
+        let primary_start = implementation_source
+            .find("fn dialog_action_button(")
+            .unwrap();
+        let primary_end = implementation_source[primary_start..]
+            .find("fn compact_action_dialog(")
+            .unwrap();
+        let primary_source = &implementation_source[primary_start..primary_start + primary_end];
+        assert!(primary_source.contains("theme::accent_deep()"));
+        assert!(primary_source.contains("theme::accent()"));
+        assert!(primary_source.contains("Color32::WHITE"));
+
+        for (start, end) in [
+            ("fn fetch_action_modal(", "fn pull_current("),
+            ("fn pull_action_modal(", "fn push_action_modal("),
+            ("fn push_action_modal(", "fn commit_action_modal("),
+            ("fn commit_action_modal(", "fn archive_action_modal("),
+            ("fn archive_action_modal(", "fn merge_action_modal("),
+            ("fn merge_action_modal(", "fn stash_action_modal("),
+            ("fn stash_action_modal(", "fn branch_action_modal("),
+            ("fn branch_action_modal(", "fn tag_action_modal("),
+            ("fn tag_action_modal(", "fn settings_modal("),
+        ] {
+            let section_start = implementation_source.find(start).unwrap();
+            let section_end = implementation_source[section_start..].find(end).unwrap();
+            let section = &implementation_source[section_start..section_start + section_end];
+            assert!(!section.contains("ui.checkbox("), "{start}");
+            assert!(!section.contains("egui::Checkbox::new("), "{start}");
+            if start != "fn archive_action_modal(" {
+                assert!(section.contains("action_checkbox("), "{start}");
+            }
+        }
+
+        let settings_start = implementation_source
+            .find("fn settings_checkbox_row(")
+            .unwrap();
+        let settings_end = implementation_source[settings_start..]
+            .find("fn tree_arrow_points(")
+            .unwrap();
+        let settings_source = &implementation_source[settings_start..settings_start + settings_end];
+        assert!(settings_source.contains("action_checkbox("));
+        assert!(!settings_source.contains("ui.checkbox("));
+
+        let push_row_start = implementation_source
+            .find("fn push_branch_table_row(")
+            .unwrap();
+        let push_row_end = implementation_source[push_row_start..]
+            .find("fn commit_remote_url(")
+            .unwrap();
+        let push_row_source = &implementation_source[push_row_start..push_row_start + push_row_end];
+        assert!(push_row_source.contains("action_icon_checkbox("));
+        assert!(!push_row_source.contains("egui::Checkbox::new("));
+    }
+
+    #[test]
     fn upstream_sync_counts_feed_toolbar_and_branch_badges() {
         let counts = UpstreamSyncCounts {
             ahead: 3,
@@ -17915,6 +25116,52 @@ mod ui_tests {
     }
 
     #[test]
+    fn workspace_repository_zero_badges_are_hidden() {
+        assert_eq!(workspace_repository_unstaged_badge_text(0), None);
+        assert_eq!(
+            workspace_repository_unstaged_badge_text(2),
+            Some("2".to_owned())
+        );
+        assert_eq!(
+            workspace_repository_branch_badges(UpstreamSyncCounts::default()),
+            ""
+        );
+        assert_eq!(
+            workspace_repository_branch_badges(UpstreamSyncCounts {
+                ahead: 3,
+                behind: 0
+            }),
+            "\u{2191}3"
+        );
+        assert_eq!(
+            workspace_repository_branch_badges(UpstreamSyncCounts {
+                ahead: 0,
+                behind: 5
+            }),
+            "\u{2193}5"
+        );
+        assert_eq!(
+            workspace_repository_branch_badges(UpstreamSyncCounts {
+                ahead: 3,
+                behind: 5
+            }),
+            "\u{2193}5  \u{2191}3"
+        );
+    }
+
+    #[test]
+    fn workspace_repository_path_column_keeps_width_when_status_is_unloaded() {
+        let text_left = 42.0;
+        let text_right = 551.0;
+        let path_left = workspace_repository_path_left(text_left, text_right);
+        let path_width = text_right - path_left;
+
+        assert!(path_width >= 176.0);
+        assert!(path_width <= 250.0);
+        assert!(path_left >= text_left + 180.0);
+    }
+
+    #[test]
     fn ctrl_shift_c_toggles_stage_all_then_unstage_all() {
         let unstaged_file = WorktreeFile {
             worktree_status: 'M',
@@ -17989,9 +25236,25 @@ mod ui_tests {
         assert!(stage_shortcut_index < text_input_guard_index);
 
         let stage_shortcut_block = &shortcuts_source[stage_shortcut_index..text_input_guard_index];
-        assert!(stage_shortcut_block.contains("self.pending_toolbar_single_click = None;"));
-        assert!(stage_shortcut_block.contains("shortcut_stage_toggle_action"));
-        assert!(stage_shortcut_block.contains("self.handle_worktree_action(action);"));
+        assert!(stage_shortcut_block.contains("self.stage_toggle_current_repository();"));
+
+        let stage_toggle_helper_start = implementation_source
+            .find("fn stage_toggle_current_repository(&mut self)")
+            .unwrap();
+        let stage_toggle_helper_end = implementation_source[stage_toggle_helper_start..]
+            .find("fn open_remote_url(")
+            .unwrap();
+        let stage_toggle_helper_source = &implementation_source
+            [stage_toggle_helper_start..stage_toggle_helper_start + stage_toggle_helper_end];
+        for required in [
+            "self.pending_toolbar_single_click = None;",
+            "self.active_view = MainView::Workspace;",
+            "self.focus_commit_message = true;",
+            "shortcut_stage_toggle_action",
+            "self.handle_worktree_action(action);",
+        ] {
+            assert!(stage_toggle_helper_source.contains(required), "{required}");
+        }
     }
 
     #[test]
@@ -18040,7 +25303,9 @@ mod ui_tests {
         assert!(!bottom_source.contains("ui.horizontal(|ui|"));
 
         let panel_start = source.find("fn source_tree_panel_frame(").unwrap();
-        let panel_end = source[panel_start..].find("fn diff_panel_frame(").unwrap();
+        let panel_end = source[panel_start..]
+            .find("fn worktree_diff_panel_frame(")
+            .unwrap();
         let panel_source = &source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains(".shadow(panel_shadow())"));
         assert!(!panel_source.contains(".stroke("));
@@ -18093,6 +25358,27 @@ mod ui_tests {
     }
 
     #[test]
+    fn history_and_search_diff_bodies_use_parent_panel_background() {
+        let source = include_str!("app.rs");
+        let history_start = source.find("fn diff_viewer(").unwrap();
+        let history_end = source[history_start..]
+            .find("fn search_diff_viewer(")
+            .unwrap();
+        let history_source = &source[history_start..history_start + history_end];
+        let search_start = source.find("fn search_diff_viewer(").unwrap();
+        let search_end = source[search_start..]
+            .find("fn worktree_diff_viewer(")
+            .unwrap();
+        let search_source = &source[search_start..search_start + search_end];
+
+        for body_source in [history_source, search_source] {
+            assert!(body_source.contains("ScrollArea::both()"));
+            assert!(!body_source.contains("diff_panel_frame().show"));
+            assert!(!body_source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
+        }
+    }
+
+    #[test]
     fn copied_hash_uses_transient_toast() {
         let source = include_str!("app.rs");
         assert!(source.contains("toast_notice: Option<(String, Instant)>"));
@@ -18137,9 +25423,48 @@ mod ui_tests {
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
         assert!(modal_source.contains("ScrollArea::vertical()"));
         assert!(modal_source.contains("TextEdit::multiline(&mut message)"));
+        assert!(modal_source.contains(".id_salt(\"error_message_text\")"));
+        assert!(!modal_source.contains(".interactive(false)"));
         assert!(modal_source.contains("self.tr(\"dialog.error.title\")"));
         assert!(modal_source.contains("self.tr(\"dialog.close\")"));
         assert!(modal_source.contains("self.error = None"));
+    }
+
+    #[test]
+    fn github_auth_errors_offer_credential_manager_login() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "credential_login_task: Option<Receiver<anyhow::Result<()>>>",
+            "fn start_github_credential_login(&mut self)",
+            "fn github_authentication_error(",
+            "git::github_credential_manager_login()",
+            "self.tr(\"credentials.github_login\")",
+            "self.tr(\"credentials.github_login_done\")",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let modal_start = implementation_source.find("fn error_modal(").unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn main_layout(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        assert!(modal_source.contains("github_authentication_error(&message)"));
+        assert!(modal_source.contains("self.start_github_credential_login();"));
+        assert!(modal_source.contains("dialog_primary_button("));
+
+        assert!(github_authentication_error(
+            "git push --force-with-lease failed: error: Authentication error: Authentication required: You must have push access to verify locks"
+        ));
+        assert!(!github_authentication_error(
+            "git push failed: non-fast-forward"
+        ));
+        assert_eq!(
+            i18n::t(Language::Chinese, "credentials.github_login"),
+            "\u{767b}\u{5f55} GitHub"
+        );
     }
 
     #[test]
@@ -18190,6 +25515,8 @@ mod ui_tests {
             ("fn pull_action_modal(", "fn push_action_modal("),
             ("fn push_action_modal(", "fn commit_action_modal("),
             ("fn commit_action_modal(", "fn worktree_action_modal("),
+            ("fn archive_action_modal(", "fn merge_action_modal("),
+            ("fn merge_action_modal(", "fn stash_action_modal("),
             (
                 "WorktreeActionDialog::ConfirmDiscard { path, untracked } =>",
                 "WorktreeActionDialog::ResolveConflicts",
@@ -18216,7 +25543,7 @@ mod ui_tests {
             .find("WorktreeActionDialog::ResolveConflicts { selected_path } =>")
             .unwrap();
         let conflict_end = implementation_source[conflict_start..]
-            .find("fn stash_action_modal(")
+            .find("fn archive_action_modal(")
             .unwrap();
         let conflict_source = &implementation_source[conflict_start..conflict_start + conflict_end];
         assert!(!conflict_source.contains("dialog_default_submit_requested(ui)"));
@@ -18225,19 +25552,17 @@ mod ui_tests {
     #[test]
     fn unified_diff_uses_single_layer_code_review_colors() {
         let source = include_str!("app.rs");
-        let diff_panel_start = source.find("fn diff_panel_frame(").unwrap();
-        let diff_frame_end = source[diff_panel_start..]
-            .find("fn diff_display_mode_salt(")
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(!implementation_source.contains("fn diff_panel_frame("));
+        let history_diff_start = implementation_source.find("fn diff_viewer(").unwrap();
+        let history_diff_end = implementation_source[history_diff_start..]
+            .find("fn search_diff_viewer(")
             .unwrap();
-        let diff_frame_source = &source[diff_panel_start..diff_panel_start + diff_frame_end];
-        assert!(diff_frame_source.contains("theme::panel_recessed()"));
-        assert!(!diff_frame_source.contains("theme::accent_soft()"));
-        assert!(
-            diff_frame_source.contains(".corner_radius(CornerRadius::same(WORKSPACE_CARD_RADIUS))")
-        );
-        assert!(!diff_frame_source.contains(".shadow(panel_shadow())"));
-        assert!(!diff_frame_source.contains(".stroke("));
-        assert!(source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
+        let history_diff_source =
+            &implementation_source[history_diff_start..history_diff_start + history_diff_end];
+        assert!(history_diff_source.contains("ScrollArea::both()"));
+        assert!(!history_diff_source.contains("theme::panel_recessed()"));
+        assert!(!history_diff_source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
 
         let diff_row_start = source.find("fn diff_row(").unwrap();
         let hunk_start = source[diff_row_start..].find("fn diff_hunk_row(").unwrap();
@@ -18274,6 +25599,31 @@ mod ui_tests {
         assert!(guide_source.contains("circle_filled"));
         assert!(guide_source.contains("layout_no_wrap"));
         assert!(guide_source.contains("_ => break"));
+    }
+
+    #[test]
+    fn unified_diff_rows_clip_background_and_text_to_visible_area() {
+        let source = include_str!("app.rs");
+        let diff_row_start = source.find("fn diff_row(").unwrap();
+        let hunk_start = source[diff_row_start..].find("fn diff_hunk_row(").unwrap();
+        let diff_row_source = &source[diff_row_start..diff_row_start + hunk_start];
+        assert!(diff_row_source.contains("let row_clip = diff_row_clip_rect(ui, rect);"));
+        assert!(diff_row_source.contains("let painter = ui.painter().with_clip_rect(row_clip);"));
+        assert!(diff_row_source.contains("let text_clip = text_rect.intersect(row_clip);"));
+        assert!(diff_row_source.contains("with_clip_rect(text_clip)"));
+        assert!(!diff_row_source.contains("with_clip_rect(text_rect).text"));
+
+        let helper_start = source.find("fn diff_row_clip_rect(").unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn selected_diff_rows_text(")
+            .unwrap();
+        let helper_source = &source[helper_start..helper_start + helper_end];
+        assert!(helper_source.contains("rect.intersect(ui.clip_rect())"));
+
+        let guide_start = source.find("fn draw_diff_indent_guides(").unwrap();
+        let guide_end = source[guide_start..].find("fn diff_hunk_row(").unwrap();
+        let guide_source = &source[guide_start..guide_start + guide_end];
+        assert!(guide_source.contains("text_rect.intersect(ui.clip_rect())"));
     }
 
     #[test]
@@ -18882,6 +26232,26 @@ diff --git a/file.txt b/file.txt
         assert!(!push_source.contains("git::push(root)"));
         assert!(!push_source.contains("git::push_set_upstream(root"));
 
+        let quick_push_start = implementation_source
+            .find("fn quick_push_current(")
+            .unwrap();
+        let quick_push_end = implementation_source[quick_push_start..]
+            .find("fn open_push_dialog(")
+            .unwrap();
+        let quick_push_source =
+            &implementation_source[quick_push_start..quick_push_start + quick_push_end];
+        assert!(quick_push_source.contains("current_named_local_branch(snapshot)"));
+        assert!(quick_push_source.contains("push.detached_error"));
+
+        let open_push_start = implementation_source.find("fn open_push_dialog(").unwrap();
+        let open_push_end = implementation_source[open_push_start..]
+            .find("fn update_push_rows_for_remote(")
+            .unwrap();
+        let open_push_source =
+            &implementation_source[open_push_start..open_push_start + open_push_end];
+        assert!(open_push_source.contains("current_named_local_branch(snapshot)"));
+        assert!(open_push_source.contains("push.detached_error"));
+
         let branch_handler_start = implementation_source
             .find("fn handle_branch_action(&mut self, action: BranchMenuAction)")
             .unwrap();
@@ -18938,6 +26308,56 @@ diff --git a/file.txt b/file.txt
         let i18n_source = include_str!("i18n.rs");
         assert!(
             i18n_source.contains("(\"push.select\", \"\\u{662f}\\u{5426}\\u{63a8}\\u{9001}\")")
+        );
+    }
+
+    #[test]
+    fn force_with_lease_push_requires_explicit_confirmation() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_force_push_confirm: Option<ConfirmForcePushDialog>",
+            "struct ConfirmForcePushDialog",
+            "fn force_push_confirm_modal(&mut self",
+            "self.force_push_confirm_modal(ctx);",
+            "push.force_confirm.title",
+            "push.force_confirm.message",
+            "push.force_confirm.submit",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let push_start = implementation_source.find("fn push_action_modal(").unwrap();
+        let push_end = implementation_source[push_start..]
+            .find("fn force_push_confirm_modal(")
+            .unwrap();
+        let push_source = &implementation_source[push_start..push_start + push_end];
+        assert!(push_source.contains("if dialog.force {"));
+        assert!(push_source.contains("self.pending_force_push_confirm = Some"));
+        assert!(
+            push_source
+                .find("self.pending_force_push_confirm = Some")
+                .unwrap()
+                < push_source
+                    .find("execute = Some(Box::new(move |root|")
+                    .unwrap()
+        );
+
+        let confirm_start = implementation_source
+            .find("fn force_push_confirm_modal(")
+            .unwrap();
+        let confirm_end = implementation_source[confirm_start..]
+            .find("fn commit_action_modal(")
+            .unwrap();
+        let confirm_source = &implementation_source[confirm_start..confirm_start + confirm_end];
+        assert!(confirm_source.contains("git::push_selected(root, &remote, &branches, options)"));
+        assert!(confirm_source.contains("dialog_cancel_button("));
+        assert!(confirm_source.contains("dialog_primary_button("));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "push.force_confirm.submit"),
+            "\u{786e}\u{8ba4}\u{5b89}\u{5168}\u{5f3a}\u{63a8}"
         );
     }
 
@@ -19065,8 +26485,219 @@ diff --git a/file.txt b/file.txt
         assert!(dialog_source.contains("BranchActionDialog::ConfirmCheckout"));
         assert!(dialog_source.contains("branch.confirm_checkout"));
         assert!(dialog_source.contains("branch.discard_before_checkout"));
-        assert!(dialog_source.contains("ui.checkbox(discard_changes"));
+        assert!(dialog_source.contains("action_checkbox("));
+        assert!(dialog_source.contains("discard_changes,"));
         assert!(dialog_source.contains("self.start_branch_checkout(name, discard_changes);"));
+    }
+
+    #[test]
+    fn repository_menu_checkout_opens_two_tab_dialog_with_confirmed_detached_head() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("enum CheckoutDialogTab"));
+        assert!(implementation_source.contains("Existing"));
+        assert!(implementation_source.contains("NewBranch"));
+        assert!(implementation_source.contains("BranchActionDialog::Checkout"));
+        assert!(implementation_source.contains("BranchActionDialog::ConfirmDetachedCheckout"));
+        assert!(implementation_source.contains("fn open_checkout_dialog(&mut self)"));
+        assert!(implementation_source.contains("fn checkout_dialog_modal("));
+        assert!(implementation_source.contains("self.open_checkout_dialog();"));
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("menu_label(self.language, \"repo_checkout\")"));
+        assert!(menu_source.contains("self.open_checkout_dialog();"));
+        let normalized_menu_source: String = menu_source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(normalized_menu_source.contains(
+            "menu_text_button(ui,git_dialog_enabled,menu_label(self.language,\"repo_checkout\"),)"
+        ));
+
+        let dialog_start = implementation_source
+            .find("fn checkout_dialog_modal(")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn tag_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "checkout.existing",
+            "checkout.new_branch",
+            "checkout.title",
+            "checkout.remote_branch",
+            "checkout.local_branch",
+            "branch.discard_before_checkout",
+            "checkout.detached_confirm_title",
+            "checkout.detached_warning_detail",
+            "git::checkout_commit(root, &hash)",
+            "git::discard_all_changes(root)?;",
+            "history_commit_browser(",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+        assert!(!dialog_source.contains("self.tr(\"repo_checkout\")"));
+        assert!(!dialog_source.contains("ui.selectable_label(selected, label)"));
+        assert!(!dialog_source.contains("history_commit_picker("));
+        assert!(dialog_source.contains("show_view_controls: true"));
+        assert!(dialog_source.contains("show_search: true"));
+        assert!(dialog_source.contains("show_cherry_pick: false"));
+        assert!(dialog_source.contains("show_jump: false"));
+
+        let picker_start = implementation_source
+            .find("fn history_commit_browser(")
+            .unwrap();
+        let picker_end = implementation_source[picker_start..]
+            .find("fn history_commit_table_row(")
+            .unwrap();
+        let picker_source = &implementation_source[picker_start..picker_start + picker_end];
+        assert!(picker_source.contains("history_branch_scope_dropdown("));
+        assert!(picker_source.contains("history_toolbar_checkbox_at("));
+        assert!(picker_source.contains("history_sort_order_dropdown("));
+        assert!(picker_source.contains("TextEdit::singleline(search)"));
+        assert!(picker_source.contains("history_table_header("));
+        assert!(picker_source.contains("cache.refresh(commits, search);"));
+        assert!(picker_source.contains("let layout = &cache.layout;"));
+        assert!(picker_source.contains("let visible_indexes = &cache.visible_indexes;"));
+        assert!(!picker_source.contains("let layout = graph::layout(commits);"));
+        assert!(picker_source.contains("layout.rows.get(index)"));
+        assert!(picker_source.contains("history_commit_table_row("));
+        assert!(picker_source.contains(".max_height(body_height)"));
+        assert!(picker_source.contains(".min_scrolled_height(body_height)"));
+        assert!(picker_source.contains(".show_rows("));
+        assert!(picker_source.contains("HISTORY_TABLE_ROW_HEIGHT"));
+        assert!(picker_source.contains("visible_indexes.len()"));
+        assert!(picker_source.contains("|ui, row_range|"));
+        assert!(
+            !picker_source.contains("ui.allocate_ui(Vec2::new(ui.available_width(), body_height)")
+        );
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "checkout.title"),
+            "\u{68c0}\u{51fa}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "checkout.existing"),
+            "\u{68c0}\u{51fa}\u{73b0}\u{6709}\u{7684}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "checkout.new_branch"),
+            "\u{68c0}\u{51fa}\u{65b0}\u{5206}\u{652f}"
+        );
+    }
+
+    #[test]
+    fn history_commit_browser_cache_reuses_graph_layout_between_frames() {
+        let commits = vec![
+            sample_commit("b", &["a"], "fix b"),
+            sample_commit("a", &[], "base a"),
+        ];
+        let mut cache = HistoryCommitBrowserCache::default();
+
+        cache.refresh(&commits, "");
+        assert_eq!(cache.visible_indexes, vec![0, 1]);
+
+        cache.layout.lanes = 99;
+        cache.refresh(&commits, "");
+        assert_eq!(cache.layout.lanes, 99);
+        assert_eq!(cache.visible_indexes, vec![0, 1]);
+
+        cache.refresh(&commits, "base");
+        assert_eq!(cache.layout.lanes, 99);
+        assert_eq!(cache.visible_indexes, vec![1]);
+
+        let changed_commits = vec![
+            sample_commit("c", &["b"], "new c"),
+            sample_commit("b", &["a"], "fix b"),
+            sample_commit("a", &[], "base a"),
+        ];
+        cache.refresh(&changed_commits, "");
+        assert_ne!(cache.layout.lanes, 99);
+        assert_eq!(cache.visible_indexes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn checkout_new_branch_tab_validates_remote_and_local_branch_names() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation_source.contains("fn validate_checkout_new_branch("));
+        assert!(implementation_source.contains("checkout.error.fix_inputs"));
+        assert!(implementation_source.contains("checkout.error.local_branch_invalid"));
+        assert!(implementation_source.contains("checkout.error.remote_branch_invalid"));
+        assert!(implementation_source.contains("checkout.error.local_branch_exists"));
+        let normalized_implementation_source: String = implementation_source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            normalized_implementation_source
+                .contains("git::checkout_remote_branch(root,&remote_branch,&local_branch,)")
+        );
+
+        let dialog_start = implementation_source
+            .find("fn checkout_dialog_modal(")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn tag_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        assert!(
+            dialog_source
+                .contains("egui::ComboBox::from_id_salt(\"checkout_remote_branch_selector\")")
+        );
+        assert!(dialog_source.contains("placeholder_for_label("));
+        assert!(dialog_source.contains("themed_singleline_text_edit("));
+        assert!(dialog_source.contains("local_branch,"));
+        assert!(dialog_source.contains("action_checkbox("));
+        assert!(dialog_source.contains("track_remote,"));
+        assert!(dialog_source.contains("validate_checkout_new_branch("));
+        assert!(dialog_source.contains("checkout.track_remote"));
+    }
+
+    #[test]
+    fn checkout_new_branch_validation_reports_invalid_and_duplicate_inputs() {
+        assert_eq!(
+            checkout_local_branch_default("origin/feature/demo"),
+            "demo".to_owned()
+        );
+        assert!(
+            validate_checkout_new_branch(
+                Language::Chinese,
+                "origin/feature/demo",
+                "new-demo",
+                &["origin/feature/demo".to_owned()],
+                &["main".to_owned()],
+            )
+            .is_none()
+        );
+
+        let error = validate_checkout_new_branch(
+            Language::English,
+            "origin/missing",
+            "main",
+            &["origin/feature/demo".to_owned()],
+            &["main".to_owned()],
+        )
+        .unwrap();
+        assert!(error.contains("Please correct the following input errors:"));
+        assert!(error.contains("Selected remote branch name is invalid"));
+        assert!(error.contains("Local branch already exists"));
+
+        let invalid_local = validate_checkout_new_branch(
+            Language::English,
+            "origin/feature/demo",
+            "bad branch",
+            &["origin/feature/demo".to_owned()],
+            &[],
+        )
+        .unwrap();
+        assert!(invalid_local.contains("Local branch name is invalid"));
     }
 
     #[test]
@@ -19295,7 +26926,9 @@ diff --git a/file.txt b/file.txt
             .find("fn source_tab_button(")
             .unwrap();
         let repo_tab_source = &source[repo_tab_start..repo_tab_start + repo_tab_end];
-        assert!(repo_tab_source.contains("paint_repo_tab_shadow(ui, rect, selected);"));
+        assert!(
+            repo_tab_source.contains("paint_connected_tab_shadow_for_state(ui, rect, visuals);")
+        );
         assert!(repo_tab_source.contains("repo_tab_close_hovered(ui, close_rect)"));
         assert!(repo_tab_source.contains("let tab_hovered = response.hovered() || close_hovered"));
         assert!(repo_tab_source.contains("let show_close = selected || tab_hovered"));
@@ -19305,7 +26938,10 @@ diff --git a/file.txt b/file.txt
             .find("fn inline_button_width(")
             .unwrap();
         let button_source = &source[button_start..button_start + button_end];
-        assert!(button_source.contains("paint_repo_tab_shadow(ui, response.rect, selected);"));
+        assert!(
+            button_source
+                .contains("paint_connected_tab_shadow_for_state(ui, response.rect, visuals);")
+        );
 
         let shadow_start = source.find("fn paint_repo_tab_shadow(").unwrap();
         let shadow_end = source[shadow_start..]
@@ -19323,6 +26959,7 @@ diff --git a/file.txt b/file.txt
         assert!(shadow_source.contains("shadow_spread"));
         assert!(shadow_source.contains("Pos2::new(rect.right(), rect.top() + 2.0)"));
         assert!(shadow_source.contains("rect.bottom() - 0.6"));
+        assert!(shadow_source.contains("rect.bottom() - shadow_spread"));
     }
 
     #[test]
@@ -19331,6 +26968,7 @@ diff --git a/file.txt b/file.txt
         let top = repo_tab_shadow_rect(rect, RepoTabShadowSide::Top, 2);
         let left = repo_tab_shadow_rect(rect, RepoTabShadowSide::Left, 2);
         let right = repo_tab_shadow_rect(rect, RepoTabShadowSide::Right, 2);
+        let bottom = repo_tab_shadow_rect(rect, RepoTabShadowSide::Bottom, 2);
 
         assert!(top.left() >= rect.left() - 2.0);
         assert!(top.right() <= rect.right() + 2.0);
@@ -19341,6 +26979,107 @@ diff --git a/file.txt b/file.txt
         assert!(right.top() >= rect.top() + 1.0);
         assert!(right.bottom() <= rect.bottom());
         assert!(right.right() <= rect.right() + 3.0);
+        assert!(bottom.top() >= rect.bottom() - 3.0);
+        assert!(bottom.bottom() <= rect.bottom());
+        assert!(bottom.left() >= rect.left());
+        assert!(bottom.right() <= rect.right());
+    }
+
+    #[test]
+    fn repo_tab_close_icon_matches_accent_hover_contrast() {
+        assert_eq!(repo_tab_close_color(false, true, false), Color32::WHITE);
+        assert_eq!(repo_tab_close_color(false, true, true), Color32::WHITE);
+        assert_eq!(repo_tab_close_color(false, false, false), theme::text());
+    }
+
+    #[test]
+    fn tab_like_buttons_share_connected_and_detached_visual_rules() {
+        let connected_active =
+            tab_visual_state(TabVisualMode::Connected, true, false, theme::panel());
+        assert_eq!(connected_active.fill, theme::panel());
+        assert_eq!(connected_active.text, theme::text());
+        assert_eq!(connected_active.icon, theme::accent());
+        assert!(connected_active.shadow);
+        assert!(!connected_active.bottom_shadow);
+
+        let connected_inactive =
+            tab_visual_state(TabVisualMode::Connected, false, false, theme::panel());
+        assert_ne!(connected_inactive.fill, theme::panel_soft());
+        assert!(color_brightness(connected_inactive.fill) > color_brightness(theme::panel_soft()));
+        assert_eq!(connected_inactive.text, theme::text());
+        assert_eq!(connected_inactive.icon, theme::accent());
+        assert!(connected_inactive.shadow);
+        assert!(connected_inactive.bottom_shadow);
+
+        let connected_inactive_hovered =
+            tab_visual_state(TabVisualMode::Connected, false, true, theme::panel());
+        assert_eq!(connected_inactive_hovered.fill, theme::accent_deep());
+        assert_eq!(connected_inactive_hovered.text, Color32::WHITE);
+        assert_eq!(connected_inactive_hovered.icon, Color32::WHITE);
+        assert!(connected_inactive_hovered.bottom_shadow);
+
+        let detached_active =
+            tab_visual_state(TabVisualMode::Detached, true, false, theme::panel());
+        assert_eq!(detached_active.fill, theme::accent_deep());
+        assert_eq!(detached_active.text, Color32::WHITE);
+        assert_eq!(detached_active.icon, Color32::WHITE);
+        assert!(!detached_active.shadow);
+
+        let detached_inactive =
+            tab_visual_state(TabVisualMode::Detached, false, false, theme::panel());
+        assert_eq!(detached_inactive.fill, inactive_tab_base_fill());
+        assert_eq!(detached_inactive.text, theme::text());
+        assert_eq!(detached_inactive.icon, theme::accent());
+        assert!(detached_inactive.shadow);
+        assert!(detached_inactive.bottom_shadow);
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        for required in [
+            "enum TabVisualMode",
+            "struct TabVisualState",
+            "fn tab_visual_state(",
+            "fn inactive_tab_base_fill(",
+            "fn connected_tab_content_fill(",
+            "fn paint_connected_tab_shadow_for_state(",
+            "mode: TabVisualMode::Connected",
+            "_ => CornerRadius::same(radius)",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        for (start, end, required) in [
+            (
+                "fn repo_tab_fill(",
+                "fn repo_tab_text_color(",
+                "TabVisualMode::Connected",
+            ),
+            (
+                "fn source_tab_button(",
+                "fn repository_workspace_tab_strip(",
+                "AppButton::detached_tab(",
+            ),
+            (
+                "fn sidebar_nav_card(",
+                "fn paint_repo_tab_shadow(",
+                "TabVisualMode::Detached",
+            ),
+            (
+                "fn repo_settings_tab_button(",
+                "fn checkout_tab_button(",
+                "TabVisualMode::Connected",
+            ),
+            (
+                "fn checkout_tab_button(",
+                "fn settings_section_title(",
+                "TabVisualMode::Connected",
+            ),
+        ] {
+            let start = implementation_source.find(start).unwrap();
+            let end = implementation_source[start..].find(end).unwrap();
+            let snippet = &implementation_source[start..start + end];
+            assert!(snippet.contains(required), "{required}");
+        }
     }
 
     #[test]
@@ -19742,7 +27481,7 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn inactive_repo_tabs_refresh_in_background_every_minute() {
+    fn repo_tabs_refresh_in_background_with_configured_intervals() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
@@ -19752,12 +27491,16 @@ diff --git a/file.txt b/file.txt
             .find("struct RepoTab")
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
-        assert!(fields_source.contains("next_background_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("next_active_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("next_inactive_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("active_repo_refresh_seconds: u64"));
+        assert!(fields_source.contains("inactive_repo_refresh_seconds: u64"));
         assert!(
-            implementation_source.contains("fn background_repo_refresh_interval() -> Duration")
+            implementation_source.contains("fn repo_refresh_duration(seconds: u64) -> Duration")
         );
-        assert!(implementation_source.contains("Duration::from_secs(60)"));
-        assert!(implementation_source.contains("fn maybe_refresh_inactive_repositories("));
+        assert!(implementation_source.contains("DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20"));
+        assert!(implementation_source.contains("DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60"));
+        assert!(implementation_source.contains("fn maybe_refresh_repositories("));
 
         let update_start = implementation_source
             .find("fn update(&mut self, ctx: &egui::Context")
@@ -19766,18 +27509,21 @@ diff --git a/file.txt b/file.txt
             .find("fn error_modal(")
             .unwrap();
         let update_source = &implementation_source[update_start..update_start + update_end];
-        assert!(update_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
+        assert!(update_source.contains("self.maybe_refresh_repositories(ctx)"));
 
         let refresh_start = implementation_source
-            .find("fn maybe_refresh_inactive_repositories(")
+            .find("fn maybe_refresh_repositories(")
             .unwrap();
         let refresh_end = implementation_source[refresh_start..]
             .find("fn open_repository_source_tab")
             .unwrap();
         let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
         assert!(refresh_source.contains("Instant::now()"));
-        assert!(refresh_source.contains("self.next_background_repo_refresh_at"));
-        assert!(refresh_source.contains("background_repo_refresh_interval()"));
+        assert!(refresh_source.contains("self.next_active_repo_refresh_at"));
+        assert!(refresh_source.contains("self.next_inactive_repo_refresh_at"));
+        assert!(refresh_source.contains("self.active_repo_refresh_duration()"));
+        assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
+        assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
         assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
         assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
         assert!(!refresh_source.contains("self.ensure_repo_tab"));
@@ -19983,6 +27729,24 @@ diff --git a/file.txt b/file.txt
         assert!(!dialog_source.contains("ui.set_min_size(ui.available_size())"));
         assert!(!implementation_source.contains("ui.available_width() - action_width"));
         assert!(!implementation_source.contains("ui.available_height() - 4.0"));
+        let header_button_start = implementation_source
+            .find("fn worktree_header_action_button(")
+            .unwrap();
+        let header_button_end = implementation_source[header_button_start..]
+            .find("fn conflict_resolution_dialog_background(")
+            .unwrap();
+        let header_button_source =
+            &implementation_source[header_button_start..header_button_start + header_button_end];
+        let action_button_start = implementation_source
+            .find("fn conflict_resolution_action_button(")
+            .unwrap();
+        let action_button_end = implementation_source[action_button_start..]
+            .find("fn conflict_resolution_header(")
+            .unwrap();
+        let action_button_source =
+            &implementation_source[action_button_start..action_button_start + action_button_end];
+        assert!(header_button_source.contains("paint_text_button_hover_shadow_for_response"));
+        assert!(action_button_source.contains("paint_text_button_hover_shadow_for_response"));
         assert!(implementation_source.contains("worktree.accept_yours"));
         assert!(implementation_source.contains("worktree.accept_theirs"));
         assert!(implementation_source.contains("worktree.resolve_conflicts"));
@@ -20023,18 +27787,44 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn plus_icon_uses_crisp_16px_asset() {
+    fn plus_icon_uses_toolbar_native_size_and_stroke() {
         let plus = include_str!("../assets/icons/plus.svg");
         let add_file = include_str!("../assets/icons/add-file.svg");
         let edit = include_str!("../assets/icons/edit.svg");
         let delete_file = include_str!("../assets/icons/delete-file.svg");
         let rename_file = include_str!("../assets/icons/rename-file.svg");
+        let implementation_source = include_str!("app.rs");
+        assert!(plus.contains("width=\"16\" height=\"16\""));
         assert!(plus.contains("viewBox=\"0 0 16 16\""));
+        assert!(!plus.contains("<rect"));
+        assert!(plus.contains("<path fill=\"#ffffff\""));
+        assert!(plus.contains("M8 1.5"));
         assert!(add_file.contains("viewBox=\"0 0 16 16\""));
         assert!(!add_file.contains("V7l-5-5"));
+        assert!(
+            implementation_source.contains(
+                "UiIcon::AddFile => egui::include_image!(\"../assets/icons/add-file.svg\")"
+            )
+        );
+        assert!(
+            !implementation_source
+                .contains("UiIcon::AddFile => egui::include_image!(\"../assets/icons/plus.svg\")")
+        );
         for icon in [plus, add_file, edit, delete_file, rename_file] {
             assert!(icon.contains("#ffffff"));
             assert!(!icon.contains("#c7d0df"));
+        }
+    }
+
+    #[test]
+    fn top_toolbar_icons_are_tintable_in_dark_theme() {
+        let globe = include_str!("../assets/icons/globe.svg");
+        let terminal = include_str!("../assets/icons/terminal.svg");
+        let resource_manager = include_str!("../assets/icons/resource-manager.svg");
+
+        for icon in [globe, terminal, resource_manager] {
+            assert!(icon.contains("#ffffff"));
+            assert!(!icon.contains("currentColor"));
         }
     }
 
@@ -20074,8 +27864,8 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn settings_and_repo_settings_are_separate_flows() {
-        assert!(SETTINGS_DIALOG_WIDTH >= 760.0);
-        assert!(SETTINGS_DIALOG_HEIGHT >= 560.0);
+        assert!(SETTINGS_DIALOG_WIDTH >= 940.0);
+        assert!(SETTINGS_DIALOG_HEIGHT >= 660.0);
         assert!(SETTINGS_NAV_WIDTH >= 180.0);
         let source = include_str!("app.rs");
         assert!(source.contains("fn settings_modal"));
@@ -20087,6 +27877,12 @@ diff --git a/file.txt b/file.txt
         assert!(!source[global_start..global_end].contains("Repository panels"));
         assert!(source[global_start..global_end].contains("settings_choice_button("));
         assert!(source[global_start..global_end].contains("settings_accent_button("));
+        assert!(source[global_start..global_end].contains("settings.appearance"));
+        assert!(source[global_start..global_end].contains("settings.theme"));
+        assert!(source[global_start..global_end].contains("settings.language"));
+        assert!(!source[global_start..global_end].contains("\"Global Options\""));
+        assert!(!source[global_start..global_end].contains("settings_field(ui, \"Theme\""));
+        assert!(!source[global_start..global_end].contains("settings_field(ui, \"Language\""));
         let choice_start = source.find("fn settings_choice_button(").unwrap();
         let choice_end = source[choice_start..]
             .find("fn settings_accent_button(")
@@ -20094,13 +27890,35 @@ diff --git a/file.txt b/file.txt
         let choice_source = &source[choice_start..choice_start + choice_end];
         assert!(choice_source.contains("if selected {\n            Color32::WHITE"));
         assert!(choice_source.contains("theme::text()"));
+        assert!(choice_source.contains("paint_text_button_hover_shadow_for_response"));
+        let accent_start = source.find("fn settings_accent_button(").unwrap();
+        let accent_end = source[accent_start..].find("fn tree_empty(").unwrap();
+        let accent_source = &source[accent_start..accent_start + accent_end];
+        assert!(accent_source.contains("paint_text_button_hover_shadow_for_response"));
         assert_eq!(
             settings_tab_label(Language::Chinese, SettingsTab::General),
-            "\u{901a}\u{7528}"
+            "\u{5e38}\u{89c4}"
         );
         assert_eq!(
             settings_tab_label(Language::Chinese, SettingsTab::RepoRemotes),
             "\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "settings.appearance"),
+            "\u{5916}\u{89c2}"
+        );
+        assert_eq!(
+            i18n::t(Language::English, "settings.appearance"),
+            "Appearance"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "settings.theme"),
+            "\u{4e3b}\u{9898}"
+        );
+        assert_eq!(i18n::t(Language::English, "settings.theme"), "Theme");
+        assert_eq!(
+            i18n::t(Language::Chinese, "settings.language"),
+            "\u{8bed}\u{8a00}"
         );
     }
 
@@ -20253,6 +28071,108 @@ diff --git a/file.txt b/file.txt
         );
         assert!(validate_remote_account_settings("", "https://github.com").is_err());
         assert!(validate_remote_account_settings("Work", "not host with spaces").is_err());
+    }
+
+    #[test]
+    fn global_options_are_split_into_tabs_and_general_has_refresh_intervals() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let app_settings_start = implementation_source.find("struct AppSettings").unwrap();
+        let app_settings_end = implementation_source[app_settings_start..]
+            .find("impl Default for AppSettings")
+            .unwrap();
+        let app_settings_source =
+            &implementation_source[app_settings_start..app_settings_start + app_settings_end];
+        let global_start = implementation_source
+            .find("fn global_settings_page")
+            .unwrap();
+        let global_end = implementation_source[global_start..]
+            .find("fn global_remote_accounts_settings")
+            .unwrap();
+        let global_source = &implementation_source[global_start..global_start + global_end];
+
+        assert!(implementation_source.contains("SettingsTab::Git"));
+        assert!(implementation_source.contains("SettingsTab::CustomActions"));
+        assert!(implementation_source.contains("SettingsTab::Verification"));
+        assert!(implementation_source.contains("SettingsTab::Network"));
+        assert!(implementation_source.contains("fn global_settings_tab_strip("));
+        assert!(global_source.contains("global_settings_tab_strip("));
+        assert!(global_source.contains("SettingsTab::General"));
+        assert!(global_source.contains("SettingsTab::Git"));
+        assert!(global_source.contains("SettingsTab::CustomActions"));
+        assert!(global_source.contains("SettingsTab::Verification"));
+        assert!(global_source.contains("SettingsTab::Network"));
+        assert!(global_source.contains("SettingsTab::General => self.global_general_settings(ui)"));
+        assert!(global_source.contains("SettingsTab::Network => self.global_network_settings(ui)"));
+        assert!(global_source.contains("global_settings_empty_tab("));
+
+        assert!(app_settings_source.contains("active_repo_refresh_seconds: u64"));
+        assert!(app_settings_source.contains("inactive_repo_refresh_seconds: u64"));
+        let defaults = AppSettings::default();
+        assert_eq!(defaults.active_repo_refresh_seconds, 20);
+        assert_eq!(defaults.inactive_repo_refresh_seconds, 60);
+        assert!(
+            implementation_source
+                .contains("repo_refresh_duration(self.active_repo_refresh_seconds)")
+        );
+        assert!(
+            implementation_source
+                .contains("repo_refresh_duration(self.inactive_repo_refresh_seconds)")
+        );
+        assert!(implementation_source.contains("settings.refresh_active_repo_seconds"));
+        assert!(implementation_source.contains("settings.refresh_inactive_repo_seconds"));
+        assert_eq!(
+            settings_tab_label(Language::Chinese, SettingsTab::Git),
+            "Git"
+        );
+        assert_eq!(
+            settings_tab_label(Language::Chinese, SettingsTab::CustomActions),
+            "\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}"
+        );
+        assert_eq!(
+            settings_tab_label(Language::Chinese, SettingsTab::Verification),
+            "\u{9a8c}\u{8bc1}"
+        );
+        assert_eq!(
+            settings_tab_label(Language::Chinese, SettingsTab::Network),
+            "\u{7f51}\u{7edc}"
+        );
+    }
+
+    #[test]
+    fn active_and_inactive_auto_refresh_use_background_loads_without_loading_gate() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let fields_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let fields_end = implementation_source[fields_start..]
+            .find("struct RepoTab")
+            .unwrap();
+        let fields_source = &implementation_source[fields_start..fields_start + fields_end];
+        let refresh_start = implementation_source
+            .find("fn maybe_refresh_repositories(")
+            .unwrap();
+        let refresh_end = implementation_source[refresh_start..]
+            .find("fn open_repository_source_tab")
+            .unwrap();
+        let refresh_source = &implementation_source[refresh_start..refresh_start + refresh_end];
+
+        assert!(fields_source.contains("next_active_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("next_inactive_repo_refresh_at: Instant"));
+        assert!(fields_source.contains("active_repo_refresh_seconds: u64"));
+        assert!(fields_source.contains("inactive_repo_refresh_seconds: u64"));
+        assert!(refresh_source.contains("self.active_repo_refresh_duration()"));
+        assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
+        assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
+        assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
+        assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
+        assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
+        assert!(!refresh_source.contains("self.restart_repository_snapshot_load"));
+        assert!(!refresh_source.contains("self.loading_repo = true"));
+        assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
+        assert!(implementation_source.contains("self.maybe_refresh_repositories(ctx)"));
+        assert!(!implementation_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
     }
 
     #[test]
