@@ -53,6 +53,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("settings.theme", "\u{4e3b}\u{9898}"),
     ("settings.language", "\u{8bed}\u{8a00}"),
     ("menu.copy", "\u{590d}\u{5236}"),
+    (
+        "menu.interactive_rebase_children",
+        "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{6b64}\u{63d0}\u{4ea4}\u{4e4b}\u{540e}\u{7684}\u{63d0}\u{4ea4}...",
+    ),
     ("repo.source.new_tab", "New tab"),
     ("repo.source.close_tab", "\u{5173}\u{95ed}\u{6807}\u{7b7e}"),
     ("repo.source.title", "\u{672c}\u{5730}\u{4ed3}\u{5e93}"),
@@ -111,6 +115,135 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "repo.git_flow.opened",
         "\u{5df2}\u{6253}\u{5f00} Git \u{5de5}\u{4f5c}\u{6d41}",
+    ),
+    (
+        "git_flow.initialize.title",
+        "\u{521d}\u{59cb}\u{5316} Git \u{5de5}\u{4f5c}\u{6d41}",
+    ),
+    (
+        "git_flow.initialize.detail",
+        "Git Flow 会保存 Production/Develop 分支和 Feature/Release/Hotfix 前缀配置。若 Develop 分支不存在，会从 Production 分支创建；Feature/Release/Hotfix 分支会在对应开始动作时创建。",
+    ),
+    ("git_flow.production_branch", "Production \u{5206}\u{652f}"),
+    ("git_flow.development_branch", "Develop \u{5206}\u{652f}"),
+    ("git_flow.feature_prefix", "Feature \u{524d}\u{7f00}"),
+    ("git_flow.release_prefix", "Release \u{524d}\u{7f00}"),
+    ("git_flow.hotfix_prefix", "Hotfix \u{524d}\u{7f00}"),
+    ("git_flow.version_tag_prefix", "Tag \u{524d}\u{7f00}"),
+    (
+        "git_flow.use_defaults",
+        "\u{4f7f}\u{7528}\u{9ed8}\u{8ba4}\u{8bbe}\u{7f6e}",
+    ),
+    ("git_flow.initialize.submit", "\u{521d}\u{59cb}\u{5316}"),
+    (
+        "git_flow.next_action",
+        "\u{4e0b}\u{4e00}\u{4e2a}\u{52a8}\u{4f5c}",
+    ),
+    (
+        "git_flow.next_action.title",
+        "\u{9009}\u{62e9}\u{4e0b}\u{4e00}\u{4e2a}\u{6d41}\u{52a8}\u{4f5c}",
+    ),
+    (
+        "git_flow.next_action.recommended",
+        "\u{63a8}\u{8350}\u{52a8}\u{4f5c}:",
+    ),
+    (
+        "git_flow.next_action.other",
+        "\u{5176}\u{4ed6}\u{64cd}\u{4f5c}...",
+    ),
+    (
+        "git_flow.other_action.title",
+        "\u{9009}\u{62e9} Git Flow \u{64cd}\u{4f5c}",
+    ),
+    ("git_flow.name", "\u{540d}\u{79f0}"),
+    ("git_flow.start_from", "\u{5f00}\u{59cb}\u{4e8e}:"),
+    ("git_flow.branch_name", "\u{5206}\u{652f}\u{540d}"),
+    (
+        "git_flow.branch_preview",
+        "\u{5c06}\u{521b}\u{5efa}\u{5206}\u{652f}:",
+    ),
+    ("git_flow.preview", "\u{9884}\u{89c8}"),
+    (
+        "git_flow.preview.create_branch",
+        "\u{521b}\u{5efa}\u{65b0}\u{5206}\u{652f}",
+    ),
+    (
+        "git_flow.preview.missing_start",
+        "\u{672a}\u{9009}\u{62e9}\u{5f00}\u{59cb}\u{70b9}",
+    ),
+    (
+        "git_flow.start_feature.title",
+        "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{529f}\u{80fd}",
+    ),
+    (
+        "git_flow.finish_feature.title",
+        "\u{5b8c}\u{6210}\u{529f}\u{80fd}",
+    ),
+    (
+        "git_flow.start_release.title",
+        "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{53d1}\u{5e03}\u{7248}\u{672c}",
+    ),
+    (
+        "git_flow.finish_release.title",
+        "\u{5b8c}\u{6210}\u{53d1}\u{5e03}\u{7248}\u{672c}",
+    ),
+    (
+        "git_flow.start_hotfix.title",
+        "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{4fee}\u{590d}\u{8865}\u{4e01}",
+    ),
+    (
+        "git_flow.finish_hotfix.title",
+        "\u{5b8c}\u{6210}\u{4fee}\u{590d}\u{8865}\u{4e01}",
+    ),
+    (
+        "git_flow.start.detail",
+        "\u{4ece}\u{914d}\u{7f6e}\u{7684}\u{57fa}\u{7840}\u{5206}\u{652f}\u{521b}\u{5efa}\u{5e76}\u{68c0}\u{51fa}\u{65b0}\u{5206}\u{652f}\u{3002}",
+    ),
+    (
+        "git_flow.finish_feature.detail",
+        "\u{5c06}\u{529f}\u{80fd}\u{5206}\u{652f}\u{5408}\u{5e76}\u{56de} develop \u{5e76}\u{5220}\u{9664}\u{529f}\u{80fd}\u{5206}\u{652f}\u{3002}",
+    ),
+    (
+        "git_flow.finish_release.detail",
+        "\u{5c06}\u{53d1}\u{5e03}\u{5206}\u{652f}\u{5408}\u{5e76}\u{5230} production \u{548c} develop\u{ff0c}\u{5e76}\u{521b}\u{5efa} tag\u{3002}",
+    ),
+    (
+        "git_flow.finish_hotfix.detail",
+        "\u{5c06}\u{4fee}\u{590d}\u{5206}\u{652f}\u{5408}\u{5e76}\u{5230} production \u{548c} develop\u{ff0c}\u{5e76}\u{521b}\u{5efa} tag\u{3002}",
+    ),
+    ("git_flow.start", "\u{5f00}\u{59cb}"),
+    ("git_flow.finish", "\u{5b8c}\u{6210}"),
+    (
+        "git_flow.error.fix_inputs",
+        "\u{8bf7}\u{4fee}\u{6b63}\u{4ee5}\u{4e0b}\u{8f93}\u{5165}:",
+    ),
+    (
+        "git_flow.error.required",
+        "\u{5fc5}\u{586b}\u{9879}\u{4e0d}\u{80fd}\u{4e3a}\u{7a7a}",
+    ),
+    (
+        "git_flow.error.branch_invalid",
+        "\u{5206}\u{652f}\u{540d}\u{4e0d}\u{5408}\u{6cd5}",
+    ),
+    (
+        "git_flow.error.branch_same",
+        "production \u{548c} develop \u{5206}\u{652f}\u{4e0d}\u{80fd}\u{76f8}\u{540c}",
+    ),
+    (
+        "git_flow.error.branch_exists",
+        "\u{5206}\u{652f}\u{5df2}\u{5b58}\u{5728}",
+    ),
+    (
+        "git_flow.error.branch_prefix",
+        "\u{5206}\u{652f}\u{524d}\u{7f00}\u{4e0d}\u{5339}\u{914d}",
+    ),
+    (
+        "git_flow.error.branch_missing",
+        "\u{5206}\u{652f}\u{4e0d}\u{5b58}\u{5728}",
+    ),
+    (
+        "git_flow.error.start_point_missing",
+        "\u{8bf7}\u{9009}\u{62e9}\u{6709}\u{6548}\u{7684}\u{5f00}\u{59cb}\u{70b9}",
     ),
     (
         "repo.command_mode.failed",
@@ -257,8 +390,24 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "interactive_rebase.selected_commit",
         "\u{5df2}\u{9009}\u{63d0}\u{4ea4}:",
     ),
+    (
+        "interactive_rebase.base_commit",
+        "\u{57fa}\u{70b9}\u{63d0}\u{4ea4}:",
+    ),
+    (
+        "interactive_rebase.published_warning",
+        "\u{6b64}\u{64cd}\u{4f5c}\u{4f1a}\u{91cd}\u{5199}\u{5df2}\u{7ecf}\u{63a8}\u{9001}\u{5230}\u{8fdc}\u{7aef}\u{7684}\u{5386}\u{53f2}\u{3002}\u{5b8c}\u{6210}\u{540e}\u{9700}\u{8981} force-with-lease \u{63a8}\u{9001}\u{ff0c}\u{5176}\u{4ed6}\u{4eba}\u{82e5}\u{62c9}\u{8fc7}\u{6b64}\u{5206}\u{652f}\u{4f1a}\u{53d7}\u{5f71}\u{54cd}\u{3002}",
+    ),
+    (
+        "interactive_rebase.confirm_published",
+        "\u{6211}\u{786e}\u{8ba4}\u{8981}\u{91cd}\u{5199}\u{5df2}\u{63a8}\u{9001}\u{5386}\u{53f2}",
+    ),
     ("interactive_rebase.todo_action", "\u{52a8}\u{4f5c}:"),
     ("interactive_rebase.todo.pick", "\u{4fdd}\u{7559}"),
+    (
+        "interactive_rebase.todo.none",
+        "\u{9009}\u{62e9}\u{52a8}\u{4f5c}",
+    ),
     (
         "interactive_rebase.todo.squash",
         "\u{5408}\u{5e76}\u{5230}\u{4e0a}\u{4e00}\u{4e2a}",
@@ -273,6 +422,18 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "interactive_rebase.squash_selected",
         "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230}\u{4e0a}\u{4e00}\u{4e2a}",
+    ),
+    (
+        "interactive_rebase.squash_target",
+        "\u{5408}\u{5e76}\u{76ee}\u{6807}:",
+    ),
+    (
+        "interactive_rebase.squash_to_target",
+        "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230}\u{76ee}\u{6807}",
+    ),
+    (
+        "interactive_rebase.squash_to_target_applied",
+        "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230}",
     ),
     (
         "interactive_rebase.reset_selected",
@@ -308,8 +469,20 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{5f53}\u{524d}\u{5206}\u{652f}\u{6ca1}\u{6709}\u{53ef}\u{7528}\u{4e8e}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{7684}\u{63d0}\u{4ea4}",
     ),
     (
+        "interactive_rebase.error.no_children",
+        "\u{6240}\u{9009}\u{63d0}\u{4ea4}\u{4e4b}\u{540e}\u{6ca1}\u{6709}\u{53ef}\u{7528}\u{4e8e}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{7684}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "interactive_rebase.error.confirm_published",
+        "\u{8bf7}\u{5148}\u{786e}\u{8ba4}\u{91cd}\u{5199}\u{5df2}\u{63a8}\u{9001}\u{5386}\u{53f2}",
+    ),
+    (
         "interactive_rebase.error.first_squash",
         "\u{6700}\u{65e9}\u{7684}\u{63d0}\u{4ea4}\u{4e0d}\u{80fd} squash",
+    ),
+    (
+        "interactive_rebase.error.no_changes",
+        "\u{8bf7}\u{5148}\u{9009}\u{62e9}\u{8981}\u{6267}\u{884c}\u{7684}\u{53d8}\u{57fa}\u{52a8}\u{4f5c}",
     ),
     (
         "interactive_rebase.in_progress.title",
@@ -322,6 +495,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "interactive_rebase.in_progress.conflicts",
         "\u{5f53}\u{524d}\u{6709}\u{51b2}\u{7a81}\u{6587}\u{4ef6}\u{ff0c}\u{9700}\u{5148}\u{89e3}\u{51b2}\u{5e76}\u{6682}\u{5b58}\u{3002}",
+    ),
+    (
+        "interactive_rebase.in_progress.ready",
+        "\u{51b2}\u{7a81}\u{5df2}\u{89e3}\u{51b3}\u{ff0c}\u{53ef}\u{4ee5}\u{7ee7}\u{7eed}\u{53d8}\u{57fa}\u{3002}",
     ),
     (
         "interactive_rebase.in_progress.continue",
@@ -762,8 +939,20 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("rewrite_prompt.later", "\u{7a0d}\u{540e}\u{5904}\u{7406}"),
     ("credentials.github_login", "\u{767b}\u{5f55} GitHub"),
     (
+        "credentials.github_login_running",
+        "\u{6b63}\u{5728}\u{767b}\u{5f55} GitHub...",
+    ),
+    (
         "credentials.github_login_done",
         "GitHub \u{767b}\u{5f55}\u{5df2}\u{5b8c}\u{6210}",
+    ),
+    (
+        "credentials.github_login_done_message",
+        "GitHub \u{767b}\u{5f55}\u{5df2}\u{5b8c}\u{6210}\u{3002}\u{5982}\u{679c}\u{6ca1}\u{6709}\u{53ef}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{7684} Git \u{64cd}\u{4f5c}\u{ff0c}\u{8bf7}\u{91cd}\u{65b0}\u{6253}\u{5f00}\u{63a8}\u{9001}\u{5e76}\u{518d}\u{6b21}\u{786e}\u{8ba4}\u{3002}",
+    ),
+    (
+        "credentials.github_retry_failed",
+        "\u{767b}\u{5f55}\u{540e}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{4ecd}\u{7136}\u{5931}\u{8d25}\u{3002}\u{8bf7}\u{68c0}\u{67e5}\u{5f53}\u{524d} HTTPS \u{51ed}\u{636e}\u{3001}GitHub \u{8d26}\u{53f7}\u{5199}\u{6743}\u{9650}\u{ff0c}\u{6216}\u{8005}\u{6539}\u{7528} SSH remote\u{3002}",
     ),
 ];
 
@@ -945,6 +1134,72 @@ const EN: &[(&str, &str)] = &[
     ("repo.command_mode", "Command Mode"),
     ("repo.resource_manager", "Resource Manager"),
     ("repo.git_flow.opened", "Git workflow opened"),
+    ("git_flow.initialize.title", "Initialize Git Workflow"),
+    (
+        "git_flow.initialize.detail",
+        "Git Flow saves Production/Develop branch and Feature/Release/Hotfix prefix settings. If the Develop branch does not exist, it is created from Production; Feature/Release/Hotfix branches are created by their start actions.",
+    ),
+    ("git_flow.production_branch", "Production branch"),
+    ("git_flow.development_branch", "Develop branch"),
+    ("git_flow.feature_prefix", "Feature prefix"),
+    ("git_flow.release_prefix", "Release prefix"),
+    ("git_flow.hotfix_prefix", "Hotfix prefix"),
+    ("git_flow.version_tag_prefix", "Tag prefix"),
+    ("git_flow.use_defaults", "Use defaults"),
+    ("git_flow.initialize.submit", "Initialize"),
+    ("git_flow.next_action", "Next action"),
+    ("git_flow.next_action.title", "Choose Next Flow Action"),
+    ("git_flow.next_action.recommended", "Recommended actions:"),
+    ("git_flow.next_action.other", "Other actions..."),
+    ("git_flow.other_action.title", "Choose Git Flow Action"),
+    ("git_flow.name", "Name"),
+    ("git_flow.start_from", "Start from:"),
+    ("git_flow.branch_name", "Branch name"),
+    ("git_flow.branch_preview", "Branch to create:"),
+    ("git_flow.preview", "Preview"),
+    ("git_flow.preview.create_branch", "Create branch"),
+    ("git_flow.preview.missing_start", "No start point"),
+    ("git_flow.start_feature.title", "Start New Feature"),
+    ("git_flow.finish_feature.title", "Finish Feature"),
+    ("git_flow.start_release.title", "Start New Release"),
+    ("git_flow.finish_release.title", "Finish Release"),
+    ("git_flow.start_hotfix.title", "Start New Hotfix"),
+    ("git_flow.finish_hotfix.title", "Finish Hotfix"),
+    (
+        "git_flow.start.detail",
+        "Create and checkout a new branch from the configured base branch.",
+    ),
+    (
+        "git_flow.finish_feature.detail",
+        "Merge the feature branch back into develop and delete the feature branch.",
+    ),
+    (
+        "git_flow.finish_release.detail",
+        "Merge the release branch into production and develop, then create a tag.",
+    ),
+    (
+        "git_flow.finish_hotfix.detail",
+        "Merge the hotfix branch into production and develop, then create a tag.",
+    ),
+    ("git_flow.start", "Start"),
+    ("git_flow.finish", "Finish"),
+    ("git_flow.error.fix_inputs", "Fix these inputs:"),
+    ("git_flow.error.required", "Required fields cannot be empty"),
+    ("git_flow.error.branch_invalid", "Branch name is invalid"),
+    (
+        "git_flow.error.branch_same",
+        "Production and develop branches cannot be the same",
+    ),
+    ("git_flow.error.branch_exists", "Branch already exists"),
+    (
+        "git_flow.error.branch_prefix",
+        "Branch prefix does not match this action",
+    ),
+    ("git_flow.error.branch_missing", "Branch does not exist"),
+    (
+        "git_flow.error.start_point_missing",
+        "Choose a valid start point",
+    ),
     ("repo.command_mode.failed", "Failed to open command mode"),
     (
         "repo.resource_manager.failed",
@@ -1025,8 +1280,18 @@ const EN: &[(&str, &str)] = &[
         "Select commits to rebase",
     ),
     ("interactive_rebase.selected_commit", "Selected commit:"),
+    ("interactive_rebase.base_commit", "Base commit:"),
+    (
+        "interactive_rebase.published_warning",
+        "This operation rewrites history that has already been pushed to the remote. After it completes, you will need a force-with-lease push, and anyone who pulled this branch can be affected.",
+    ),
+    (
+        "interactive_rebase.confirm_published",
+        "I understand this rewrites pushed history",
+    ),
     ("interactive_rebase.todo_action", "Action:"),
     ("interactive_rebase.todo.pick", "Pick"),
+    ("interactive_rebase.todo.none", "Choose action"),
     ("interactive_rebase.todo.squash", "Squash into previous"),
     ("interactive_rebase.todo.drop", "Drop"),
     ("interactive_rebase.reset", "Reset"),
@@ -1035,6 +1300,15 @@ const EN: &[(&str, &str)] = &[
     (
         "interactive_rebase.squash_selected",
         "Squash selected into previous",
+    ),
+    ("interactive_rebase.squash_target", "Squash target:"),
+    (
+        "interactive_rebase.squash_to_target",
+        "Squash selected into target",
+    ),
+    (
+        "interactive_rebase.squash_to_target_applied",
+        "Squash selected into",
     ),
     ("interactive_rebase.reset_selected", "Reset selected"),
     (
@@ -1064,8 +1338,20 @@ const EN: &[(&str, &str)] = &[
         "Current branch has no commits available for interactive rebase",
     ),
     (
+        "interactive_rebase.error.no_children",
+        "Selected commit has no later commits available for interactive rebase",
+    ),
+    (
+        "interactive_rebase.error.confirm_published",
+        "Confirm pushed-history rewrite first",
+    ),
+    (
         "interactive_rebase.error.first_squash",
         "Oldest commit cannot be squash",
+    ),
+    (
+        "interactive_rebase.error.no_changes",
+        "Choose at least one rebase action first",
     ),
     ("interactive_rebase.in_progress.title", "Rebase in progress"),
     (
@@ -1075,6 +1361,10 @@ const EN: &[(&str, &str)] = &[
     (
         "interactive_rebase.in_progress.conflicts",
         "Conflicted files must be resolved and staged before continuing.",
+    ),
+    (
+        "interactive_rebase.in_progress.ready",
+        "Conflicts are resolved. Continue the rebase.",
     ),
     ("interactive_rebase.in_progress.continue", "Continue"),
     ("interactive_rebase.in_progress.skip", "Skip current commit"),
@@ -1283,7 +1573,19 @@ const EN: &[(&str, &str)] = &[
     ("dialog.error.title", "Git error"),
     ("dialog.error.message", "The Git command returned an error."),
     ("credentials.github_login", "Log in to GitHub"),
+    (
+        "credentials.github_login_running",
+        "Logging in to GitHub...",
+    ),
     ("credentials.github_login_done", "GitHub login completed"),
+    (
+        "credentials.github_login_done_message",
+        "GitHub login completed. If there is no Git operation that can be retried automatically, open push again and confirm it.",
+    ),
+    (
+        "credentials.github_retry_failed",
+        "Automatic retry after login still failed. Check the current HTTPS credential, GitHub account write permission, or switch this remote to SSH.",
+    ),
     ("menu.copy_hash", "Copy commit hash"),
     ("menu.copy_short_hash", "Copy short hash"),
     ("menu.copy", "Copy"),
@@ -1291,6 +1593,10 @@ const EN: &[(&str, &str)] = &[
     ("menu.create_branch", "Create branch here"),
     ("menu.create_tag", "Create tag here"),
     ("menu.cherry_pick", "Cherry-pick commit"),
+    (
+        "menu.interactive_rebase_children",
+        "Rebase children of this commit interactively...",
+    ),
     ("menu.revert", "Revert commit"),
     ("menu.reset", "Reset current branch to here"),
     ("menu.compare", "Compare"),

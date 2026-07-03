@@ -87,6 +87,7 @@ const COMMIT_MESSAGE_EDITOR_MIN_HEIGHT: f32 = 34.0;
 const COMMIT_BUTTON_ROW_HEIGHT: f32 = 30.0;
 const COMMIT_MESSAGE_BOTTOM_GAP: f32 = 4.0;
 const COMMIT_SUBMIT_BUTTON_SIZE: Vec2 = Vec2 { x: 54.0, y: 24.0 };
+const REBASE_CONTROL_BUTTON_SIZE: Vec2 = Vec2 { x: 104.0, y: 28.0 };
 const HISTORY_TABLE_HEADER_HEIGHT: f32 = 24.0;
 const HISTORY_TABLE_ROW_HEIGHT: f32 = 22.0;
 const HISTORY_REF_BADGE_MIN_WIDTH: f32 = 34.0;
@@ -132,6 +133,7 @@ const MERGE_DIALOG_WIDTH: f32 = 980.0;
 const INTERACTIVE_REBASE_DIALOG_WIDTH: f32 = 980.0;
 const DEPENDENCY_DIALOG_WIDTH: f32 = 700.0;
 const LFS_DIALOG_WIDTH: f32 = 460.0;
+const GIT_FLOW_DIALOG_WIDTH: f32 = 520.0;
 const REPO_SETTINGS_TABS_HEIGHT: f32 = 34.0;
 const REPO_SETTINGS_TAB_WIDTH: f32 = 104.0;
 const REPO_SETTINGS_TAB_HEIGHT: f32 = 28.0;
@@ -374,6 +376,7 @@ pub struct GitAgentApp {
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
     credential_login_task: Option<Receiver<anyhow::Result<()>>>,
+    credential_retry_in_progress: bool,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
     merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
@@ -412,6 +415,7 @@ pub struct GitAgentApp {
     pending_force_push_confirm: Option<ConfirmForcePushDialog>,
     pending_rewritten_history_prompt_root: Option<PathBuf>,
     pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
+    pending_credential_retry: Option<PendingCredentialRetryAction>,
     pending_archive_action: Option<ArchiveActionDialog>,
     pending_merge_action: Option<MergeActionDialog>,
     pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>,
@@ -419,6 +423,7 @@ pub struct GitAgentApp {
     pending_submodule_action: Option<SubmoduleActionDialog>,
     pending_subtree_action: Option<SubtreeActionDialog>,
     pending_lfs_action: Option<LfsActionDialog>,
+    pending_git_flow_action: Option<GitFlowActionDialog>,
     commit_message: String,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
@@ -655,6 +660,7 @@ enum CommitMenuAction {
     CreateBranch { hash: String, short_hash: String },
     CreateTag { hash: String, short_hash: String },
     CherryPick { hash: String, short_hash: String },
+    InteractiveRebaseChildren { hash: String, short_hash: String },
     Revert { hash: String, short_hash: String },
     Reset { hash: String, short_hash: String },
     CompareWithWorktree { hash: String, short_hash: String },
@@ -725,6 +731,15 @@ struct ConfirmForcePushDialog {
 }
 
 #[derive(Clone, Debug)]
+enum PendingCredentialRetryAction {
+    Push {
+        remote: String,
+        branches: Vec<git::PushBranchSpec>,
+        options: git::PushOptions,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct PushBranchRow {
     selected: bool,
     local_branch: String,
@@ -773,14 +788,6 @@ enum InteractiveRebaseTodoAction {
 }
 
 impl InteractiveRebaseTodoAction {
-    fn label(self, language: Language) -> &'static str {
-        match self {
-            Self::Pick => i18n::t(language, "interactive_rebase.todo.pick"),
-            Self::Squash => i18n::t(language, "interactive_rebase.todo.squash"),
-            Self::Drop => i18n::t(language, "interactive_rebase.todo.drop"),
-        }
-    }
-
     fn to_git_action(self) -> git::InteractiveRebaseAction {
         match self {
             Self::Pick => git::InteractiveRebaseAction::Pick,
@@ -790,8 +797,19 @@ impl InteractiveRebaseTodoAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveRebaseScope {
+    LocalUnpushed,
+    ChildrenOfCommit,
+}
+
 #[derive(Clone, Debug)]
 struct InteractiveRebaseActionDialog {
+    scope: InteractiveRebaseScope,
+    base_hash: String,
+    base_short_hash: String,
+    rewrites_published_history: bool,
+    acknowledge_published_rewrite: bool,
     selected_hash: String,
     selected_short_hash: String,
     branch_scope: HistoryBranchScope,
@@ -801,12 +819,21 @@ struct InteractiveRebaseActionDialog {
     history_cache: HistoryCommitBrowserCache,
     actions: BTreeMap<String, InteractiveRebaseTodoAction>,
     selected_hashes: HashSet<String>,
+    squash_target_hash: Option<String>,
+    squash_range_hashes: Vec<String>,
     validation_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RebaseControlDialog {
     message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebaseControlAction {
+    Continue,
+    Skip,
+    Abort,
 }
 
 #[derive(Clone, Debug)]
@@ -838,6 +865,40 @@ enum LfsActionDialog {
         selected: Option<usize>,
         validation_error: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitFlowOperation {
+    Start(git::GitFlowBranchKind),
+    Finish(git::GitFlowBranchKind),
+}
+
+#[derive(Clone, Debug)]
+enum GitFlowActionDialog {
+    Initialize {
+        config: git::GitFlowConfig,
+        validation_error: Option<String>,
+    },
+    NextAction {
+        config: git::GitFlowConfig,
+    },
+    OtherActions {
+        config: git::GitFlowConfig,
+    },
+    Run {
+        operation: GitFlowOperation,
+        config: git::GitFlowConfig,
+        name: String,
+        start_point: String,
+        branch_name: String,
+        validation_error: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitFlowStartPointOption {
+    name: String,
+    subject: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1892,6 +1953,7 @@ impl GitAgentApp {
             inactive_repo_refresh_seconds,
             remote_git_task: None,
             credential_login_task: None,
+            credential_retry_in_progress: false,
             branch_checkout_task: None,
             merge_tool_task: None,
             repo_source_task: None,
@@ -1930,6 +1992,7 @@ impl GitAgentApp {
             pending_force_push_confirm: None,
             pending_rewritten_history_prompt_root: None,
             pending_rewritten_history_prompt: None,
+            pending_credential_retry: None,
             pending_archive_action: None,
             pending_merge_action: None,
             pending_interactive_rebase_action: None,
@@ -1937,6 +2000,7 @@ impl GitAgentApp {
             pending_submodule_action: None,
             pending_subtree_action: None,
             pending_lfs_action: None,
+            pending_git_flow_action: None,
             commit_message: String::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
@@ -2485,8 +2549,73 @@ impl GitAgentApp {
     }
 
     fn open_git_workflow(&mut self) {
-        self.active_view = MainView::Branches;
-        self.last_notice = Some(self.tr("repo.git_flow.opened").to_owned());
+        self.open_git_flow_next_action();
+    }
+
+    fn open_git_flow_initialize_dialog(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let config = git::read_git_flow_config(&snapshot.root)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| git_flow_config_defaults(snapshot));
+        self.pending_git_flow_action = Some(GitFlowActionDialog::Initialize {
+            config,
+            validation_error: None,
+        });
+    }
+
+    fn open_git_flow_next_action(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        match git::read_git_flow_config(&snapshot.root) {
+            Ok(Some(config)) => {
+                self.pending_git_flow_action = Some(GitFlowActionDialog::NextAction { config })
+            }
+            Ok(None) => self.open_git_flow_initialize_dialog(),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn open_git_flow_action_dialog(&mut self, operation: GitFlowOperation) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        match git::read_git_flow_config(&snapshot.root) {
+            Ok(Some(config)) => self.open_git_flow_run_dialog(operation, config),
+            Ok(None) => self.open_git_flow_initialize_dialog(),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn open_git_flow_run_dialog(
+        &mut self,
+        operation: GitFlowOperation,
+        config: git::GitFlowConfig,
+    ) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        self.pending_git_flow_action = Some(GitFlowActionDialog::Run {
+            operation,
+            name: git_flow_operation_default_name(snapshot, &config, operation),
+            start_point: match operation {
+                GitFlowOperation::Start(kind) => {
+                    git_flow_default_start_point(snapshot, &config, kind)
+                }
+                GitFlowOperation::Finish(_) => String::new(),
+            },
+            branch_name: match operation {
+                GitFlowOperation::Start(_) => String::new(),
+                GitFlowOperation::Finish(kind) => {
+                    git_flow_current_branch_for_kind(snapshot, &config, kind).unwrap_or_default()
+                }
+            },
+            config,
+            validation_error: None,
+        });
     }
 
     fn open_repo_settings_from_menu(&mut self) {
@@ -2931,40 +3060,47 @@ impl GitAgentApp {
         });
     }
 
-    fn open_interactive_rebase_dialog(&mut self) {
+    fn prepare_interactive_rebase_snapshot(&mut self) -> Option<RepositorySnapshot> {
         if self.branch_actions_busy() {
-            return;
+            return None;
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
-            return;
+            return None;
         };
         if snapshot.rebase_in_progress {
             if !git::repository_rebase_in_progress(&snapshot.root) {
                 let root = snapshot.root.clone();
                 self.error = None;
                 self.load_repository_uncached(root);
-                return;
+                return None;
             }
             self.pending_rebase_control_action = Some(RebaseControlDialog::default());
             self.active_view = MainView::Workspace;
-            return;
+            return None;
         }
         if !snapshot.unstaged.is_empty() {
             self.error = Some(interactive_rebase_dirty_message(self.language));
-            return;
+            return None;
         }
         if !snapshot.staged.is_empty() {
             self.error =
                 Some(i18n::t(self.language, "interactive_rebase.error.index_dirty").to_owned());
-            return;
+            return None;
         }
         if current_named_local_branch(snapshot).is_none() {
             self.error =
                 Some(i18n::t(self.language, "interactive_rebase.error.detached").to_owned());
-            return;
+            return None;
         }
 
-        let commits = interactive_rebase_dialog_commits(snapshot, self.history_sort_order);
+        Some(snapshot.clone())
+    }
+
+    fn open_interactive_rebase_dialog(&mut self) {
+        let Some(snapshot) = self.prepare_interactive_rebase_snapshot() else {
+            return;
+        };
+        let commits = interactive_rebase_dialog_commits(&snapshot, self.history_sort_order);
         let Some(commit) = self
             .selected_commit
             .and_then(|index| snapshot.commits.get(index))
@@ -2985,6 +3121,9 @@ impl GitAgentApp {
                 Some(i18n::t(self.language, "interactive_rebase.error.no_commits").to_owned());
             return;
         };
+        let base_hash =
+            interactive_rebase_base_for_commits(&commits).unwrap_or_else(|| "--root".to_owned());
+        let base_short_hash = short_rebase_base_label(&base_hash);
         let actions = commits
             .iter()
             .filter(|commit| !interactive_rebase_commit_is_merge(commit))
@@ -2992,6 +3131,11 @@ impl GitAgentApp {
             .collect();
 
         self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash,
+            base_short_hash,
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
             selected_hash: commit.hash,
             selected_short_hash: commit.short_hash,
             branch_scope: HistoryBranchScope::Current,
@@ -3001,6 +3145,56 @@ impl GitAgentApp {
             history_cache: HistoryCommitBrowserCache::default(),
             actions,
             selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        });
+    }
+
+    fn open_interactive_rebase_dialog_from_base(
+        &mut self,
+        base_hash: String,
+        base_short_hash: String,
+    ) {
+        let Some(snapshot) = self.prepare_interactive_rebase_snapshot() else {
+            return;
+        };
+        let commits =
+            interactive_rebase_children_of_commit(&snapshot, &base_hash, self.history_sort_order);
+        let Some(commit) = commits
+            .iter()
+            .find(|commit| !interactive_rebase_commit_is_merge(commit))
+            .cloned()
+        else {
+            self.error =
+                Some(i18n::t(self.language, "interactive_rebase.error.no_children").to_owned());
+            return;
+        };
+        let actions = commits
+            .iter()
+            .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+            .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
+            .collect();
+        let rewrites_published_history =
+            interactive_rebase_rewrites_published_history(&snapshot, &commits);
+
+        self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::ChildrenOfCommit,
+            base_hash,
+            base_short_hash,
+            rewrites_published_history,
+            acknowledge_published_rewrite: !rewrites_published_history,
+            selected_hash: commit.hash,
+            selected_short_hash: commit.short_hash,
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: self.history_sort_order,
+            show_remote_refs: self.history_show_remote_refs,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions,
+            selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
             validation_error: None,
         });
     }
@@ -3068,12 +3262,47 @@ impl GitAgentApp {
         let (sender, receiver) = mpsc::channel();
         self.credential_login_task = Some(receiver);
         self.loading_repo = true;
-        self.error = None;
         self.last_notice = None;
 
         thread::spawn(move || {
             let _ = sender.send(git::github_credential_manager_login());
         });
+    }
+
+    fn start_credential_retry_action(
+        &mut self,
+        action: PendingCredentialRetryAction,
+        after_login: bool,
+    ) {
+        match action.clone() {
+            PendingCredentialRetryAction::Push {
+                remote,
+                branches,
+                options,
+            } => {
+                self.pending_credential_retry = Some(action);
+                self.credential_retry_in_progress = after_login;
+                self.start_remote_git_action(move |root| {
+                    git::push_selected(root, &remote, &branches, options)
+                });
+            }
+        }
+    }
+
+    fn start_push_with_credential_retry(
+        &mut self,
+        remote: String,
+        branches: Vec<git::PushBranchSpec>,
+        options: git::PushOptions,
+    ) {
+        self.start_credential_retry_action(
+            PendingCredentialRetryAction::Push {
+                remote,
+                branches,
+                options,
+            },
+            false,
+        );
     }
 
     fn start_remote_git_action(
@@ -3356,14 +3585,28 @@ impl GitAgentApp {
             .unwrap_or_else(|| "Repository".to_owned())
     }
 
+    fn open_rebase_control_if_needed(&mut self, snapshot: &RepositorySnapshot) -> bool {
+        if !(snapshot.rebase_in_progress || git::repository_rebase_in_progress(&snapshot.root)) {
+            return false;
+        }
+        self.pending_rebase_control_action = Some(RebaseControlDialog::default());
+        self.active_view = MainView::Workspace;
+        self.error = None;
+        true
+    }
+
     fn push_current(&mut self) {
         self.open_push_dialog(None, None);
     }
 
     fn quick_push_current(&mut self) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(snapshot_owned) = self.snapshot.clone() else {
             return;
         };
+        let snapshot = &snapshot_owned;
+        if self.open_rebase_control_if_needed(snapshot) {
+            return;
+        }
         if current_named_local_branch(snapshot).is_none() {
             self.error = Some(self.tr("push.detached_error").to_owned());
             return;
@@ -3381,9 +3624,13 @@ impl GitAgentApp {
         target_remote: Option<String>,
         force: bool,
     ) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(snapshot_owned) = self.snapshot.clone() else {
             return;
         };
+        let snapshot = &snapshot_owned;
+        if self.open_rebase_control_if_needed(snapshot) {
+            return;
+        }
         let current_branch = current_named_local_branch(snapshot);
         if target_branch.is_none() && current_branch.is_none() {
             self.error = Some(self.tr("push.detached_error").to_owned());
@@ -3546,7 +3793,6 @@ impl GitAgentApp {
                         if self.active_repo_root_matches(&requested_root) {
                             self.apply_repository_snapshot(snapshot);
                             self.pending_branch_checkout = None;
-                            self.error = None;
                         }
                     }
                     Err(error) => {
@@ -3609,6 +3855,8 @@ impl GitAgentApp {
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
+                    self.pending_credential_retry = None;
+                    self.credential_retry_in_progress = false;
                     self.error = None;
                     self.last_notice = None;
                     self.load_repository_uncached(root);
@@ -3635,7 +3883,18 @@ impl GitAgentApp {
                         return;
                     }
                     self.loading_repo = false;
-                    self.error = Some(error.to_string());
+                    let mut message = error.to_string();
+                    let auth_error = github_authentication_error(&message);
+                    let was_login_retry = self.credential_retry_in_progress;
+                    self.credential_retry_in_progress = false;
+                    if was_login_retry && auth_error {
+                        self.pending_credential_retry = None;
+                        message.push_str("\n\n");
+                        message.push_str(self.tr("credentials.github_retry_failed"));
+                    } else if !auth_error {
+                        self.pending_credential_retry = None;
+                    }
+                    self.error = Some(message);
                     self.last_notice = None;
                     ctx.request_repaint();
                 }
@@ -3656,11 +3915,13 @@ impl GitAgentApp {
         if let Some(receiver) = self.credential_login_task.take() {
             match receiver.try_recv() {
                 Ok(Ok(())) => {
-                    self.error = None;
                     self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
                     self.loading_repo = false;
-                    if let Some(root) = self.active_repo_root() {
-                        self.load_repository_uncached(root);
+                    if let Some(retry) = self.pending_credential_retry.take() {
+                        self.start_credential_retry_action(retry, true);
+                    } else {
+                        self.error =
+                            Some(self.tr("credentials.github_login_done_message").to_owned());
                     }
                     ctx.request_repaint();
                 }
@@ -4421,6 +4682,7 @@ impl App for GitAgentApp {
         self.interactive_rebase_action_modal(ctx);
         self.rebase_control_modal(ctx);
         self.rewritten_history_prompt_modal(ctx);
+        self.git_flow_action_modal(ctx);
         self.lfs_action_modal(ctx);
         self.submodule_action_modal(ctx);
         self.subtree_action_modal(ctx);
@@ -4478,12 +4740,17 @@ impl GitAgentApp {
                 if ui.button(self.tr("menu.copy")).clicked() {
                     ui.ctx().copy_text(message.clone());
                 }
-                if github_authentication_error(&message)
-                    && dialog_primary_button(ui, self.tr("credentials.github_login"), true)
-                        .clicked()
+                if github_authentication_error(&message) && self.pending_credential_retry.is_some()
                 {
-                    self.start_github_credential_login();
-                    close_requested = true;
+                    let login_running = self.credential_login_task.is_some();
+                    let login_label = if login_running {
+                        self.tr("credentials.github_login_running")
+                    } else {
+                        self.tr("credentials.github_login")
+                    };
+                    if dialog_primary_button(ui, login_label, !login_running).clicked() {
+                        self.start_github_credential_login();
+                    }
                 }
             });
         });
@@ -5018,46 +5285,100 @@ impl GitAgentApp {
                     }
                 });
                 menu_button(ui, menu_label(self.language, "repo_git_flow"), |ui| {
-                    menu_text_button(
+                    let git_flow_operation_enabled =
+                        git_flow_operation_menu_enabled(self.snapshot.as_ref(), git_dialog_enabled);
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_dialog_enabled,
                         menu_label(self.language, "repo_git_flow_initialize"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_initialize_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_next_action"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_next_action();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_start_feature"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                            git::GitFlowBranchKind::Feature,
+                        ));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_finish_feature"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                            git::GitFlowBranchKind::Feature,
+                        ));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_start_release"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                            git::GitFlowBranchKind::Release,
+                        ));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_finish_release"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                            git::GitFlowBranchKind::Release,
+                        ));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_start_hotfix"),
-                    );
-                    menu_text_button(
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                            git::GitFlowBranchKind::Hotfix,
+                        ));
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
                         ui,
-                        false,
+                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_finish_hotfix"),
-                    );
+                    )
+                    .clicked()
+                    {
+                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                            git::GitFlowBranchKind::Hotfix,
+                        ));
+                        ui.close_menu();
+                    }
                 });
                 if menu_text_button(
                     ui,
@@ -7492,6 +7813,9 @@ impl GitAgentApp {
                 self.pending_commit_action =
                     Some(CommitActionDialog::ConfirmCherryPick { hash, short_hash });
             }
+            CommitMenuAction::InteractiveRebaseChildren { hash, short_hash } => {
+                self.open_interactive_rebase_dialog_from_base(hash, short_hash);
+            }
             CommitMenuAction::Revert { hash, short_hash } => {
                 self.pending_commit_action =
                     Some(CommitActionDialog::ConfirmRevert { hash, short_hash });
@@ -7887,6 +8211,16 @@ impl GitAgentApp {
                     ui,
                     frame_inner_size(ui.available_width(), panel_height, 12, 10),
                 );
+                let rebase_snapshot = self
+                    .snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.rebase_in_progress)
+                    .cloned();
+                if let Some(snapshot) = rebase_snapshot {
+                    self.rebase_commit_panel_body(ui, &snapshot);
+                    return;
+                }
+
                 ui.horizontal(|ui| {
                     panel_heading_inline(ui, self.tr("commit.panel"));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -7953,6 +8287,106 @@ impl GitAgentApp {
             });
             paint_workspace_card_inset_shadow(ui, card_rect);
         });
+    }
+
+    fn rebase_commit_panel_body(&mut self, ui: &mut Ui, snapshot: &RepositorySnapshot) {
+        ui.horizontal(|ui| {
+            panel_heading_inline(ui, self.tr("interactive_rebase.in_progress.title"));
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(self.tr("interactive_rebase.in_progress.detail"))
+                .color(theme::text())
+                .small(),
+        );
+
+        let conflicts = worktree_conflict_files(snapshot);
+        let has_conflicts = !conflicts.is_empty();
+        ui.add_space(8.0);
+        if has_conflicts {
+            ui.label(
+                RichText::new(self.tr("interactive_rebase.in_progress.conflicts"))
+                    .color(theme::warning())
+                    .small(),
+            );
+            for file in conflicts.iter().take(4) {
+                ui.label(
+                    RichText::new(format!("U {}", file.display_path))
+                        .color(theme::muted())
+                        .small(),
+                );
+            }
+        } else {
+            ui.label(
+                RichText::new(self.tr("interactive_rebase.in_progress.ready"))
+                    .color(theme::muted())
+                    .small(),
+            );
+        }
+
+        ui.add_space((ui.available_height() - COMMIT_BUTTON_ROW_HEIGHT).max(12.0));
+        let actions_enabled = !self.branch_actions_busy();
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if dialog_sized_action_button(
+                ui,
+                self.tr("interactive_rebase.in_progress.abort"),
+                actions_enabled,
+                false,
+                REBASE_CONTROL_BUTTON_SIZE,
+            )
+            .clicked()
+            {
+                self.start_rebase_control_action(RebaseControlAction::Abort);
+            }
+            if dialog_sized_action_button(
+                ui,
+                self.tr("interactive_rebase.in_progress.skip"),
+                actions_enabled,
+                false,
+                REBASE_CONTROL_BUTTON_SIZE,
+            )
+            .clicked()
+            {
+                self.start_rebase_control_action(RebaseControlAction::Skip);
+            }
+            if dialog_sized_action_button(
+                ui,
+                self.tr("interactive_rebase.in_progress.continue"),
+                actions_enabled && !has_conflicts,
+                true,
+                REBASE_CONTROL_BUTTON_SIZE,
+            )
+            .clicked()
+            {
+                self.start_rebase_control_action(RebaseControlAction::Continue);
+            }
+        });
+    }
+
+    fn start_rebase_control_action(&mut self, action: RebaseControlAction) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        if matches!(
+            action,
+            RebaseControlAction::Continue | RebaseControlAction::Skip
+        ) {
+            if let Some(snapshot) = self.snapshot.as_ref() {
+                self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+            }
+        }
+
+        match action {
+            RebaseControlAction::Continue => {
+                self.execute_git_action(|root| git::rebase_continue(root));
+            }
+            RebaseControlAction::Skip => {
+                self.execute_git_action(|root| git::rebase_skip(root));
+            }
+            RebaseControlAction::Abort => {
+                self.execute_git_action(|root| git::rebase_abort(root));
+            }
+        }
     }
 
     fn commit_action_row(&mut self, ui: &mut Ui, can_commit: bool) -> bool {
@@ -8372,7 +8806,7 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+        let mut push_after_close: Option<(String, Vec<git::PushBranchSpec>, git::PushOptions)> =
             None;
         let actions_enabled = !self.branch_actions_busy();
         let remotes = self.remote_names();
@@ -8502,9 +8936,7 @@ impl GitAgentApp {
                                 options,
                             });
                         } else {
-                            execute = Some(Box::new(move |root| {
-                                git::push_selected(root, &remote, &branches, options)
-                            }));
+                            push_after_close = Some((remote, branches, options));
                         }
                         close_after = true;
                     }
@@ -8512,8 +8944,8 @@ impl GitAgentApp {
             });
         });
 
-        if let Some(action) = execute {
-            self.execute_git_action(action);
+        if let Some((remote, branches, options)) = push_after_close {
+            self.start_push_with_credential_retry(remote, branches, options);
         }
         if close_after {
             keep_open = false;
@@ -8529,7 +8961,7 @@ impl GitAgentApp {
         };
 
         let mut keep_open = true;
-        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+        let mut push_after_close: Option<(String, Vec<git::PushBranchSpec>, git::PushOptions)> =
             None;
         compact_action_dialog(
             ctx,
@@ -8560,9 +8992,7 @@ impl GitAgentApp {
                             let remote = dialog.remote.clone();
                             let branches = dialog.branches.clone();
                             let options = dialog.options;
-                            execute = Some(Box::new(move |root| {
-                                git::push_selected(root, &remote, &branches, options)
-                            }));
+                            push_after_close = Some((remote, branches, options));
                             keep_open = false;
                         }
                     });
@@ -8570,8 +9000,8 @@ impl GitAgentApp {
             },
         );
 
-        if let Some(action) = execute {
-            self.execute_git_action(action);
+        if let Some((remote, branches, options)) = push_after_close {
+            self.start_push_with_credential_retry(remote, branches, options);
         }
         if keep_open {
             self.pending_force_push_confirm = Some(dialog);
@@ -9184,12 +9614,33 @@ impl GitAgentApp {
         let commits = self
             .snapshot
             .as_ref()
-            .map(|snapshot| interactive_rebase_dialog_commits(snapshot, dialog.sort_order))
+            .map(|snapshot| {
+                interactive_rebase_commits_for_scope(
+                    snapshot,
+                    dialog.scope,
+                    &dialog.base_hash,
+                    dialog.sort_order,
+                )
+            })
             .unwrap_or_default();
+        dialog.rewrites_published_history = self.snapshot.as_ref().is_some_and(|snapshot| {
+            interactive_rebase_rewrites_published_history(snapshot, &commits)
+        });
         let disabled_hashes = interactive_rebase_disabled_hashes(&commits);
         dialog.selected_hashes.retain(|hash| {
             !disabled_hashes.contains(hash) && commits.iter().any(|commit| commit.hash == *hash)
         });
+        if dialog
+            .squash_target_hash
+            .as_ref()
+            .is_some_and(|hash| !dialog.selected_hashes.contains(hash))
+        {
+            dialog.squash_target_hash = None;
+            dialog.squash_range_hashes.clear();
+        }
+        dialog
+            .squash_range_hashes
+            .retain(|hash| commits.iter().any(|commit| commit.hash == *hash));
         for commit in commits
             .iter()
             .filter(|commit| !interactive_rebase_commit_is_merge(commit))
@@ -9223,6 +9674,30 @@ impl GitAgentApp {
                         .small()
                         .color(theme::muted()),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.tr("interactive_rebase.base_commit"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    ui.label(
+                        RichText::new(&dialog.base_short_hash)
+                            .monospace()
+                            .color(theme::text()),
+                    );
+                });
+                if dialog.rewrites_published_history {
+                    ui.label(
+                        RichText::new(self.tr("interactive_rebase.published_warning"))
+                            .small()
+                            .color(theme::warning()),
+                    );
+                    action_checkbox(
+                        ui,
+                        &mut dialog.acknowledge_published_rewrite,
+                        self.tr("interactive_rebase.confirm_published"),
+                    );
+                }
                 ui.add_space(4.0);
                 let browser_outcome = history_commit_browser(
                     ui,
@@ -9268,11 +9743,9 @@ impl GitAgentApp {
                 let selected_actionable_hashes =
                     interactive_rebase_selected_actionable_hashes(&dialog, &commits);
                 let selected_batch_count = selected_actionable_hashes.len();
-                let oldest_actionable_hash = commits
-                    .iter()
-                    .rev()
-                    .find(|commit| !interactive_rebase_commit_is_merge(commit))
-                    .map(|commit| commit.hash.clone());
+                let squash_targets = interactive_rebase_selected_squash_targets(&dialog, &commits);
+                let selected_squash_range_hashes =
+                    interactive_rebase_selected_squash_range_hashes(&dialog, &commits);
                 let selected = commits
                     .iter()
                     .position(|commit| commit.hash == dialog.selected_hash)
@@ -9286,79 +9759,19 @@ impl GitAgentApp {
                             interactive_rebase_commit_is_merge(commit),
                         )
                     });
-                Self::merge_options_panel(ui, |ui| {
-                    if let Some((_, hash, short_hash, subject, is_merge)) = selected.as_ref() {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} {}",
-                                    self.tr("interactive_rebase.selected_commit"),
-                                    short_hash
-                                ))
-                                .small()
-                                .color(theme::muted()),
-                            );
-                            ui.label(RichText::new(subject).color(theme::text()));
-                        });
-                        if *is_merge {
-                            ui.label(
-                                RichText::new(self.tr("interactive_rebase.merge_commit_disabled"))
-                                    .small()
-                                    .color(theme::muted()),
-                            );
-                        } else {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(self.tr("interactive_rebase.todo_action"))
-                                        .small()
-                                        .color(theme::muted()),
-                                );
-                                let action = dialog
-                                    .actions
-                                    .entry(hash.clone())
-                                    .or_insert(InteractiveRebaseTodoAction::Pick);
-                                egui::ComboBox::from_id_salt("interactive_rebase_action_selector")
-                                    .selected_text(action.label(self.language))
-                                    .show_ui(ui, |ui| {
-                                        for (candidate, label) in [
-                                            (
-                                                InteractiveRebaseTodoAction::Pick,
-                                                self.tr("interactive_rebase.todo.pick"),
-                                            ),
-                                            (
-                                                InteractiveRebaseTodoAction::Squash,
-                                                self.tr("interactive_rebase.todo.squash"),
-                                            ),
-                                            (
-                                                InteractiveRebaseTodoAction::Drop,
-                                                self.tr("interactive_rebase.todo.drop"),
-                                            ),
-                                        ] {
-                                            ui.selectable_value(action, candidate, label);
-                                        }
-                                    });
-                                let is_oldest = oldest_actionable_hash
-                                    .as_ref()
-                                    .is_some_and(|oldest| oldest == hash);
-                                if is_oldest && *action == InteractiveRebaseTodoAction::Squash {
-                                    ui.label(
-                                        RichText::new(
-                                            self.tr("interactive_rebase.error.first_squash"),
-                                        )
-                                        .small()
-                                        .color(theme::warning()),
-                                    );
-                                }
-                            });
-                        }
-                    } else {
-                        ui.label(
-                            RichText::new(self.tr("interactive_rebase.error.no_commits"))
-                                .small()
-                                .color(theme::muted()),
-                        );
-                    }
-                });
+                if dialog
+                    .squash_target_hash
+                    .as_ref()
+                    .is_none_or(|hash| !squash_targets.iter().any(|commit| commit.hash == *hash))
+                {
+                    dialog.squash_target_hash = selected
+                        .as_ref()
+                        .filter(|(_, hash, _, _, is_merge)| {
+                            !*is_merge && squash_targets.iter().any(|commit| commit.hash == *hash)
+                        })
+                        .map(|(_, hash, _, _, _)| hash.clone())
+                        .or_else(|| squash_targets.first().map(|commit| commit.hash.clone()));
+                }
 
                 if let Some(error) = dialog.validation_error.as_ref() {
                     ui.add_space(4.0);
@@ -9380,6 +9793,8 @@ impl GitAgentApp {
                         for action in dialog.actions.values_mut() {
                             *action = InteractiveRebaseTodoAction::Pick;
                         }
+                        dialog.squash_target_hash = None;
+                        dialog.squash_range_hashes.clear();
                     }
                     if ui
                         .add_enabled(
@@ -9388,29 +9803,69 @@ impl GitAgentApp {
                         )
                         .clicked()
                     {
+                        dialog.squash_target_hash = None;
+                        dialog.squash_range_hashes.clear();
                         for hash in &selected_actionable_hashes {
                             dialog
                                 .actions
                                 .insert(hash.clone(), InteractiveRebaseTodoAction::Drop);
                         }
                     }
-                    let can_squash_selected = selected_batch_count > 0
-                        && !selected_actionable_hashes.iter().any(|hash| {
-                            oldest_actionable_hash
-                                .as_ref()
-                                .is_some_and(|oldest| oldest == hash)
-                        });
-                    if ui
-                        .add_enabled(
-                            can_squash_selected,
-                            egui::Button::new(self.tr("interactive_rebase.squash_selected")),
-                        )
-                        .clicked()
+                    let can_squash_to_target = squash_targets.len() >= 2
+                        && selected_squash_range_hashes.len() >= 2
+                        && dialog.squash_target_hash.is_some();
+                    ui.label(
+                        RichText::new(self.tr("interactive_rebase.squash_target"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    ui.add_enabled_ui(can_squash_to_target, |ui| {
+                        let selected_target_label = dialog
+                            .squash_target_hash
+                            .as_ref()
+                            .and_then(|hash| {
+                                squash_targets
+                                    .iter()
+                                    .find(|commit| commit.hash == *hash)
+                                    .map(|commit| {
+                                        format!("{} {}", commit.short_hash, commit.subject)
+                                    })
+                            })
+                            .unwrap_or_else(|| self.tr("interactive_rebase.todo.none").to_owned());
+                        egui::ComboBox::from_id_salt("interactive_rebase_squash_target")
+                            .selected_text(selected_target_label)
+                            .show_ui(ui, |ui| {
+                                for target in &squash_targets {
+                                    let label = format!("{} {}", target.short_hash, target.subject);
+                                    ui.selectable_value(
+                                        &mut dialog.squash_target_hash,
+                                        Some(target.hash.clone()),
+                                        label,
+                                    );
+                                }
+                            });
+                    });
+                    let squash_button_label = interactive_rebase_squash_target_button_label(
+                        self.language,
+                        &dialog,
+                        &commits,
+                    );
+                    let squash_target_applied =
+                        interactive_rebase_squash_target_applied(&dialog, &commits);
+                    if dialog_action_button(
+                        ui,
+                        &squash_button_label,
+                        can_squash_to_target,
+                        squash_target_applied,
+                    )
+                    .clicked()
                     {
-                        for hash in &selected_actionable_hashes {
-                            dialog
-                                .actions
-                                .insert(hash.clone(), InteractiveRebaseTodoAction::Squash);
+                        if let Some(target_hash) = dialog.squash_target_hash.clone() {
+                            interactive_rebase_apply_squash_range_to_target(
+                                &mut dialog,
+                                &commits,
+                                &target_hash,
+                            );
                         }
                     }
                     if ui
@@ -9425,25 +9880,38 @@ impl GitAgentApp {
                                 .actions
                                 .insert(hash.clone(), InteractiveRebaseTodoAction::Pick);
                         }
+                        dialog.squash_target_hash = None;
+                        dialog.squash_range_hashes.clear();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button(self.tr("dialog.cancel")).clicked() {
                             close_after = true;
                         }
                         let submit_requested = dialog_default_submit_requested(ui);
-                        let can_rebase = actions_enabled && !commits.is_empty();
+                        let can_rebase = actions_enabled
+                            && !commits.is_empty()
+                            && interactive_rebase_dialog_has_changes(&dialog);
                         if ui
                             .add_enabled(can_rebase, egui::Button::new(self.tr("dialog.ok")))
                             .clicked()
                             || (submit_requested && can_rebase)
                         {
-                            if let Some(error) =
+                            if dialog.rewrites_published_history
+                                && !dialog.acknowledge_published_rewrite
+                            {
+                                dialog.validation_error = Some(
+                                    i18n::t(
+                                        self.language,
+                                        "interactive_rebase.error.confirm_published",
+                                    )
+                                    .to_owned(),
+                                );
+                            } else if let Some(error) =
                                 validate_interactive_rebase_dialog(self.language, &dialog, &commits)
                             {
                                 dialog.validation_error = Some(error);
                             } else {
-                                let base = interactive_rebase_base_for_commits(&commits)
-                                    .unwrap_or_else(|| "--root".to_owned());
+                                let base = dialog.base_hash.clone();
                                 let todo_items = interactive_rebase_todo_items(&dialog, &commits);
                                 execute = Some(Box::new(move |root| {
                                     git::interactive_rebase(root, &base, &todo_items)
@@ -9640,6 +10108,381 @@ impl GitAgentApp {
         }
         if keep_open {
             self.pending_rewritten_history_prompt = Some(prompt);
+        }
+    }
+
+    fn git_flow_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_git_flow_action.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut next_dialog: Option<GitFlowActionDialog> = None;
+        let mut run_after_close: Option<(GitFlowOperation, git::GitFlowConfig)> = None;
+        let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
+            None;
+        let actions_enabled = !self.branch_actions_busy();
+        let local_branch_names = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .branches
+                    .iter()
+                    .filter(|branch| !branch.remote)
+                    .map(|branch| branch.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        match &mut dialog {
+            GitFlowActionDialog::Initialize {
+                config,
+                validation_error,
+            } => {
+                let default_config = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| git_flow_config_defaults(snapshot));
+                compact_action_dialog(
+                    ctx,
+                    self.tr("git_flow.initialize.title"),
+                    GIT_FLOW_DIALOG_WIDTH,
+                    |ui| {
+                        ui.label(
+                            RichText::new(self.tr("git_flow.initialize.detail"))
+                                .color(theme::text()),
+                        );
+                        ui.add_space(8.0);
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.production_branch"),
+                            &mut config.production_branch,
+                        );
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.development_branch"),
+                            &mut config.development_branch,
+                        );
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.feature_prefix"),
+                            &mut config.feature_prefix,
+                        );
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.release_prefix"),
+                            &mut config.release_prefix,
+                        );
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.hotfix_prefix"),
+                            &mut config.hotfix_prefix,
+                        );
+                        git_flow_config_field(
+                            ui,
+                            self.language,
+                            self.tr("git_flow.version_tag_prefix"),
+                            &mut config.version_tag_prefix,
+                        );
+
+                        if let Some(error) = validation_error.as_ref() {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(error).color(theme::warning()).small());
+                        }
+                        let footer = git_flow_action_footer(
+                            ui,
+                            Some(self.tr("git_flow.use_defaults")),
+                            self.tr("dialog.cancel"),
+                            self.tr("git_flow.initialize.submit"),
+                            actions_enabled,
+                        );
+                        if footer.reset_clicked {
+                            if let Some(default_config) = default_config.clone() {
+                                *config = default_config;
+                                *validation_error = None;
+                            }
+                        }
+                        if footer.cancel_clicked {
+                            close_after = true;
+                        }
+                        if footer.submit_requested {
+                            if let Some(error) =
+                                validate_git_flow_config_dialog(self.language, config)
+                            {
+                                *validation_error = Some(error);
+                            } else {
+                                let config = config.clone();
+                                execute = Some(Box::new(move |root| {
+                                    git::initialize_git_flow(root, config)
+                                }));
+                                close_after = true;
+                            }
+                        }
+                    },
+                );
+            }
+            GitFlowActionDialog::NextAction { config } => {
+                compact_action_dialog(ctx, self.tr("git_flow.next_action.title"), 280.0, |ui| {
+                    ui.label(
+                        RichText::new(self.tr("git_flow.next_action.recommended"))
+                            .color(theme::text()),
+                    );
+                    ui.add_space(6.0);
+                    if git_flow_next_action_button(
+                        ui,
+                        self.tr("git_flow.start_feature.title"),
+                        actions_enabled,
+                    )
+                    .clicked()
+                    {
+                        run_after_close = Some((
+                            GitFlowOperation::Start(git::GitFlowBranchKind::Feature),
+                            config.clone(),
+                        ));
+                    }
+                    ui.add_space(4.0);
+                    if git_flow_next_action_button(
+                        ui,
+                        self.tr("git_flow.start_release.title"),
+                        actions_enabled,
+                    )
+                    .clicked()
+                    {
+                        run_after_close = Some((
+                            GitFlowOperation::Start(git::GitFlowBranchKind::Release),
+                            config.clone(),
+                        ));
+                    }
+                    ui.add_space(4.0);
+                    if git_flow_next_action_button(
+                        ui,
+                        self.tr("git_flow.start_hotfix.title"),
+                        actions_enabled,
+                    )
+                    .clicked()
+                    {
+                        run_after_close = Some((
+                            GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix),
+                            config.clone(),
+                        ));
+                    }
+                    ui.add_space(4.0);
+                    if git_flow_next_action_button(
+                        ui,
+                        self.tr("git_flow.next_action.other"),
+                        actions_enabled,
+                    )
+                    .clicked()
+                    {
+                        next_dialog = Some(GitFlowActionDialog::OtherActions {
+                            config: config.clone(),
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                    });
+                });
+            }
+            GitFlowActionDialog::OtherActions { config } => {
+                compact_action_dialog(ctx, self.tr("git_flow.other_action.title"), 320.0, |ui| {
+                    for operation in [
+                        GitFlowOperation::Start(git::GitFlowBranchKind::Feature),
+                        GitFlowOperation::Finish(git::GitFlowBranchKind::Feature),
+                        GitFlowOperation::Start(git::GitFlowBranchKind::Release),
+                        GitFlowOperation::Finish(git::GitFlowBranchKind::Release),
+                        GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix),
+                        GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix),
+                    ] {
+                        if git_flow_next_action_button(
+                            ui,
+                            git_flow_operation_title(self.language, operation),
+                            actions_enabled,
+                        )
+                        .clicked()
+                        {
+                            run_after_close = Some((operation, config.clone()));
+                        }
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(4.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                    });
+                });
+            }
+            GitFlowActionDialog::Run {
+                operation,
+                config,
+                name,
+                start_point,
+                branch_name,
+                validation_error,
+            } => {
+                let title = git_flow_operation_title(self.language, *operation);
+                let start_options = match *operation {
+                    GitFlowOperation::Start(kind) => {
+                        git_flow_start_point_options(self.snapshot.as_ref(), config, kind)
+                    }
+                    GitFlowOperation::Finish(_) => Vec::new(),
+                };
+                if matches!(*operation, GitFlowOperation::Start(_))
+                    && !start_options
+                        .iter()
+                        .any(|option| option.name == *start_point)
+                    && !start_options.is_empty()
+                {
+                    *start_point = start_options[0].name.clone();
+                }
+                compact_action_dialog(ctx, title, GIT_FLOW_DIALOG_WIDTH, |ui| {
+                    ui.label(
+                        RichText::new(git_flow_operation_detail(self.language, *operation))
+                            .color(theme::text()),
+                    );
+                    ui.add_space(8.0);
+                    match *operation {
+                        GitFlowOperation::Start(kind) => {
+                            git_flow_config_field(
+                                ui,
+                                self.language,
+                                self.tr("git_flow.name"),
+                                name,
+                            );
+                            git_flow_start_point_row(
+                                ui,
+                                self.tr("git_flow.start_from"),
+                                start_point,
+                                &start_options,
+                            );
+                            ui.add_space(8.0);
+                            git_flow_start_preview_panel(
+                                ui,
+                                self.language,
+                                config,
+                                kind,
+                                name,
+                                start_point,
+                                &start_options,
+                            );
+                        }
+                        GitFlowOperation::Finish(_) => {
+                            git_flow_config_field(
+                                ui,
+                                self.language,
+                                self.tr("git_flow.branch_name"),
+                                branch_name,
+                            );
+                        }
+                    }
+                    if matches!(*operation, GitFlowOperation::Finish(_)) {
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .fill(theme::panel_soft())
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(8, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(self.tr("git_flow.preview"))
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                                for line in git_flow_operation_preview(
+                                    self.language,
+                                    config,
+                                    *operation,
+                                    name,
+                                    start_point,
+                                    branch_name,
+                                ) {
+                                    ui.label(RichText::new(line).small().color(theme::text()));
+                                }
+                            });
+                    }
+
+                    if let Some(error) = validation_error.as_ref() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(error).color(theme::warning()).small());
+                    }
+                    let footer = git_flow_action_footer(
+                        ui,
+                        None,
+                        self.tr("dialog.cancel"),
+                        git_flow_operation_submit_label(self.language, *operation),
+                        actions_enabled,
+                    );
+                    if footer.cancel_clicked {
+                        close_after = true;
+                    }
+                    if footer.submit_requested {
+                        if let Some(error) = validate_git_flow_run_dialog(
+                            self.language,
+                            config,
+                            *operation,
+                            name,
+                            start_point,
+                            branch_name,
+                            &start_options,
+                            &local_branch_names,
+                        ) {
+                            *validation_error = Some(error);
+                        } else {
+                            let config = config.clone();
+                            match *operation {
+                                GitFlowOperation::Start(kind) => {
+                                    let name = name.trim().to_owned();
+                                    let start_point = start_point.trim().to_owned();
+                                    execute = Some(Box::new(move |root| {
+                                        git::start_git_flow_action(
+                                            root,
+                                            config,
+                                            kind,
+                                            name,
+                                            start_point,
+                                        )
+                                    }));
+                                }
+                                GitFlowOperation::Finish(kind) => {
+                                    let branch_name = branch_name.trim().to_owned();
+                                    execute = Some(Box::new(move |root| {
+                                        git::finish_git_flow_action(
+                                            root,
+                                            config,
+                                            kind,
+                                            &branch_name,
+                                        )
+                                    }));
+                                }
+                            }
+                            close_after = true;
+                        }
+                    }
+                });
+            }
+        }
+
+        if let Some(action) = execute {
+            self.execute_git_action(action);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if let Some(dialog) = next_dialog {
+            self.pending_git_flow_action = Some(dialog);
+        } else if let Some((operation, config)) = run_after_close {
+            self.open_git_flow_run_dialog(operation, config);
+        } else if keep_open {
+            self.pending_git_flow_action = Some(dialog);
         }
     }
 
@@ -12393,6 +13236,16 @@ fn dialog_cancel_button(ui: &mut Ui, label: &str) -> egui::Response {
 fn dialog_action_button(ui: &mut Ui, label: &str, enabled: bool, primary: bool) -> egui::Response {
     let width = inline_button_width(ui, label, 12.0, 64.0, 144.0, 24.0);
     let size = Vec2::new(width, 28.0);
+    dialog_sized_action_button(ui, label, enabled, primary, size)
+}
+
+fn dialog_sized_action_button(
+    ui: &mut Ui,
+    label: &str,
+    enabled: bool,
+    primary: bool,
+    size: Vec2,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         size,
         if enabled {
@@ -12452,6 +13305,7 @@ fn compact_action_dialog(
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
+        .auto_sized()
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .frame(dialog_window_frame())
         .show(ctx, |ui| {
@@ -12557,6 +13411,9 @@ fn pointing_hand_cursor(response: egui::Response) -> egui::Response {
 }
 
 fn row_rect_hovered(ui: &Ui, rect: Rect) -> bool {
+    if ui.memory(|memory| memory.any_popup_open()) {
+        return false;
+    }
     ui.input(|input| {
         input
             .pointer
@@ -13865,13 +14722,95 @@ fn close_top_menu_popup(ui: &mut Ui) {
 }
 
 fn menu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+    hover_submenu_button(ui, label, add_contents);
+}
+
+fn hover_submenu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+    hover_submenu_button_enabled(ui, true, label, add_contents);
+}
+
+fn hover_submenu_button_enabled(
+    ui: &mut Ui,
+    enabled: bool,
+    label: &'static str,
+    add_contents: impl FnOnce(&mut Ui),
+) {
     ui.scope(|ui| {
         apply_menu_visuals(ui);
-        let response = ui.menu_button(RichText::new(label).color(theme::text()).size(13.0), |ui| {
-            apply_menu_visuals(ui);
-            add_contents(ui);
-        });
-        paint_text_button_hover_shadow_for_response(ui, &response.response);
+        let area_id = ui.make_persistent_id(("hover_submenu_area", label));
+        let state_id = ui.make_persistent_id(("hover_submenu_rect", label));
+        let pointer_pos = ui.input(|input| input.pointer.hover_pos());
+        let pointer_in_submenu = ui
+            .ctx()
+            .data(|data| data.get_temp::<Option<Rect>>(state_id).flatten())
+            .is_some_and(|rect| pointer_pos.is_some_and(|pos| rect.expand(8.0).contains(pos)));
+        let row_rect_width = ui.available_width().max(160.0);
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(row_rect_width, 22.0),
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let response = pointing_hand_cursor(response);
+        let submenu_open = enabled && (response.hovered() || pointer_in_submenu);
+        let fill = if submenu_open || response.has_focus() {
+            menu_text_button_hover_fill()
+        } else {
+            Color32::TRANSPARENT
+        };
+        let text_color = if enabled {
+            theme::text()
+        } else {
+            theme::muted()
+        };
+        if submenu_open {
+            paint_text_button_hover_shadow(ui, rect);
+        }
+        ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+        ui.painter().text(
+            rect.left_center() + Vec2::new(6.0, 0.0),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(13.0),
+            text_color,
+        );
+        ui.painter().text(
+            rect.right_center() - Vec2::new(8.0, 0.0),
+            Align2::RIGHT_CENTER,
+            ">",
+            FontId::proportional(11.0),
+            text_color,
+        );
+        if submenu_open {
+            let mut pos = rect.right_top() + Vec2::new(-2.0, -2.0);
+            if let Some(to_global) = ui.ctx().layer_transform_to_global(ui.layer_id()) {
+                pos = to_global * pos;
+            }
+            let area = egui::Area::new(area_id)
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ui.ctx(), |ui| {
+                    apply_menu_visuals(ui);
+                    egui::Frame::new()
+                        .fill(theme::panel())
+                        .corner_radius(CornerRadius::same(6))
+                        .shadow(panel_shadow())
+                        .inner_margin(egui::Margin::symmetric(6, 6))
+                        .show(ui, |ui| {
+                            apply_menu_visuals(ui);
+                            ui.set_min_width(170.0);
+                            add_contents(ui);
+                        });
+                });
+            ui.ctx().data_mut(|data| {
+                data.insert_temp::<Option<Rect>>(state_id, Some(area.response.rect))
+            });
+        } else {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp::<Option<Rect>>(state_id, None));
+        }
     });
 }
 
@@ -17826,19 +18765,71 @@ fn conflict_resolution_action_button(ui: &mut Ui, text: &str, enabled: bool) -> 
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ConflictResolutionColumns {
+    name: Rect,
+    local: Rect,
+    remote: Rect,
+}
+
+fn conflict_resolution_columns(rect: Rect) -> ConflictResolutionColumns {
+    let status_width = 74.0;
+    let status_gap = 12.0;
+    let remote_left = rect.right() - status_width - 12.0;
+    let local_left = remote_left - status_gap - status_width;
+    ConflictResolutionColumns {
+        name: Rect::from_min_max(
+            Pos2::new(rect.left() + 34.0, rect.top()),
+            Pos2::new(local_left - 12.0, rect.bottom()),
+        ),
+        local: Rect::from_min_max(
+            Pos2::new(local_left, rect.top()),
+            Pos2::new(local_left + status_width, rect.bottom()),
+        ),
+        remote: Rect::from_min_max(
+            Pos2::new(remote_left, rect.top()),
+            Pos2::new(remote_left + status_width, rect.bottom()),
+        ),
+    }
+}
+
+fn conflict_resolution_side_status(file: &WorktreeFile, side: git::ConflictSide) -> &'static str {
+    match (file.index_status, file.worktree_status, side) {
+        ('D', 'U', git::ConflictSide::Ours) => "Deleted",
+        ('D', 'U', git::ConflictSide::Theirs) => "Modified",
+        ('U', 'D', git::ConflictSide::Ours) => "Modified",
+        ('U', 'D', git::ConflictSide::Theirs) => "Deleted",
+        ('A', 'A', _) => "Added",
+        ('A', 'U', git::ConflictSide::Ours) => "Added",
+        ('A', 'U', git::ConflictSide::Theirs) => "Modified",
+        ('U', 'A', git::ConflictSide::Ours) => "Modified",
+        ('U', 'A', git::ConflictSide::Theirs) => "Added",
+        ('D', 'D', _) => "Deleted",
+        _ => "Modified",
+    }
+}
+
 fn conflict_resolution_header(ui: &mut Ui, language: Language) {
     let (name, yours, theirs) = if language == Language::Chinese {
         ("名称", "本地", "远端")
     } else {
         ("Name", "Yours", "Theirs")
     };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(name).strong().color(theme::muted()));
-        ui.add_space(300.0);
-        ui.label(RichText::new(yours).strong().color(theme::muted()));
-        ui.add_space(36.0);
-        ui.label(RichText::new(theirs).strong().color(theme::muted()));
-    });
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let columns = conflict_resolution_columns(rect);
+    for (column, text) in [
+        (columns.name, name),
+        (columns.local, yours),
+        (columns.remote, theirs),
+    ] {
+        ui.painter().text(
+            column.left_center(),
+            Align2::LEFT_CENTER,
+            text,
+            FontId::proportional(12.0),
+            theme::muted(),
+        );
+    }
 }
 
 fn conflict_resolution_row(ui: &mut Ui, file: &WorktreeFile, selected: bool) -> egui::Response {
@@ -17871,37 +18862,39 @@ fn conflict_resolution_row(ui: &mut Ui, file: &WorktreeFile, selected: bool) -> 
         UiIcon::Warning,
         Color32::from_rgb(232, 174, 55),
     );
+    let columns = conflict_resolution_columns(rect);
     draw_clipped_cell(
         ui,
-        rect.left() + 34.0,
+        columns.name.left(),
         rect.center().y,
-        (rect.width() - 220.0).max(120.0),
+        columns.name.width().max(80.0),
         &file.display_path,
         text_color,
         false,
     );
-    ui.painter().text(
-        Pos2::new(rect.right() - 150.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Modified",
-        FontId::proportional(12.0),
-        if selected {
-            Color32::WHITE
-        } else {
-            theme::muted()
-        },
-    );
-    ui.painter().text(
-        Pos2::new(rect.right() - 74.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Modified",
-        FontId::proportional(12.0),
-        if selected {
-            Color32::WHITE
-        } else {
-            theme::muted()
-        },
-    );
+    let status_color = if selected {
+        Color32::WHITE
+    } else {
+        theme::muted()
+    };
+    for (column, status) in [
+        (
+            columns.local,
+            conflict_resolution_side_status(file, git::ConflictSide::Ours),
+        ),
+        (
+            columns.remote,
+            conflict_resolution_side_status(file, git::ConflictSide::Theirs),
+        ),
+    ] {
+        ui.painter().with_clip_rect(column).text(
+            column.left_center(),
+            Align2::LEFT_CENTER,
+            status,
+            FontId::proportional(12.0),
+            status_color,
+        );
+    }
     response
 }
 
@@ -18227,67 +19220,71 @@ fn branch_context_menu(
                 ui.close_menu();
             }
             ui.add_enabled_ui(enabled && !remotes.is_empty(), |ui| {
-                ui.menu_button(i18n::t(language, "branch.push_to"), |ui| {
-                    if remotes.is_empty() {
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(i18n::t(language, "branch.no_remotes")),
-                        );
-                    } else {
-                        for remote in remotes {
-                            if ui.button(remote).clicked() {
-                                *action = Some(BranchMenuAction::PushToRemote {
+                hover_submenu_button_enabled(
+                    ui,
+                    enabled && !remotes.is_empty(),
+                    i18n::t(language, "branch.push_to"),
+                    |ui| {
+                        if remotes.is_empty() {
+                            menu_text_button(ui, false, i18n::t(language, "branch.no_remotes"));
+                        } else {
+                            for remote in remotes {
+                                if menu_text_button(ui, true, remote).clicked() {
+                                    *action = Some(BranchMenuAction::PushToRemote {
+                                        name: name.to_owned(),
+                                        remote: remote.clone(),
+                                    });
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    },
+                );
+            });
+            ui.add_enabled_ui(enabled, |ui| {
+                hover_submenu_button_enabled(
+                    ui,
+                    enabled,
+                    i18n::t(language, "branch.track_remote"),
+                    |ui| {
+                        for remote_branch in remote_branch_names {
+                            let selected = upstream == Some(remote_branch.as_str());
+                            if menu_text_button_with_text(
+                                ui,
+                                !selected,
+                                branch_tracking_menu_label(selected, remote_branch),
+                            )
+                            .clicked()
+                            {
+                                *action = Some(BranchMenuAction::TrackRemote {
                                     name: name.to_owned(),
-                                    remote: remote.clone(),
+                                    remote_branch: Some(remote_branch.clone()),
                                 });
                                 ui.close_menu();
                             }
                         }
-                    }
-                });
-            });
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.menu_button(i18n::t(language, "branch.track_remote"), |ui| {
-                    for remote_branch in remote_branch_names {
-                        let selected = upstream == Some(remote_branch.as_str());
-                        if ui
-                            .add_enabled(
-                                !selected,
-                                egui::Button::new(branch_tracking_menu_label(
-                                    selected,
-                                    remote_branch,
-                                )),
-                            )
-                            .clicked()
+                        if !remote_branch_names.is_empty() {
+                            ui.add_space(4.0);
+                        }
+                        let selected = upstream.is_none();
+                        if menu_text_button_with_text(
+                            ui,
+                            !selected,
+                            branch_tracking_menu_label(
+                                selected,
+                                i18n::t(language, "branch.no_remote_tracking"),
+                            ),
+                        )
+                        .clicked()
                         {
                             *action = Some(BranchMenuAction::TrackRemote {
                                 name: name.to_owned(),
-                                remote_branch: Some(remote_branch.clone()),
+                                remote_branch: None,
                             });
                             ui.close_menu();
                         }
-                    }
-                    if !remote_branch_names.is_empty() {
-                        ui.separator();
-                    }
-                    let selected = upstream.is_none();
-                    if ui
-                        .add_enabled(
-                            !selected,
-                            egui::Button::new(branch_tracking_menu_label(
-                                selected,
-                                i18n::t(language, "branch.no_remote_tracking"),
-                            )),
-                        )
-                        .clicked()
-                    {
-                        *action = Some(BranchMenuAction::TrackRemote {
-                            name: name.to_owned(),
-                            remote_branch: None,
-                        });
-                        ui.close_menu();
-                    }
-                });
+                    },
+                );
             });
             ui.separator();
             if ui
@@ -19651,6 +20648,16 @@ fn commit_context_menu(
         });
         ui.close_menu();
     }
+    if ui
+        .button(i18n::t(language, "menu.interactive_rebase_children"))
+        .clicked()
+    {
+        action = Some(CommitMenuAction::InteractiveRebaseChildren {
+            hash: commit.hash.clone(),
+            short_hash: commit.short_hash.clone(),
+        });
+        ui.close_menu();
+    }
     if ui.button(i18n::t(language, "menu.revert")).clicked() {
         action = Some(CommitMenuAction::Revert {
             hash: commit.hash.clone(),
@@ -19666,25 +20673,22 @@ fn commit_context_menu(
         ui.close_menu();
     }
     ui.add_space(6.0);
-    ui.menu_button(i18n::t(language, "menu.compare"), |ui| {
-        if ui
-            .button(i18n::t(language, "menu.compare_worktree"))
-            .clicked()
-        {
+    hover_submenu_button(ui, i18n::t(language, "menu.compare"), |ui| {
+        if menu_text_button(ui, true, i18n::t(language, "menu.compare_worktree")).clicked() {
             action = Some(CommitMenuAction::CompareWithWorktree {
                 hash: commit.hash.clone(),
                 short_hash: commit.short_hash.clone(),
             });
             ui.close_menu();
         }
-        if ui.button(i18n::t(language, "menu.external_diff")).clicked() {
+        if menu_text_button(ui, true, i18n::t(language, "menu.external_diff")).clicked() {
             action = Some(CommitMenuAction::ExternalDiff {
                 hash: commit.hash.clone(),
                 short_hash: commit.short_hash.clone(),
             });
             ui.close_menu();
         }
-        if ui.button(i18n::t(language, "menu.open_remote")).clicked() {
+        if menu_text_button(ui, true, i18n::t(language, "menu.open_remote")).clicked() {
             action = Some(CommitMenuAction::OpenRemote {
                 hash: commit.hash.clone(),
             });
@@ -20697,6 +21701,73 @@ fn interactive_rebase_dialog_commits(
     commits
 }
 
+fn interactive_rebase_commits_for_scope(
+    snapshot: &RepositorySnapshot,
+    scope: InteractiveRebaseScope,
+    base_hash: &str,
+    order: HistorySortOrder,
+) -> Vec<Commit> {
+    match scope {
+        InteractiveRebaseScope::LocalUnpushed => interactive_rebase_dialog_commits(snapshot, order),
+        InteractiveRebaseScope::ChildrenOfCommit => {
+            interactive_rebase_children_of_commit(snapshot, base_hash, order)
+        }
+    }
+}
+
+fn interactive_rebase_children_of_commit(
+    snapshot: &RepositorySnapshot,
+    base_hash: &str,
+    order: HistorySortOrder,
+) -> Vec<Commit> {
+    let child_hashes = interactive_rebase_first_parent_hashes_after_base(snapshot, base_hash);
+    if child_hashes.is_empty() {
+        return Vec::new();
+    }
+    history_dialog_commits(snapshot, HistoryBranchScope::Current, order)
+        .into_iter()
+        .filter(|commit| child_hashes.contains(&commit.hash))
+        .collect()
+}
+
+fn interactive_rebase_first_parent_hashes_after_base(
+    snapshot: &RepositorySnapshot,
+    base_hash: &str,
+) -> HashSet<String> {
+    let base_hash = base_hash.trim();
+    if base_hash.is_empty() || base_hash == "--root" {
+        return interactive_rebase_first_parent_hashes(snapshot);
+    }
+    let topology = history_dialog_commits(
+        snapshot,
+        HistoryBranchScope::Current,
+        HistorySortOrder::Topology,
+    );
+    let commits_by_hash = topology
+        .iter()
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let Some(mut current_hash) = interactive_rebase_head_hash(snapshot, &topology) else {
+        return HashSet::new();
+    };
+    let mut hashes = HashSet::new();
+    loop {
+        if current_hash == base_hash {
+            return hashes;
+        }
+        if !hashes.insert(current_hash.clone()) {
+            return HashSet::new();
+        }
+        let Some(commit) = commits_by_hash.get(current_hash.as_str()) else {
+            return HashSet::new();
+        };
+        let Some(parent) = commit.parents.first() else {
+            return HashSet::new();
+        };
+        current_hash = parent.clone();
+    }
+}
+
 fn interactive_rebase_first_parent_hashes(snapshot: &RepositorySnapshot) -> HashSet<String> {
     let topology = history_dialog_commits(
         snapshot,
@@ -20741,6 +21812,62 @@ fn interactive_rebase_head_hash(
     topology.first().map(|commit| commit.hash.clone())
 }
 
+fn interactive_rebase_local_unpushed_hashes(snapshot: &RepositorySnapshot) -> HashSet<String> {
+    let Some(upstream) = snapshot.upstream.as_ref() else {
+        return HashSet::new();
+    };
+    let ahead = upstream.ahead;
+    if ahead == 0 {
+        return HashSet::new();
+    }
+    let topology = history_dialog_commits(
+        snapshot,
+        HistoryBranchScope::Current,
+        HistorySortOrder::Topology,
+    );
+    let commits_by_hash = topology
+        .iter()
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let Some(mut current_hash) = interactive_rebase_head_hash(snapshot, &topology) else {
+        return HashSet::new();
+    };
+    let mut hashes = HashSet::new();
+    for _ in 0..ahead {
+        if !hashes.insert(current_hash.clone()) {
+            break;
+        }
+        let Some(commit) = commits_by_hash.get(current_hash.as_str()) else {
+            break;
+        };
+        let Some(parent) = commit.parents.first() else {
+            break;
+        };
+        current_hash = parent.clone();
+    }
+    hashes
+}
+
+fn interactive_rebase_rewrites_published_history(
+    snapshot: &RepositorySnapshot,
+    commits: &[Commit],
+) -> bool {
+    if snapshot.upstream.is_none() || commits.is_empty() {
+        return false;
+    }
+    let local_unpushed = interactive_rebase_local_unpushed_hashes(snapshot);
+    commits
+        .iter()
+        .any(|commit| !local_unpushed.contains(&commit.hash))
+}
+
+fn short_rebase_base_label(base: &str) -> String {
+    if base == "--root" {
+        return "--root".to_owned();
+    }
+    base.chars().take(8).collect()
+}
+
 fn interactive_rebase_commit_is_merge(commit: &Commit) -> bool {
     commit.parents.len() > 1
 }
@@ -20775,6 +21902,116 @@ fn interactive_rebase_selected_actionable_hashes(
         .collect()
 }
 
+fn interactive_rebase_selected_squash_targets(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<Commit> {
+    commits
+        .iter()
+        .filter(|commit| {
+            !interactive_rebase_commit_is_merge(commit)
+                && dialog.selected_hashes.contains(&commit.hash)
+        })
+        .cloned()
+        .collect()
+}
+
+fn interactive_rebase_selected_squash_range_hashes(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<String> {
+    let selected_positions = commits
+        .iter()
+        .enumerate()
+        .filter(|(_, commit)| {
+            !interactive_rebase_commit_is_merge(commit)
+                && dialog.selected_hashes.contains(&commit.hash)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let Some(last) = selected_positions.iter().max().copied() else {
+        return Vec::new();
+    };
+
+    commits[..=last]
+        .iter()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| commit.hash.clone())
+        .collect()
+}
+
+fn interactive_rebase_apply_squash_range_to_target(
+    dialog: &mut InteractiveRebaseActionDialog,
+    commits: &[Commit],
+    target_hash: &str,
+) {
+    let target_hash = target_hash.trim();
+    let target_is_selected = commits.iter().any(|commit| {
+        commit.hash == target_hash
+            && !interactive_rebase_commit_is_merge(commit)
+            && dialog.selected_hashes.contains(&commit.hash)
+    });
+    let range = interactive_rebase_selected_squash_range_hashes(dialog, commits);
+    if !target_is_selected || range.len() < 2 || !range.iter().any(|hash| hash == target_hash) {
+        return;
+    }
+
+    dialog.squash_target_hash = Some(target_hash.to_owned());
+    dialog.squash_range_hashes = range.clone();
+    for hash in range {
+        let action = if hash == target_hash {
+            InteractiveRebaseTodoAction::Pick
+        } else {
+            InteractiveRebaseTodoAction::Squash
+        };
+        dialog.actions.insert(hash, action);
+    }
+}
+
+fn interactive_rebase_dialog_has_changes(dialog: &InteractiveRebaseActionDialog) -> bool {
+    dialog
+        .actions
+        .values()
+        .any(|action| *action != InteractiveRebaseTodoAction::Pick)
+        || dialog.squash_target_hash.is_some() && dialog.squash_range_hashes.len() > 1
+}
+
+fn interactive_rebase_squash_target_applied(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> bool {
+    let Some(target_hash) = dialog.squash_target_hash.as_deref() else {
+        return false;
+    };
+    dialog.squash_range_hashes.len() > 1
+        && dialog
+            .squash_range_hashes
+            .iter()
+            .any(|hash| hash == target_hash)
+        && commits.iter().any(|commit| commit.hash == target_hash)
+}
+
+fn interactive_rebase_squash_target_button_label(
+    language: Language,
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> String {
+    if interactive_rebase_squash_target_applied(dialog, commits) {
+        if let Some(target) = dialog
+            .squash_target_hash
+            .as_ref()
+            .and_then(|hash| commits.iter().find(|commit| commit.hash == *hash))
+        {
+            return format!(
+                "{} {}",
+                i18n::t(language, "interactive_rebase.squash_to_target_applied"),
+                target.short_hash
+            );
+        }
+    }
+    i18n::t(language, "interactive_rebase.squash_to_target").to_owned()
+}
+
 fn interactive_rebase_base_for_commits(commits: &[Commit]) -> Option<String> {
     let actionable = interactive_rebase_actionable_commits(commits);
     let oldest = actionable.last()?;
@@ -20791,23 +22028,69 @@ fn interactive_rebase_todo_items(
     dialog: &InteractiveRebaseActionDialog,
     commits: &[Commit],
 ) -> Vec<git::InteractiveRebaseTodoItem> {
-    commits
+    let chronological_commits = commits
         .iter()
         .rev()
         .filter(|commit| !interactive_rebase_commit_is_merge(commit))
-        .map(|commit| {
-            let action = dialog
-                .actions
-                .get(&commit.hash)
-                .copied()
-                .unwrap_or(InteractiveRebaseTodoAction::Pick);
-            git::InteractiveRebaseTodoItem {
-                action: action.to_git_action(),
-                hash: commit.hash.clone(),
-                subject: commit.subject.clone(),
+        .collect::<Vec<_>>();
+
+    let squash_target = dialog.squash_target_hash.as_deref();
+    let squash_range = dialog
+        .squash_range_hashes
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let use_squash_range = squash_target.is_some()
+        && squash_range.len() > 1
+        && squash_target.is_some_and(|target| squash_range.contains(target));
+
+    let mut items = Vec::new();
+    let mut emitted_squash_range = false;
+    for commit in &chronological_commits {
+        if use_squash_range && squash_range.contains(commit.hash.as_str()) {
+            if emitted_squash_range {
+                continue;
             }
-        })
-        .collect()
+            let Some(target_hash) = squash_target else {
+                continue;
+            };
+            if let Some(target_commit) = chronological_commits
+                .iter()
+                .find(|candidate| candidate.hash == target_hash)
+            {
+                items.push(git::InteractiveRebaseTodoItem {
+                    action: git::InteractiveRebaseAction::Pick,
+                    hash: target_commit.hash.clone(),
+                    subject: target_commit.subject.clone(),
+                });
+                for candidate in &chronological_commits {
+                    if squash_range.contains(candidate.hash.as_str())
+                        && candidate.hash != target_hash
+                    {
+                        items.push(git::InteractiveRebaseTodoItem {
+                            action: git::InteractiveRebaseAction::Squash,
+                            hash: candidate.hash.clone(),
+                            subject: candidate.subject.clone(),
+                        });
+                    }
+                }
+            }
+            emitted_squash_range = true;
+            continue;
+        }
+
+        let action = dialog
+            .actions
+            .get(&commit.hash)
+            .copied()
+            .unwrap_or(InteractiveRebaseTodoAction::Pick);
+        items.push(git::InteractiveRebaseTodoItem {
+            action: action.to_git_action(),
+            hash: commit.hash.clone(),
+            subject: commit.subject.clone(),
+        });
+    }
+    items
 }
 
 fn validate_interactive_rebase_dialog(
@@ -20819,9 +22102,13 @@ fn validate_interactive_rebase_dialog(
     if actionable.is_empty() {
         return Some(i18n::t(language, "interactive_rebase.error.no_commits").to_owned());
     }
-    if actionable.last().is_some_and(|commit| {
-        dialog.actions.get(&commit.hash) == Some(&InteractiveRebaseTodoAction::Squash)
-    }) {
+    if !interactive_rebase_dialog_has_changes(dialog) {
+        return Some(i18n::t(language, "interactive_rebase.error.no_changes").to_owned());
+    }
+    if interactive_rebase_todo_items(dialog, commits)
+        .first()
+        .is_some_and(|item| item.action == git::InteractiveRebaseAction::Squash)
+    {
         return Some(i18n::t(language, "interactive_rebase.error.first_squash").to_owned());
     }
     None
@@ -20886,6 +22173,551 @@ fn validate_lfs_patterns(language: Language, patterns: &[String]) -> Option<Stri
         }
     }
     None
+}
+
+fn git_flow_config_defaults(snapshot: &RepositorySnapshot) -> git::GitFlowConfig {
+    let production_branch = if snapshot
+        .branches
+        .iter()
+        .any(|branch| !branch.remote && branch.name == "main")
+    {
+        "main"
+    } else if snapshot
+        .branches
+        .iter()
+        .any(|branch| !branch.remote && branch.name == "master")
+    {
+        "master"
+    } else {
+        snapshot.branch.as_str()
+    };
+
+    git::GitFlowConfig {
+        production_branch: production_branch.to_owned(),
+        development_branch: "develop".to_owned(),
+        ..git::GitFlowConfig::default()
+    }
+}
+
+fn git_flow_operation_menu_enabled(
+    snapshot: Option<&RepositorySnapshot>,
+    git_dialog_enabled: bool,
+) -> bool {
+    git_dialog_enabled
+        && snapshot
+            .and_then(|snapshot| snapshot.git_flow_config.as_ref())
+            .is_some()
+}
+
+fn git_flow_current_branch_for_kind(
+    snapshot: &RepositorySnapshot,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> Option<String> {
+    let prefix = git_flow_prefix(config, kind);
+    snapshot
+        .branch
+        .starts_with(prefix)
+        .then(|| snapshot.branch.clone())
+}
+
+fn git_flow_operation_default_name(
+    snapshot: &RepositorySnapshot,
+    config: &git::GitFlowConfig,
+    operation: GitFlowOperation,
+) -> String {
+    match operation {
+        GitFlowOperation::Start(_) => String::new(),
+        GitFlowOperation::Finish(kind) => git_flow_current_branch_for_kind(snapshot, config, kind)
+            .and_then(|branch| {
+                branch
+                    .strip_prefix(git_flow_prefix(config, kind))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn git_flow_prefix(config: &git::GitFlowConfig, kind: git::GitFlowBranchKind) -> &str {
+    match kind {
+        git::GitFlowBranchKind::Feature => &config.feature_prefix,
+        git::GitFlowBranchKind::Release => &config.release_prefix,
+        git::GitFlowBranchKind::Hotfix => &config.hotfix_prefix,
+    }
+}
+
+fn git_flow_start_base(config: &git::GitFlowConfig, kind: git::GitFlowBranchKind) -> &str {
+    match kind {
+        git::GitFlowBranchKind::Feature | git::GitFlowBranchKind::Release => {
+            &config.development_branch
+        }
+        git::GitFlowBranchKind::Hotfix => &config.production_branch,
+    }
+}
+
+fn git_flow_default_start_point(
+    snapshot: &RepositorySnapshot,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> String {
+    let base = git_flow_start_base(config, kind);
+    if snapshot.branches.iter().any(|branch| branch.name == base) {
+        return base.to_owned();
+    }
+    let remote_base = format!("origin/{base}");
+    if snapshot
+        .branches
+        .iter()
+        .any(|branch| branch.name == remote_base)
+    {
+        return remote_base;
+    }
+    snapshot
+        .branches
+        .first()
+        .map(|branch| branch.name.clone())
+        .unwrap_or_else(|| base.to_owned())
+}
+
+fn git_flow_start_point_options(
+    snapshot: Option<&RepositorySnapshot>,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> Vec<GitFlowStartPointOption> {
+    let Some(snapshot) = snapshot else {
+        return vec![GitFlowStartPointOption {
+            name: git_flow_start_base(config, kind).to_owned(),
+            subject: String::new(),
+        }];
+    };
+
+    let default_start = git_flow_default_start_point(snapshot, config, kind);
+    let mut seen = HashSet::new();
+    let mut options = Vec::new();
+    for name in std::iter::once(default_start).chain(
+        snapshot
+            .branches
+            .iter()
+            .map(|branch| branch.name.clone())
+            .filter(|name| !name.trim().is_empty()),
+    ) {
+        if seen.insert(name.clone()) {
+            options.push(GitFlowStartPointOption {
+                subject: git_flow_branch_subject(snapshot, &name).unwrap_or_default(),
+                name,
+            });
+        }
+    }
+    options
+}
+
+fn git_flow_branch_subject(snapshot: &RepositorySnapshot, branch_name: &str) -> Option<String> {
+    snapshot
+        .all_date_commits
+        .iter()
+        .chain(snapshot.date_commits.iter())
+        .chain(snapshot.commits.iter())
+        .find(|commit| {
+            commit
+                .refs
+                .iter()
+                .any(|reference| reference == branch_name || reference.ends_with(branch_name))
+        })
+        .map(|commit| commit.subject.clone())
+}
+
+fn git_flow_full_branch_name(
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+    name: &str,
+) -> String {
+    let prefix = git_flow_prefix(config, kind);
+    let name = name.trim().trim_start_matches('/');
+    if name.starts_with(prefix) {
+        name.to_owned()
+    } else {
+        format!("{prefix}{name}")
+    }
+}
+
+fn git_flow_config_field(ui: &mut Ui, language: Language, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [132.0, 24.0],
+            egui::Label::new(RichText::new(label).small().color(theme::muted())),
+        );
+        let hint = placeholder_for_label(language, label);
+        themed_text_edit_selection(ui);
+        ui.add_sized(
+            [ui.available_width(), 24.0],
+            themed_singleline_text_edit(value, &hint),
+        );
+    });
+}
+
+fn git_flow_start_point_row(
+    ui: &mut Ui,
+    label: &str,
+    start_point: &mut String,
+    options: &[GitFlowStartPointOption],
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [132.0, 24.0],
+            egui::Label::new(RichText::new(label).small().color(theme::muted())),
+        );
+        egui::ComboBox::from_id_salt("git_flow_start_point")
+            .selected_text(start_point.as_str())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for option in options {
+                    ui.selectable_value(start_point, option.name.clone(), &option.name);
+                }
+            });
+    });
+}
+
+fn git_flow_start_preview_panel(
+    ui: &mut Ui,
+    language: Language,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+    name: &str,
+    start_point: &str,
+    options: &[GitFlowStartPointOption],
+) {
+    let branch = git_flow_full_branch_name(config, kind, name);
+    let start_subject = options
+        .iter()
+        .find(|option| option.name == start_point)
+        .map(|option| option.subject.as_str())
+        .unwrap_or_default();
+
+    ui.label(
+        RichText::new(i18n::t(language, "git_flow.preview"))
+            .small()
+            .color(theme::muted()),
+    );
+    egui::Frame::new()
+        .fill(theme::panel_soft())
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            let height = 56.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let x = rect.left() + 30.0;
+            let y_top = rect.top() + 16.0;
+            let y_bottom = rect.top() + 40.0;
+            let accent = theme::accent();
+            let muted = theme::muted();
+            painter.line_segment(
+                [Pos2::new(x, y_top), Pos2::new(x - 12.0, y_bottom)],
+                Stroke::new(2.0, accent),
+            );
+            painter.circle_filled(Pos2::new(x, y_top), 3.0, accent);
+            painter.circle_filled(Pos2::new(x - 12.0, y_bottom), 3.0, muted);
+
+            let label_x = x + 26.0;
+            let badge_height = 18.0;
+            let branch_badge_width = inline_button_width_from_text(
+                text_width(ui, &branch, FontId::proportional(12.0), theme::text()),
+                42.0,
+                180.0,
+                12.0,
+            );
+            let branch_rect = Rect::from_min_size(
+                Pos2::new(label_x, y_top - badge_height / 2.0),
+                Vec2::new(branch_badge_width, badge_height),
+            );
+            painter.rect_filled(branch_rect, CornerRadius::same(3), theme::accent_deep());
+            painter.text(
+                branch_rect.center(),
+                Align2::CENTER_CENTER,
+                branch,
+                FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+            painter.text(
+                Pos2::new(branch_rect.right() + 10.0, y_top),
+                Align2::LEFT_CENTER,
+                i18n::t(language, "git_flow.preview.create_branch"),
+                FontId::proportional(12.0),
+                theme::text(),
+            );
+
+            let start_label = if start_point.trim().is_empty() {
+                i18n::t(language, "git_flow.preview.missing_start")
+            } else {
+                start_point
+            };
+            let start_badge_width = inline_button_width_from_text(
+                text_width(ui, start_label, FontId::proportional(12.0), theme::text()),
+                42.0,
+                180.0,
+                12.0,
+            );
+            let start_rect = Rect::from_min_size(
+                Pos2::new(label_x, y_bottom - badge_height / 2.0),
+                Vec2::new(start_badge_width, badge_height),
+            );
+            painter.rect_filled(start_rect, CornerRadius::same(3), theme::hover());
+            painter.text(
+                start_rect.center(),
+                Align2::CENTER_CENTER,
+                start_label,
+                FontId::proportional(12.0),
+                theme::accent_deep(),
+            );
+            if !start_subject.is_empty() {
+                painter.text(
+                    Pos2::new(start_rect.right() + 10.0, y_bottom),
+                    Align2::LEFT_CENTER,
+                    start_subject,
+                    FontId::proportional(12.0),
+                    theme::text(),
+                );
+            }
+        });
+}
+
+#[derive(Default)]
+struct GitFlowActionFooterResponse {
+    reset_clicked: bool,
+    submit_requested: bool,
+    cancel_clicked: bool,
+}
+
+fn git_flow_action_footer(
+    ui: &mut Ui,
+    reset_label: Option<&str>,
+    cancel_label: &str,
+    submit_label: &str,
+    actions_enabled: bool,
+) -> GitFlowActionFooterResponse {
+    let mut response = GitFlowActionFooterResponse::default();
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if let Some(reset_label) = reset_label {
+            response.reset_clicked = dialog_cancel_button(ui, reset_label).clicked();
+        }
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 28.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                response.cancel_clicked = dialog_cancel_button(ui, cancel_label).clicked();
+                let enter_requested = dialog_default_submit_requested(ui);
+                response.submit_requested =
+                    dialog_primary_button(ui, submit_label, actions_enabled).clicked()
+                        || (enter_requested && actions_enabled);
+            },
+        );
+    });
+    response
+}
+
+fn git_flow_next_action_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    dialog_sized_action_button(
+        ui,
+        label,
+        enabled,
+        false,
+        Vec2::new(ui.available_width().max(0.0), 28.0),
+    )
+}
+
+fn git_flow_operation_title(language: Language, operation: GitFlowOperation) -> &'static str {
+    match operation {
+        GitFlowOperation::Start(git::GitFlowBranchKind::Feature) => {
+            i18n::t(language, "git_flow.start_feature.title")
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Feature) => {
+            i18n::t(language, "git_flow.finish_feature.title")
+        }
+        GitFlowOperation::Start(git::GitFlowBranchKind::Release) => {
+            i18n::t(language, "git_flow.start_release.title")
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Release) => {
+            i18n::t(language, "git_flow.finish_release.title")
+        }
+        GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix) => {
+            i18n::t(language, "git_flow.start_hotfix.title")
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix) => {
+            i18n::t(language, "git_flow.finish_hotfix.title")
+        }
+    }
+}
+
+fn git_flow_operation_detail(language: Language, operation: GitFlowOperation) -> &'static str {
+    match operation {
+        GitFlowOperation::Start(_) => i18n::t(language, "git_flow.start.detail"),
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Feature) => {
+            i18n::t(language, "git_flow.finish_feature.detail")
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Release) => {
+            i18n::t(language, "git_flow.finish_release.detail")
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix) => {
+            i18n::t(language, "git_flow.finish_hotfix.detail")
+        }
+    }
+}
+
+fn git_flow_operation_submit_label(
+    language: Language,
+    operation: GitFlowOperation,
+) -> &'static str {
+    match operation {
+        GitFlowOperation::Start(_) => i18n::t(language, "git_flow.start"),
+        GitFlowOperation::Finish(_) => i18n::t(language, "git_flow.finish"),
+    }
+}
+
+fn git_flow_operation_preview(
+    language: Language,
+    config: &git::GitFlowConfig,
+    operation: GitFlowOperation,
+    name: &str,
+    start_point: &str,
+    branch_name: &str,
+) -> Vec<String> {
+    match operation {
+        GitFlowOperation::Start(kind) => {
+            let branch = git_flow_full_branch_name(config, kind, name);
+            vec![format!("checkout -b {} {}", branch, start_point.trim())]
+        }
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Feature) => vec![
+            format!("checkout {}", config.development_branch),
+            format!("merge --no-ff {}", branch_name.trim()),
+            format!("branch -d {}", branch_name.trim()),
+        ],
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Release) => git_flow_finish_preview_lines(
+            language,
+            config,
+            branch_name,
+            git::GitFlowBranchKind::Release,
+        ),
+        GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix) => git_flow_finish_preview_lines(
+            language,
+            config,
+            branch_name,
+            git::GitFlowBranchKind::Hotfix,
+        ),
+    }
+}
+
+fn git_flow_finish_preview_lines(
+    _language: Language,
+    config: &git::GitFlowConfig,
+    branch_name: &str,
+    kind: git::GitFlowBranchKind,
+) -> Vec<String> {
+    let branch_name = branch_name.trim();
+    let version = branch_name
+        .strip_prefix(git_flow_prefix(config, kind))
+        .unwrap_or(branch_name);
+    let tag = format!("{}{}", config.version_tag_prefix, version);
+    vec![
+        format!("checkout {}", config.production_branch),
+        format!("merge --no-ff {}", branch_name),
+        format!("tag {}", tag),
+        format!("checkout {}", config.development_branch),
+        format!("merge --no-ff {}", branch_name),
+        format!("branch -d {}", branch_name),
+    ]
+}
+
+fn validate_git_flow_config_dialog(
+    language: Language,
+    config: &git::GitFlowConfig,
+) -> Option<String> {
+    let mut issues = Vec::new();
+    for value in [
+        config.production_branch.as_str(),
+        config.development_branch.as_str(),
+        config.feature_prefix.as_str(),
+        config.release_prefix.as_str(),
+        config.hotfix_prefix.as_str(),
+    ] {
+        if value.trim().is_empty() {
+            issues.push(i18n::t(language, "git_flow.error.required"));
+            break;
+        }
+    }
+    for branch in [
+        config.production_branch.as_str(),
+        config.development_branch.as_str(),
+    ] {
+        if !valid_checkout_local_branch_name(branch) {
+            issues.push(i18n::t(language, "git_flow.error.branch_invalid"));
+            break;
+        }
+    }
+    if config.production_branch.trim() == config.development_branch.trim() {
+        issues.push(i18n::t(language, "git_flow.error.branch_same"));
+    }
+    git_flow_issue_message(language, issues)
+}
+
+fn validate_git_flow_run_dialog(
+    language: Language,
+    config: &git::GitFlowConfig,
+    operation: GitFlowOperation,
+    name: &str,
+    start_point: &str,
+    branch_name: &str,
+    start_options: &[GitFlowStartPointOption],
+    local_branch_names: &[String],
+) -> Option<String> {
+    let mut issues = Vec::new();
+    match operation {
+        GitFlowOperation::Start(kind) => {
+            let full_branch = git_flow_full_branch_name(config, kind, name);
+            if name.trim().is_empty() || !valid_checkout_local_branch_name(&full_branch) {
+                issues.push(i18n::t(language, "git_flow.error.branch_invalid"));
+            } else if local_branch_names
+                .iter()
+                .any(|branch| branch == &full_branch)
+            {
+                issues.push(i18n::t(language, "git_flow.error.branch_exists"));
+            }
+            if start_point.trim().is_empty()
+                || !start_options
+                    .iter()
+                    .any(|option| option.name == start_point.trim())
+            {
+                issues.push(i18n::t(language, "git_flow.error.start_point_missing"));
+            }
+        }
+        GitFlowOperation::Finish(kind) => {
+            let expected_prefix = git_flow_prefix(config, kind);
+            let branch_name = branch_name.trim();
+            if branch_name.is_empty() || !valid_checkout_local_branch_name(branch_name) {
+                issues.push(i18n::t(language, "git_flow.error.branch_invalid"));
+            } else if !branch_name.starts_with(expected_prefix) {
+                issues.push(i18n::t(language, "git_flow.error.branch_prefix"));
+            } else if !local_branch_names
+                .iter()
+                .any(|branch| branch == branch_name)
+            {
+                issues.push(i18n::t(language, "git_flow.error.branch_missing"));
+            }
+        }
+    }
+    git_flow_issue_message(language, issues)
+}
+
+fn git_flow_issue_message(language: Language, issues: Vec<&'static str>) -> Option<String> {
+    if issues.is_empty() {
+        return None;
+    }
+    let mut message = i18n::t(language, "git_flow.error.fix_inputs").to_owned();
+    for (index, issue) in issues.iter().enumerate() {
+        message.push_str(&format!("\n{}. {}", index + 1, issue));
+    }
+    Some(message)
 }
 
 fn dependency_source_row(
@@ -22827,7 +24659,10 @@ mod ui_tests {
             .unwrap();
         let menu_source = &implementation_source[menu_start..menu_start + menu_end];
 
-        assert!(menu_source.contains("ui.menu_button(i18n::t(language, \"menu.compare\")"));
+        assert!(
+            menu_source.contains("hover_submenu_button(ui, i18n::t(language, \"menu.compare\")")
+        );
+        assert!(!menu_source.contains("ui.menu_button(i18n::t(language, \"menu.compare\")"));
         assert!(menu_source.contains("CommitMenuAction::CompareWithWorktree"));
         assert!(menu_source.contains("CommitMenuAction::ExternalDiff"));
         assert!(menu_source.contains("CommitMenuAction::OpenRemote"));
@@ -22890,6 +24725,67 @@ mod ui_tests {
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains("&& !self.loading_repo"));
         assert!(panel_source.contains("&& !self.remote_git_busy()"));
+    }
+
+    #[test]
+    fn commit_panel_switches_to_rebase_controls_during_rebase() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let panel_start = implementation_source.find("fn commit_panel(").unwrap();
+        let panel_end = implementation_source[panel_start..]
+            .find("fn commit_action_row(")
+            .unwrap();
+        let panel_source = &implementation_source[panel_start..panel_start + panel_end];
+        assert!(panel_source.contains("snapshot.rebase_in_progress"));
+        assert!(panel_source.contains("self.rebase_commit_panel_body(ui, &snapshot);"));
+        assert!(
+            panel_source.find("snapshot.rebase_in_progress").unwrap()
+                < panel_source.find("commit_message_editor_ui(").unwrap()
+        );
+
+        let rebase_panel_start = implementation_source
+            .find("fn rebase_commit_panel_body(")
+            .unwrap();
+        let rebase_panel_end = implementation_source[rebase_panel_start..]
+            .find("fn commit_action_row(")
+            .unwrap();
+        let rebase_panel_source =
+            &implementation_source[rebase_panel_start..rebase_panel_start + rebase_panel_end];
+        for required in [
+            "interactive_rebase.in_progress.title",
+            "interactive_rebase.in_progress.detail",
+            "interactive_rebase.in_progress.conflicts",
+            "interactive_rebase.in_progress.continue",
+            "interactive_rebase.in_progress.skip",
+            "interactive_rebase.in_progress.abort",
+            "worktree_conflict_files(snapshot)",
+            "self.start_rebase_control_action(RebaseControlAction::Continue)",
+            "self.start_rebase_control_action(RebaseControlAction::Skip)",
+            "self.start_rebase_control_action(RebaseControlAction::Abort)",
+        ] {
+            assert!(rebase_panel_source.contains(required), "{required}");
+        }
+        assert!(!rebase_panel_source.contains("commit_message_editor_ui("));
+        assert!(!rebase_panel_source.contains("commit.push_immediately"));
+        assert!(!rebase_panel_source.contains("commit.amend"));
+        assert!(rebase_panel_source.contains("REBASE_CONTROL_BUTTON_SIZE"));
+        assert!(rebase_panel_source.contains("dialog_sized_action_button"));
+
+        let action_start = implementation_source
+            .find("fn start_rebase_control_action(")
+            .unwrap();
+        let action_end = implementation_source[action_start..]
+            .find("fn commit_action_row(")
+            .unwrap();
+        let action_source = &implementation_source[action_start..action_start + action_end];
+        assert!(action_source.contains("RebaseControlAction::Continue"));
+        assert!(action_source.contains("git::rebase_continue(root)"));
+        assert!(action_source.contains("RebaseControlAction::Skip"));
+        assert!(action_source.contains("git::rebase_skip(root)"));
+        assert!(action_source.contains("RebaseControlAction::Abort"));
+        assert!(action_source.contains("git::rebase_abort(root)"));
+        assert!(action_source.contains("self.pending_rewritten_history_prompt_root = Some("));
     }
 
     #[test]
@@ -24127,11 +26023,26 @@ mod ui_tests {
         let shadow = text_button_hover_shadow();
 
         assert!(source.contains("fn top_menu_button("));
+        assert!(source.contains("fn hover_submenu_button("));
         assert!(top_menu_button_source.contains("popup_below_widget("));
         assert!(top_menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
         assert!(!top_menu_button_source.contains("ui.menu_button("));
         assert!(source.contains("fn menu_text_button("));
         assert!(source.contains("fn menu_text_button_hover_fill("));
+        assert!(menu_button_source.contains("hover_submenu_button("));
+        assert!(menu_button_source.contains("response.hovered()"));
+        assert!(menu_button_source.contains("egui::Area::new("));
+        assert!(menu_button_source.contains("get_temp::<Option<Rect>>("));
+        assert!(menu_button_source.contains("insert_temp::<Option<Rect>>("));
+        assert!(menu_button_source.contains("Some(area.response.rect)"));
+        assert!(menu_button_source.contains("None"));
+        assert!(menu_button_source.contains("Align2::RIGHT_CENTER"));
+        assert!(menu_button_source.contains("\">\""));
+        assert!(menu_button_source.contains("FontId::proportional(11.0)"));
+        assert!(!menu_button_source.contains("memory.open_popup(popup_id)"));
+        assert!(!menu_button_source.contains("popup_below_widget("));
+        assert!(!menu_button_source.contains("\\u{25b6}"));
+        assert!(!menu_button_source.contains("ui.menu_button("));
         assert!(menu_button_source.contains("ui.visuals_mut().window_stroke = Stroke::NONE"));
         assert!(menu_button_source.contains("ui.visuals_mut().window_shadow = panel_shadow()"));
         assert!(menu_button_source.contains("ui.visuals_mut().popup_shadow = panel_shadow()"));
@@ -24164,6 +26075,23 @@ mod ui_tests {
         assert!(shadow.offset[1] > shadow.offset[0]);
         assert!(shadow.blur >= 4);
         assert_eq!(shadow.spread, 0);
+    }
+
+    #[test]
+    fn custom_row_hover_is_blocked_while_any_popup_is_open() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let helper_start = implementation_source.find("fn row_rect_hovered(").unwrap();
+        let helper_end = implementation_source[helper_start..]
+            .find("fn full_row_click_response(")
+            .unwrap();
+        let helper_source = &implementation_source[helper_start..helper_start + helper_end];
+
+        assert!(helper_source.contains("memory.any_popup_open()"));
+        assert!(
+            helper_source.find("memory.any_popup_open()").unwrap()
+                < helper_source.find("pointer").unwrap()
+        );
     }
 
     #[test]
@@ -24286,11 +26214,15 @@ mod ui_tests {
             "show_cherry_pick: false",
             "show_jump: false",
             "show_context_menu: false",
-            "interactive_rebase.todo.pick",
-            "interactive_rebase.todo.squash",
-            "interactive_rebase.todo.drop",
         ] {
             assert!(dialog_source.contains(required), "{required}");
+        }
+        for removed in [
+            "interactive_rebase_action_selector",
+            "interactive_rebase.todo_action",
+            "interactive_rebase.selected_commit",
+        ] {
+            assert!(!dialog_source.contains(removed), "{removed}");
         }
 
         assert_eq!(
@@ -24375,12 +26307,104 @@ mod ui_tests {
     }
 
     #[test]
+    fn interactive_rebase_children_of_commit_allows_published_history_with_warning() {
+        let root = sample_commit("root", &[], "root");
+        let base = sample_commit("base", &["root"], "base");
+        let old = sample_commit("old", &["base"], "old");
+        let merge = sample_commit("merge", &["old", "side"], "merge");
+        let mut head = sample_commit("head", &["merge"], "head");
+        head.refs.push("main".to_owned());
+        let snapshot = RepositorySnapshot {
+            branch: "main".to_owned(),
+            branches: vec![sample_branch("main", true)],
+            upstream: Some(git::UpstreamStatus {
+                name: "origin/main".to_owned(),
+                ahead: 0,
+                behind: 0,
+            }),
+            date_commits: vec![head.clone(), merge.clone(), old.clone(), base.clone(), root],
+            topology_commits: vec![head.clone(), merge.clone(), old.clone(), base.clone()],
+            ..Default::default()
+        };
+
+        assert!(
+            interactive_rebase_dialog_commits(&snapshot, HistorySortOrder::Date).is_empty(),
+            "Repository-menu safe mode should still avoid already-pushed history"
+        );
+        assert_eq!(
+            interactive_rebase_children_of_commit(&snapshot, "base", HistorySortOrder::Date)
+                .iter()
+                .map(|commit| commit.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec!["head", "merge", "old"]
+        );
+        assert_eq!(
+            interactive_rebase_actionable_commits(&interactive_rebase_children_of_commit(
+                &snapshot,
+                "base",
+                HistorySortOrder::Date
+            ))
+            .iter()
+            .map(|commit| commit.hash.as_str())
+            .collect::<Vec<_>>(),
+            vec!["head", "old"],
+            "Merge commits stay visible but are not actionable in normal rebase mode"
+        );
+        assert!(interactive_rebase_rewrites_published_history(
+            &snapshot,
+            &interactive_rebase_children_of_commit(&snapshot, "base", HistorySortOrder::Date)
+        ));
+    }
+
+    #[test]
+    fn commit_context_menu_exposes_sourcetree_children_rebase_entry() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let action_start = implementation_source.find("enum CommitMenuAction").unwrap();
+        let action_end = implementation_source[action_start..]
+            .find("enum WorktreeActionDialog")
+            .unwrap();
+        let action_source = &implementation_source[action_start..action_start + action_end];
+        assert!(action_source.contains("InteractiveRebaseChildren"));
+
+        let menu_start = implementation_source
+            .find("fn commit_context_menu(")
+            .unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn detail_line(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        assert!(menu_source.contains("menu.interactive_rebase_children"));
+        assert!(menu_source.contains("CommitMenuAction::InteractiveRebaseChildren"));
+
+        let handler_start = implementation_source
+            .find("fn handle_commit_menu_action(&mut self")
+            .unwrap();
+        let handler_end = implementation_source[handler_start..]
+            .find("fn handle_worktree_action")
+            .unwrap();
+        let handler_source = &implementation_source[handler_start..handler_start + handler_end];
+        assert!(handler_source.contains("self.open_interactive_rebase_dialog_from_base"));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "menu.interactive_rebase_children"),
+            "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{6b64}\u{63d0}\u{4ea4}\u{4e4b}\u{540e}\u{7684}\u{63d0}\u{4ea4}..."
+        );
+    }
+
+    #[test]
     fn interactive_rebase_omits_merge_commits_from_todo_and_batch_actions() {
         let linear_old = sample_commit("old", &["base"], "old");
         let merge = sample_commit("merge", &["left", "right"], "merge");
         let linear_new = sample_commit("new", &["old"], "new");
         let commits = vec![linear_new.clone(), merge.clone(), linear_old.clone()];
         let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: false,
             selected_hash: linear_new.hash.clone(),
             selected_short_hash: linear_new.short_hash.clone(),
             branch_scope: HistoryBranchScope::Current,
@@ -24390,6 +26414,8 @@ mod ui_tests {
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
             selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
             validation_error: None,
         };
         dialog
@@ -24425,6 +26451,166 @@ mod ui_tests {
     }
 
     #[test]
+    fn interactive_rebase_requires_real_action_before_submit() {
+        let old = sample_commit("old", &["base"], "old");
+        let new = sample_commit("new", &["old"], "new");
+        let commits = vec![new.clone(), old.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: new.hash.clone(),
+            selected_short_hash: new.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::new(),
+            selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        assert!(!interactive_rebase_dialog_has_changes(&dialog));
+        assert_eq!(
+            validate_interactive_rebase_dialog(Language::Chinese, &dialog, &commits),
+            Some(i18n::t(Language::Chinese, "interactive_rebase.error.no_changes").to_owned())
+        );
+
+        dialog
+            .actions
+            .insert(new.hash.clone(), InteractiveRebaseTodoAction::Drop);
+        assert!(interactive_rebase_dialog_has_changes(&dialog));
+        assert_eq!(
+            validate_interactive_rebase_dialog(Language::Chinese, &dialog, &commits),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_can_squash_selected_range_to_target_commit() {
+        let a = sample_commit("a", &["base"], "a");
+        let b = sample_commit("b", &["a"], "b");
+        let c = sample_commit("c", &["b"], "c");
+        let d = sample_commit("d", &["c"], "d");
+        let e = sample_commit("e", &["d"], "e");
+        let commits = vec![e.clone(), d.clone(), c.clone(), b.clone(), a.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: d.hash.clone(),
+            selected_short_hash: d.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::new(),
+            selected_hashes: HashSet::from([d.hash.clone(), b.hash.clone(), a.hash.clone()]),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        assert_eq!(
+            interactive_rebase_selected_squash_range_hashes(&dialog, &commits),
+            vec![
+                "e".to_owned(),
+                "d".to_owned(),
+                "c".to_owned(),
+                "b".to_owned(),
+                "a".to_owned()
+            ]
+        );
+
+        interactive_rebase_apply_squash_range_to_target(&mut dialog, &commits, &d.hash);
+
+        assert_eq!(dialog.squash_target_hash.as_deref(), Some("d"));
+        assert_eq!(
+            dialog.squash_range_hashes,
+            vec![
+                "e".to_owned(),
+                "d".to_owned(),
+                "c".to_owned(),
+                "b".to_owned(),
+                "a".to_owned()
+            ]
+        );
+        assert_eq!(
+            interactive_rebase_todo_items(&dialog, &commits)
+                .iter()
+                .map(|item| (item.hash.as_str(), item.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("d", git::InteractiveRebaseAction::Pick),
+                ("a", git::InteractiveRebaseAction::Squash),
+                ("b", git::InteractiveRebaseAction::Squash),
+                ("c", git::InteractiveRebaseAction::Squash),
+                ("e", git::InteractiveRebaseAction::Squash),
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_squash_button_reflects_applied_target() {
+        let old = sample_commit("oldhash1", &["base"], "old");
+        let new = sample_commit("newhash2", &["oldhash1"], "new");
+        let commits = vec![new.clone(), old.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: new.hash.clone(),
+            selected_short_hash: new.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::new(),
+            selected_hashes: HashSet::from([new.hash.clone(), old.hash.clone()]),
+            squash_target_hash: Some(new.hash.clone()),
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        assert_eq!(
+            interactive_rebase_squash_target_button_label(Language::Chinese, &dialog, &commits),
+            "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230}\u{76ee}\u{6807}"
+        );
+
+        interactive_rebase_apply_squash_range_to_target(&mut dialog, &commits, &new.hash);
+
+        assert_eq!(
+            interactive_rebase_squash_target_button_label(Language::Chinese, &dialog, &commits),
+            "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230} newhash2"
+        );
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let modal_start = implementation_source
+            .find("fn interactive_rebase_action_modal(&mut self")
+            .unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn rebase_control_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+        assert!(modal_source.contains("interactive_rebase_squash_target_button_label"));
+        assert!(modal_source.contains("dialog_action_button("));
+        assert!(modal_source.contains("&squash_button_label"));
+        assert!(modal_source.contains("squash_target_applied"));
+    }
+
+    #[test]
     fn interactive_rebase_dialog_exposes_batch_selection_and_disabled_merge_rows() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -24436,6 +26622,8 @@ mod ui_tests {
             .unwrap();
         let struct_source = &implementation_source[struct_start..struct_start + struct_end];
         assert!(struct_source.contains("selected_hashes: HashSet<String>"));
+        assert!(struct_source.contains("squash_target_hash: Option<String>"));
+        assert!(struct_source.contains("squash_range_hashes: Vec<String>"));
 
         let modal_start = implementation_source
             .find("fn interactive_rebase_action_modal(&mut self")
@@ -24446,14 +26634,19 @@ mod ui_tests {
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
         for required in [
             "interactive_rebase_disabled_hashes(&commits)",
+            "dialog.rewrites_published_history",
+            "interactive_rebase.published_warning",
+            "interactive_rebase.confirm_published",
+            "interactive_rebase.error.confirm_published",
             "dialog.selected_hashes.retain",
             "select_rows: true",
             "disabled_hashes",
             "interactive_rebase.selected_count",
             "interactive_rebase.drop_selected",
-            "interactive_rebase.squash_selected",
+            "interactive_rebase.squash_target",
+            "interactive_rebase_squash_target_button_label",
             "interactive_rebase.reset_selected",
-            "interactive_rebase.merge_commit_disabled",
+            "interactive_rebase_dialog_has_changes(&dialog)",
         ] {
             assert!(modal_source.contains(required), "{required}");
         }
@@ -24464,10 +26657,10 @@ mod ui_tests {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let open_start = implementation_source
-            .find("fn open_interactive_rebase_dialog(&mut self)")
+            .find("fn prepare_interactive_rebase_snapshot(&mut self)")
             .unwrap();
         let open_end = implementation_source[open_start..]
-            .find("fn open_archive_dialog(")
+            .find("fn open_interactive_rebase_dialog(")
             .unwrap();
         let open_source = &implementation_source[open_start..open_start + open_end];
 
@@ -24506,10 +26699,10 @@ mod ui_tests {
         }
 
         let open_start = implementation_source
-            .find("fn open_interactive_rebase_dialog(&mut self)")
+            .find("fn prepare_interactive_rebase_snapshot(&mut self)")
             .unwrap();
         let open_end = implementation_source[open_start..]
-            .find("fn open_archive_dialog(")
+            .find("fn open_interactive_rebase_dialog(")
             .unwrap();
         let open_source = &implementation_source[open_start..open_start + open_end];
         assert!(open_source.contains("self.pending_rebase_control_action = Some("));
@@ -24870,6 +27063,168 @@ mod ui_tests {
             i18n::t(Language::Chinese, "lfs.track.title"),
             "Git LFS: \u{9009}\u{62e9}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}"
         );
+    }
+
+    #[test]
+    fn repository_git_flow_menu_wires_sourcetree_actions() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "pending_git_flow_action: Option<GitFlowActionDialog>",
+            "enum GitFlowActionDialog",
+            "enum GitFlowOperation",
+            "start_point: String",
+            "fn open_git_flow_initialize_dialog(&mut self)",
+            "fn open_git_flow_next_action(&mut self)",
+            "fn git_flow_action_modal(&mut self",
+            "self.git_flow_action_modal(ctx);",
+            "git::read_git_flow_config",
+            "git::initialize_git_flow(root, config)",
+            "git::start_git_flow_action(",
+            "git::finish_git_flow_action(",
+            "&branch_name",
+            "fn git_flow_operation_menu_enabled(",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        for required in [
+            "repo_git_flow",
+            "repo_git_flow_initialize",
+            "repo_git_flow_next_action",
+            "repo_git_flow_start_feature",
+            "repo_git_flow_finish_feature",
+            "repo_git_flow_start_release",
+            "repo_git_flow_finish_release",
+            "repo_git_flow_start_hotfix",
+            "repo_git_flow_finish_hotfix",
+            "self.open_git_flow_initialize_dialog();",
+            "self.open_git_flow_next_action();",
+            "self.open_git_flow_action_dialog(GitFlowOperation::Start(",
+            "git::GitFlowBranchKind::Feature",
+            "self.open_git_flow_action_dialog(GitFlowOperation::Finish(",
+        ] {
+            assert!(menu_source.contains(required), "{required}");
+        }
+        assert!(menu_source.contains("let git_flow_operation_enabled"));
+        assert!(menu_source.contains("git_flow_operation_menu_enabled("));
+        assert!(menu_source.contains(
+            "menu_text_button(\n                        ui,\n                        git_flow_operation_enabled,\n                        menu_label(self.language, \"repo_git_flow_next_action\"),"
+        ));
+        assert!(menu_source.contains(
+            "menu_text_button(\n                        ui,\n                        git_flow_operation_enabled,\n                        menu_label(self.language, \"repo_git_flow_start_feature\"),"
+        ));
+        assert!(!menu_source.contains(
+            "menu_text_button(\n                        ui,\n                        false,\n                        menu_label(self.language, \"repo_git_flow_initialize\")"
+        ));
+
+        let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
+        let toolbar_end = implementation_source[toolbar_start..]
+            .find("fn repository_source_view(")
+            .unwrap();
+        let toolbar_source = &implementation_source[toolbar_start..toolbar_start + toolbar_end];
+        assert!(toolbar_source.contains("self.open_git_workflow();"));
+
+        let dialog_start = implementation_source
+            .find("fn git_flow_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn lfs_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+        for required in [
+            "GitFlowActionDialog::Initialize",
+            "GitFlowActionDialog::NextAction",
+            "GitFlowActionDialog::Run",
+            "git_flow.next_action.title",
+            "git_flow.next_action.recommended",
+            "git_flow_next_action_button(",
+            "git_flow.use_defaults",
+            "git_flow_action_footer(",
+            "git_flow_start_point_row(",
+            "git_flow_start_preview_panel(",
+            "git_flow_start_point_options(",
+            "git_flow.start_from",
+            "git_flow_config_defaults(snapshot)",
+            "git_flow_operation_title(",
+            "git_flow_operation_preview(",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+        assert!(!dialog_source.contains("ui.add_space(12.0);"));
+        assert!(dialog_source.matches("git_flow_action_footer(").count() >= 2);
+        assert!(implementation_source.contains("git_flow_current_branch_for_kind("));
+        assert!(implementation_source.contains("git_flow_operation_default_name("));
+        assert!(implementation_source.contains("git_flow_config_defaults("));
+        let next_action_start = implementation_source
+            .find("fn open_git_flow_next_action(&mut self)")
+            .unwrap();
+        let next_action_end = implementation_source[next_action_start..]
+            .find("fn open_git_flow_action_dialog(&mut self")
+            .unwrap();
+        let next_action_source =
+            &implementation_source[next_action_start..next_action_start + next_action_end];
+        assert!(next_action_source.contains("GitFlowActionDialog::NextAction"));
+        assert!(!next_action_source.contains("git_flow_next_operation("));
+        assert!(!next_action_source.contains("self.open_git_flow_run_dialog(operation, config)"));
+        let compact_dialog_start = implementation_source
+            .find("fn compact_action_dialog(")
+            .unwrap();
+        let compact_dialog_end = implementation_source[compact_dialog_start..]
+            .find("fn compact_dialog_title_bar(")
+            .unwrap();
+        let compact_dialog_source =
+            &implementation_source[compact_dialog_start..compact_dialog_start + compact_dialog_end];
+        assert!(compact_dialog_source.contains(".auto_sized()"));
+
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.initialize.title"),
+            "\u{521d}\u{59cb}\u{5316} Git \u{5de5}\u{4f5c}\u{6d41}"
+        );
+        assert!(
+            i18n::t(Language::Chinese, "git_flow.initialize.detail")
+                .contains("\u{82e5} Develop \u{5206}\u{652f}\u{4e0d}\u{5b58}\u{5728}")
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.use_defaults"),
+            "\u{4f7f}\u{7528}\u{9ed8}\u{8ba4}\u{8bbe}\u{7f6e}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.next_action"),
+            "\u{4e0b}\u{4e00}\u{4e2a}\u{52a8}\u{4f5c}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.next_action.title"),
+            "\u{9009}\u{62e9}\u{4e0b}\u{4e00}\u{4e2a}\u{6d41}\u{52a8}\u{4f5c}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.next_action.other"),
+            "\u{5176}\u{4ed6}\u{64cd}\u{4f5c}..."
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "git_flow.start_from"),
+            "\u{5f00}\u{59cb}\u{4e8e}:"
+        );
+
+        let uninitialized = RepositorySnapshot::default();
+        assert!(!git_flow_operation_menu_enabled(Some(&uninitialized), true));
+        assert!(!git_flow_operation_menu_enabled(
+            Some(&uninitialized),
+            false
+        ));
+
+        let initialized = RepositorySnapshot {
+            git_flow_config: Some(git::GitFlowConfig::default()),
+            ..RepositorySnapshot::default()
+        };
+        assert!(git_flow_operation_menu_enabled(Some(&initialized), true));
+        assert!(!git_flow_operation_menu_enabled(Some(&initialized), false));
     }
 
     #[test]
@@ -25437,14 +27792,32 @@ mod ui_tests {
 
         for required in [
             "credential_login_task: Option<Receiver<anyhow::Result<()>>>",
+            "pending_credential_retry: Option<PendingCredentialRetryAction>",
+            "credential_retry_in_progress: bool",
+            "enum PendingCredentialRetryAction",
             "fn start_github_credential_login(&mut self)",
+            "fn start_credential_retry_action(",
+            "fn start_push_with_credential_retry(",
             "fn github_authentication_error(",
             "git::github_credential_manager_login()",
             "self.tr(\"credentials.github_login\")",
+            "self.tr(\"credentials.github_login_running\")",
             "self.tr(\"credentials.github_login_done\")",
+            "self.tr(\"credentials.github_login_done_message\")",
+            "self.tr(\"credentials.github_retry_failed\")",
         ] {
             assert!(implementation_source.contains(required), "{required}");
         }
+
+        let start_login_start = implementation_source
+            .find("fn start_github_credential_login(")
+            .unwrap();
+        let start_login_end = implementation_source[start_login_start..]
+            .find("fn start_remote_git_action(")
+            .unwrap();
+        let start_login_source =
+            &implementation_source[start_login_start..start_login_start + start_login_end];
+        assert!(!start_login_source.contains("self.error = None;"));
 
         let modal_start = implementation_source.find("fn error_modal(").unwrap();
         let modal_end = implementation_source[modal_start..]
@@ -25452,8 +27825,82 @@ mod ui_tests {
             .unwrap();
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
         assert!(modal_source.contains("github_authentication_error(&message)"));
+        assert!(modal_source.contains("self.pending_credential_retry.is_some()"));
         assert!(modal_source.contains("self.start_github_credential_login();"));
         assert!(modal_source.contains("dialog_primary_button("));
+        assert!(modal_source.contains("credentials.github_login_running"));
+        let login_call = modal_source
+            .find("self.start_github_credential_login();")
+            .unwrap();
+        let after_login_call =
+            &modal_source[login_call..(login_call + 160).min(modal_source.len())];
+        assert!(!after_login_call.contains("close_requested = true"));
+
+        let credential_task_start = implementation_source
+            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .unwrap();
+        let credential_task_end = implementation_source[credential_task_start..]
+            .find("self.poll_merge_tool_task(ctx);")
+            .unwrap();
+        let credential_task_source = &implementation_source
+            [credential_task_start..credential_task_start + credential_task_end];
+        assert!(credential_task_source.contains("credentials.github_login_done_message"));
+        assert!(credential_task_source.contains("self.pending_credential_retry.take()"));
+        assert!(
+            credential_task_source.contains("self.start_credential_retry_action(retry, true);")
+        );
+        assert!(!credential_task_source.contains("self.load_repository_uncached(root);"));
+
+        let retry_start = implementation_source
+            .find("fn start_credential_retry_action(")
+            .unwrap();
+        let retry_end = implementation_source[retry_start..]
+            .find("fn start_remote_git_action(")
+            .unwrap();
+        let retry_source = &implementation_source[retry_start..retry_start + retry_end];
+        assert!(retry_source.contains("PendingCredentialRetryAction::Push"));
+        assert!(retry_source.contains("self.pending_credential_retry = Some(action);"));
+        assert!(retry_source.contains("self.credential_retry_in_progress = after_login;"));
+        assert!(retry_source.contains("git::push_selected(root, &remote, &branches, options)"));
+
+        let remote_task_start = implementation_source
+            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .unwrap();
+        let remote_task_end = implementation_source[remote_task_start..]
+            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .unwrap();
+        let remote_task_source =
+            &implementation_source[remote_task_start..remote_task_start + remote_task_end];
+        assert!(remote_task_source.contains("self.pending_credential_retry = None;"));
+        assert!(
+            remote_task_source.contains("let was_login_retry = self.credential_retry_in_progress")
+        );
+        assert!(remote_task_source.contains("credentials.github_retry_failed"));
+        assert!(remote_task_source.contains("else if !auth_error"));
+
+        let push_modal_start = implementation_source.find("fn push_action_modal(").unwrap();
+        let push_modal_end = implementation_source[push_modal_start..]
+            .find("fn force_push_confirm_modal(")
+            .unwrap();
+        let push_modal_source =
+            &implementation_source[push_modal_start..push_modal_start + push_modal_end];
+        assert!(push_modal_source.contains("start_push_with_credential_retry"));
+        assert!(
+            !push_modal_source.contains("git::push_selected(root, &remote, &branches, options)")
+        );
+
+        let force_confirm_start = implementation_source
+            .find("fn force_push_confirm_modal(")
+            .unwrap();
+        let force_confirm_end = implementation_source[force_confirm_start..]
+            .find("fn commit_action_modal(")
+            .unwrap();
+        let force_confirm_source =
+            &implementation_source[force_confirm_start..force_confirm_start + force_confirm_end];
+        assert!(force_confirm_source.contains("start_push_with_credential_retry"));
+        assert!(
+            !force_confirm_source.contains("git::push_selected(root, &remote, &branches, options)")
+        );
 
         assert!(github_authentication_error(
             "git push --force-with-lease failed: error: Authentication error: Authentication required: You must have push access to verify locks"
@@ -25464,6 +27911,37 @@ mod ui_tests {
         assert_eq!(
             i18n::t(Language::Chinese, "credentials.github_login"),
             "\u{767b}\u{5f55} GitHub"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "credentials.github_login_done_message"),
+            "\u{0047}\u{0069}\u{0074}\u{0048}\u{0075}\u{0062} \u{767b}\u{5f55}\u{5df2}\u{5b8c}\u{6210}\u{3002}\u{5982}\u{679c}\u{6ca1}\u{6709}\u{53ef}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{7684} Git \u{64cd}\u{4f5c}\u{ff0c}\u{8bf7}\u{91cd}\u{65b0}\u{6253}\u{5f00}\u{63a8}\u{9001}\u{5e76}\u{518d}\u{6b21}\u{786e}\u{8ba4}\u{3002}"
+        );
+        assert_eq!(
+            i18n::t(Language::Chinese, "credentials.github_retry_failed"),
+            "\u{767b}\u{5f55}\u{540e}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{4ecd}\u{7136}\u{5931}\u{8d25}\u{3002}\u{8bf7}\u{68c0}\u{67e5}\u{5f53}\u{524d} HTTPS \u{51ed}\u{636e}\u{3001}GitHub \u{8d26}\u{53f7}\u{5199}\u{6743}\u{9650}\u{ff0c}\u{6216}\u{8005}\u{6539}\u{7528} SSH remote\u{3002}"
+        );
+    }
+
+    #[test]
+    fn repository_refresh_success_does_not_clear_git_operation_error() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation_source[poll_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let poll_source = &implementation_source[poll_start..poll_start + poll_end];
+        let repo_ok_start = poll_source
+            .find("for (requested_root, result) in repo_results")
+            .unwrap();
+        let repo_ok_end = poll_source[repo_ok_start..].find("Err(error)").unwrap();
+        let repo_ok_source = &poll_source[repo_ok_start..repo_ok_start + repo_ok_end];
+
+        assert!(repo_ok_source.contains("self.apply_repository_snapshot(snapshot)"));
+        assert!(repo_ok_source.contains("self.pending_branch_checkout = None"));
+        assert!(
+            !repo_ok_source.contains("self.error = None"),
+            "successful repository refresh must not erase an unrelated Git error dialog"
         );
     }
 
@@ -26312,6 +28790,67 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
+    fn push_actions_open_rebase_control_before_detached_head_error() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let quick_push_start = implementation_source
+            .find("fn quick_push_current(")
+            .unwrap();
+        let quick_push_end = implementation_source[quick_push_start..]
+            .find("fn open_push_dialog(")
+            .unwrap();
+        let quick_push_source =
+            &implementation_source[quick_push_start..quick_push_start + quick_push_end];
+        assert!(
+            quick_push_source.contains("self.open_rebase_control_if_needed(snapshot)"),
+            "{quick_push_source}"
+        );
+        assert!(
+            quick_push_source
+                .find("self.open_rebase_control_if_needed(snapshot)")
+                .unwrap()
+                < quick_push_source.find("push.detached_error").unwrap()
+        );
+
+        let open_push_start = implementation_source
+            .find("fn open_push_dialog_with_force(")
+            .unwrap();
+        let open_push_end = implementation_source[open_push_start..]
+            .find("fn selected_push_branches(")
+            .unwrap();
+        let open_push_source =
+            &implementation_source[open_push_start..open_push_start + open_push_end];
+        assert!(
+            open_push_source.contains("self.open_rebase_control_if_needed(snapshot)"),
+            "{open_push_source}"
+        );
+        assert!(
+            open_push_source
+                .find("self.open_rebase_control_if_needed(snapshot)")
+                .unwrap()
+                < open_push_source.find("push.detached_error").unwrap()
+        );
+
+        let helper_start = implementation_source
+            .find("fn open_rebase_control_if_needed(")
+            .unwrap();
+        let helper_end = implementation_source[helper_start..]
+            .find("fn push_current(")
+            .unwrap();
+        let helper_source = &implementation_source[helper_start..helper_start + helper_end];
+        for required in [
+            "snapshot.rebase_in_progress",
+            "git::repository_rebase_in_progress(&snapshot.root)",
+            "self.pending_rebase_control_action = Some(RebaseControlDialog::default())",
+            "self.active_view = MainView::Workspace",
+            "self.error = None",
+        ] {
+            assert!(helper_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
     fn force_with_lease_push_requires_explicit_confirmation() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -26339,9 +28878,7 @@ diff --git a/file.txt b/file.txt
             push_source
                 .find("self.pending_force_push_confirm = Some")
                 .unwrap()
-                < push_source
-                    .find("execute = Some(Box::new(move |root|")
-                    .unwrap()
+                < push_source.find("push_after_close = Some").unwrap()
         );
 
         let confirm_start = implementation_source
@@ -26351,7 +28888,7 @@ diff --git a/file.txt b/file.txt
             .find("fn commit_action_modal(")
             .unwrap();
         let confirm_source = &implementation_source[confirm_start..confirm_start + confirm_end];
-        assert!(confirm_source.contains("git::push_selected(root, &remote, &branches, options)"));
+        assert!(confirm_source.contains("self.start_push_with_credential_retry("));
         assert!(confirm_source.contains("dialog_cancel_button("));
         assert!(confirm_source.contains("dialog_primary_button("));
 
@@ -26804,6 +29341,8 @@ diff --git a/file.txt b/file.txt
         assert!(menu_source.contains("branch_rebase_menu_label(language, name)"));
         assert!(menu_source.contains("branch_rename_menu_label(language, name)"));
         assert!(menu_source.contains("branch_delete_menu_label(language, name)"));
+        assert!(menu_source.contains("hover_submenu_button_enabled("));
+        assert!(!menu_source.contains("ui.menu_button("));
     }
 
     #[test]
@@ -27778,6 +30317,55 @@ diff --git a/file.txt b/file.txt
         assert!(row_source.contains("file.is_conflicted()"));
         assert!(row_source.contains("\"U\""));
         assert!(row_source.contains("worktree.resolve_conflict"));
+    }
+
+    #[test]
+    fn conflict_resolution_columns_and_statuses_stay_aligned() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(560.0, 26.0));
+        let columns = conflict_resolution_columns(rect);
+        assert_eq!(columns.remote.left(), rect.right() - 86.0);
+        assert_eq!(columns.local.left(), columns.remote.left() - 86.0);
+        assert!(columns.name.right() <= columns.local.left() - 12.0);
+
+        let deleted_by_us = WorktreeFile {
+            index_status: 'D',
+            worktree_status: 'U',
+            path: "batch-a.txt".to_owned(),
+            display_path: "batch-a.txt".to_owned(),
+        };
+        assert_eq!(
+            conflict_resolution_side_status(&deleted_by_us, git::ConflictSide::Ours),
+            "Deleted"
+        );
+        assert_eq!(
+            conflict_resolution_side_status(&deleted_by_us, git::ConflictSide::Theirs),
+            "Modified"
+        );
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let header_start = implementation_source
+            .find("fn conflict_resolution_header(")
+            .unwrap();
+        let header_end = implementation_source[header_start..]
+            .find("fn conflict_resolution_row(")
+            .unwrap();
+        let header_source = &implementation_source[header_start..header_start + header_end];
+        assert!(header_source.contains("conflict_resolution_columns(rect)"));
+        assert!(!header_source.contains("ui.horizontal(|ui|"));
+        assert!(!header_source.contains("ui.add_space(300.0)"));
+
+        let row_start = implementation_source
+            .find("fn conflict_resolution_row(")
+            .unwrap();
+        let row_end = implementation_source[row_start..]
+            .find("fn merge_theme_arg(")
+            .unwrap();
+        let row_source = &implementation_source[row_start..row_start + row_end];
+        assert!(row_source.contains("conflict_resolution_columns(rect)"));
+        assert!(row_source.contains("conflict_resolution_side_status("));
+        assert!(!row_source.contains("rect.right() - 150.0"));
+        assert!(!row_source.contains("rect.right() - 74.0"));
     }
 
     #[test]

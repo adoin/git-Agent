@@ -121,6 +121,8 @@ pub struct RepositorySnapshot {
     pub all_date_commits: Vec<Commit>,
     pub all_topology_commits: Vec<Commit>,
     pub config: RepositoryConfig,
+    #[serde(default)]
+    pub git_flow_config: Option<GitFlowConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +179,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     }
     let remotes = load_remotes(&root).unwrap_or_default();
     let config = load_repository_config(&root);
+    let git_flow_config = read_git_flow_config(&root).unwrap_or_default();
     let merge_message = load_merge_message(&root, &branch);
     let rebase_in_progress = rebase_in_progress(&root);
     let upstream = load_upstream_status(&root).ok().flatten();
@@ -227,6 +230,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         all_date_commits,
         all_topology_commits,
         config,
+        git_flow_config,
     })
 }
 
@@ -690,6 +694,309 @@ pub fn archive(
     let args = archive_args(output_path, folder_prefix, target);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitFlowBranchKind {
+    Feature,
+    Release,
+    Hotfix,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitFlowConfig {
+    pub production_branch: String,
+    pub development_branch: String,
+    pub feature_prefix: String,
+    pub release_prefix: String,
+    pub hotfix_prefix: String,
+    pub version_tag_prefix: String,
+}
+
+impl Default for GitFlowConfig {
+    fn default() -> Self {
+        Self {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        }
+    }
+}
+
+fn git_config_get(root: &Path, key: &str) -> Option<String> {
+    git_output(root, &["config", "--get", key])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn read_git_flow_config(root: impl AsRef<Path>) -> Result<Option<GitFlowConfig>> {
+    let root = root.as_ref();
+    let Some(production_branch) = git_config_get(root, "gitflow.branch.master") else {
+        return Ok(None);
+    };
+    let Some(development_branch) = git_config_get(root, "gitflow.branch.develop") else {
+        return Ok(None);
+    };
+
+    Ok(Some(GitFlowConfig {
+        production_branch,
+        development_branch,
+        feature_prefix: git_config_get(root, "gitflow.prefix.feature")
+            .unwrap_or_else(|| "feature/".to_owned()),
+        release_prefix: git_config_get(root, "gitflow.prefix.release")
+            .unwrap_or_else(|| "release/".to_owned()),
+        hotfix_prefix: git_config_get(root, "gitflow.prefix.hotfix")
+            .unwrap_or_else(|| "hotfix/".to_owned()),
+        version_tag_prefix: git_config_get(root, "gitflow.prefix.versiontag").unwrap_or_default(),
+    }))
+}
+
+fn git_flow_config_set_args(config: &GitFlowConfig) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "config".to_owned(),
+            "gitflow.branch.master".to_owned(),
+            config.production_branch.clone(),
+        ],
+        vec![
+            "config".to_owned(),
+            "gitflow.branch.develop".to_owned(),
+            config.development_branch.clone(),
+        ],
+        vec![
+            "config".to_owned(),
+            "gitflow.prefix.feature".to_owned(),
+            config.feature_prefix.clone(),
+        ],
+        vec![
+            "config".to_owned(),
+            "gitflow.prefix.release".to_owned(),
+            config.release_prefix.clone(),
+        ],
+        vec![
+            "config".to_owned(),
+            "gitflow.prefix.hotfix".to_owned(),
+            config.hotfix_prefix.clone(),
+        ],
+        vec![
+            "config".to_owned(),
+            "gitflow.prefix.versiontag".to_owned(),
+            config.version_tag_prefix.clone(),
+        ],
+    ]
+}
+
+fn branch_exists(root: &Path, branch: &str) -> bool {
+    git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{}", branch.trim()))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+pub fn initialize_git_flow(root: impl AsRef<Path>, config: GitFlowConfig) -> Result<()> {
+    let root = root.as_ref();
+    validate_git_flow_config(&config)?;
+    if !branch_exists(root, &config.production_branch) {
+        return Err(anyhow!(
+            "production branch '{}' does not exist",
+            config.production_branch
+        ));
+    }
+
+    for args in git_flow_config_set_args(&config) {
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        git_output(root, &refs)?;
+    }
+    if !branch_exists(root, &config.development_branch) {
+        git_output(
+            root,
+            &[
+                "branch",
+                config.development_branch.as_str(),
+                config.production_branch.as_str(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_git_flow_config(config: &GitFlowConfig) -> Result<()> {
+    for (label, value) in [
+        ("production branch", config.production_branch.as_str()),
+        ("development branch", config.development_branch.as_str()),
+        ("feature prefix", config.feature_prefix.as_str()),
+        ("release prefix", config.release_prefix.as_str()),
+        ("hotfix prefix", config.hotfix_prefix.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow!("{label} is required"));
+        }
+    }
+    Ok(())
+}
+
+fn git_flow_prefix(config: &GitFlowConfig, kind: GitFlowBranchKind) -> &str {
+    match kind {
+        GitFlowBranchKind::Feature => &config.feature_prefix,
+        GitFlowBranchKind::Release => &config.release_prefix,
+        GitFlowBranchKind::Hotfix => &config.hotfix_prefix,
+    }
+}
+
+fn git_flow_branch_name(config: &GitFlowConfig, kind: GitFlowBranchKind, name: &str) -> String {
+    let name = name.trim().trim_start_matches('/');
+    let prefix = git_flow_prefix(config, kind);
+    if name.starts_with(prefix) {
+        name.to_owned()
+    } else {
+        format!("{prefix}{name}")
+    }
+}
+
+#[cfg(test)]
+fn git_flow_start_branch_args(
+    config: &GitFlowConfig,
+    kind: GitFlowBranchKind,
+    name: &str,
+    start_point: &str,
+) -> Vec<String> {
+    vec![
+        "checkout".to_owned(),
+        "-b".to_owned(),
+        git_flow_branch_name(config, kind, name),
+        start_point.trim().to_owned(),
+    ]
+}
+
+fn git_flow_tag_name(config: &GitFlowConfig, branch_name: &str, kind: GitFlowBranchKind) -> String {
+    let prefix = git_flow_prefix(config, kind);
+    let suffix = branch_name
+        .trim()
+        .strip_prefix(prefix)
+        .unwrap_or(branch_name);
+    format!("{}{}", config.version_tag_prefix, suffix)
+}
+
+fn git_flow_finish_feature_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["checkout".to_owned(), config.development_branch.clone()],
+        vec![
+            "merge".to_owned(),
+            "--no-ff".to_owned(),
+            branch_name.to_owned(),
+        ],
+        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
+    ]
+}
+
+fn git_flow_finish_release_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["checkout".to_owned(), config.production_branch.clone()],
+        vec![
+            "merge".to_owned(),
+            "--no-ff".to_owned(),
+            branch_name.to_owned(),
+        ],
+        vec![
+            "tag".to_owned(),
+            git_flow_tag_name(config, branch_name, GitFlowBranchKind::Release),
+        ],
+        vec!["checkout".to_owned(), config.development_branch.clone()],
+        vec![
+            "merge".to_owned(),
+            "--no-ff".to_owned(),
+            branch_name.to_owned(),
+        ],
+        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
+    ]
+}
+
+fn git_flow_finish_hotfix_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
+    vec![
+        vec!["checkout".to_owned(), config.production_branch.clone()],
+        vec![
+            "merge".to_owned(),
+            "--no-ff".to_owned(),
+            branch_name.to_owned(),
+        ],
+        vec![
+            "tag".to_owned(),
+            git_flow_tag_name(config, branch_name, GitFlowBranchKind::Hotfix),
+        ],
+        vec!["checkout".to_owned(), config.development_branch.clone()],
+        vec![
+            "merge".to_owned(),
+            "--no-ff".to_owned(),
+            branch_name.to_owned(),
+        ],
+        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
+    ]
+}
+
+pub fn start_git_flow_action(
+    root: impl AsRef<Path>,
+    config: GitFlowConfig,
+    kind: GitFlowBranchKind,
+    name: String,
+    start_point: String,
+) -> Result<()> {
+    let branch_name = git_flow_branch_name(&config, kind, &name);
+    if branch_name.trim() == git_flow_prefix(&config, kind).trim() {
+        return Err(anyhow!("git flow branch name is required"));
+    }
+    let start_point = start_point.trim();
+    if start_point.is_empty() {
+        return Err(anyhow!("git flow start point is required"));
+    }
+    let args = ["checkout", "-b", branch_name.as_str(), start_point];
+    git_output(root.as_ref(), &args).map(|_| ())
+}
+
+pub fn finish_git_flow_action(
+    root: impl AsRef<Path>,
+    config: GitFlowConfig,
+    kind: GitFlowBranchKind,
+    branch_name: &str,
+) -> Result<()> {
+    let root = root.as_ref();
+    let branch_name = branch_name.trim();
+    if branch_name.is_empty() {
+        return Err(anyhow!("git flow branch name is required"));
+    }
+    let expected_prefix = git_flow_prefix(&config, kind);
+    if !branch_name.starts_with(expected_prefix) {
+        return Err(anyhow!(
+            "branch '{}' does not match expected prefix '{}'",
+            branch_name,
+            expected_prefix
+        ));
+    }
+    let steps = match kind {
+        GitFlowBranchKind::Feature => git_flow_finish_feature_steps(&config, branch_name),
+        GitFlowBranchKind::Release => git_flow_finish_release_steps(&config, branch_name),
+        GitFlowBranchKind::Hotfix => git_flow_finish_hotfix_steps(&config, branch_name),
+    };
+
+    for step in steps {
+        let refs = step.iter().map(String::as_str).collect::<Vec<_>>();
+        if refs.first() == Some(&"merge") {
+            git_output_allowing_new_conflicts(root, &refs)?;
+            if has_unmerged_paths(root) {
+                return Ok(());
+            }
+        } else {
+            git_output(root, &refs)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn rebase_current_onto(root: impl AsRef<Path>, name: &str) -> Result<()> {
@@ -2825,6 +3132,81 @@ mod tests {
                 "*.mp4".to_owned()
             ]),
             vec!["*.psd", "*.mp4"]
+        );
+    }
+
+    #[test]
+    fn git_flow_args_reflect_sourcetree_actions() {
+        let config = GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+
+        assert_eq!(
+            git_flow_config_set_args(&config),
+            vec![
+                vec!["config", "gitflow.branch.master", "main"],
+                vec!["config", "gitflow.branch.develop", "develop"],
+                vec!["config", "gitflow.prefix.feature", "feature/"],
+                vec!["config", "gitflow.prefix.release", "release/"],
+                vec!["config", "gitflow.prefix.hotfix", "hotfix/"],
+                vec!["config", "gitflow.prefix.versiontag", "v"],
+            ]
+        );
+        assert_eq!(
+            git_flow_start_branch_args(&config, GitFlowBranchKind::Feature, "login", "develop"),
+            vec!["checkout", "-b", "feature/login", "develop"]
+        );
+        assert_eq!(
+            git_flow_start_branch_args(
+                &config,
+                GitFlowBranchKind::Feature,
+                "login",
+                "origin/develop"
+            ),
+            vec!["checkout", "-b", "feature/login", "origin/develop"]
+        );
+        assert_eq!(
+            git_flow_start_branch_args(&config, GitFlowBranchKind::Release, "1.2.0", "develop"),
+            vec!["checkout", "-b", "release/1.2.0", "develop"]
+        );
+        assert_eq!(
+            git_flow_start_branch_args(&config, GitFlowBranchKind::Hotfix, "1.2.1", "main"),
+            vec!["checkout", "-b", "hotfix/1.2.1", "main"]
+        );
+        assert_eq!(
+            git_flow_finish_feature_steps(&config, "feature/login"),
+            vec![
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "feature/login"],
+                vec!["branch", "-d", "feature/login"],
+            ]
+        );
+        assert_eq!(
+            git_flow_finish_release_steps(&config, "release/1.2.0"),
+            vec![
+                vec!["checkout", "main"],
+                vec!["merge", "--no-ff", "release/1.2.0"],
+                vec!["tag", "v1.2.0"],
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "release/1.2.0"],
+                vec!["branch", "-d", "release/1.2.0"],
+            ]
+        );
+        assert_eq!(
+            git_flow_finish_hotfix_steps(&config, "hotfix/1.2.1"),
+            vec![
+                vec!["checkout", "main"],
+                vec!["merge", "--no-ff", "hotfix/1.2.1"],
+                vec!["tag", "v1.2.1"],
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "hotfix/1.2.1"],
+                vec!["branch", "-d", "hotfix/1.2.1"],
+            ]
         );
     }
 

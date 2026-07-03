@@ -213,6 +213,23 @@ fn auto_merges_deletion_when_other_side_keeps_base_line() {
 }
 
 #[test]
+fn delete_modify_conflict_remains_resolvable() {
+    let mut merged = three_way_merge("batch commit A\n", "", "batch commit A\nthis n\n");
+
+    let conflicts = merged.conflicts();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].base, vec!["batch commit A"]);
+    assert!(conflicts[0].local.is_empty());
+    assert_eq!(conflicts[0].remote, vec!["batch commit A", "this n"]);
+    assert_eq!(merged.result_text(), "batch commit A\n");
+
+    merged.accept_conflict_side_only(0, MergeSide::Remote);
+    assert!(merged.conflict_side_resolved(0, MergeSide::Local));
+    assert!(merged.conflict_side_resolved(0, MergeSide::Remote));
+    assert_eq!(merged.result_text(), "batch commit A\nthis n\n");
+}
+
+#[test]
 fn keeps_conflicting_lines_as_resolvable_blocks() {
     let merged = three_way_merge(
         "shared line from base\nmain keeps this file\n",

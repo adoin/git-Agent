@@ -181,6 +181,12 @@ pub fn three_way_merge(base: &str, local: &str, remote: &str) -> MergeDocument {
     let base_lines = split_lines(base);
     let local_lines = split_lines(local);
     let remote_lines = split_lines(remote);
+    if base != remote && !base.is_empty() && local.is_empty() {
+        return delete_modify_conflict_document(base_lines, local_lines, remote_lines);
+    }
+    if base != local && !base.is_empty() && remote.is_empty() {
+        return delete_modify_conflict_document(base_lines, local_lines, remote_lines);
+    }
     let max_len = base_lines
         .len()
         .max(local_lines.len())
@@ -244,6 +250,48 @@ pub fn three_way_merge(base: &str, local: &str, remote: &str) -> MergeDocument {
     MergeDocument { lines, conflicts }
 }
 
+fn delete_modify_conflict_document(
+    base_lines: Vec<String>,
+    local_lines: Vec<String>,
+    remote_lines: Vec<String>,
+) -> MergeDocument {
+    let max_len = base_lines
+        .len()
+        .max(local_lines.len())
+        .max(remote_lines.len());
+    let line_indices = (0..max_len).collect::<Vec<_>>();
+    let lines = (0..max_len)
+        .map(|index| {
+            let base = base_lines.get(index).cloned();
+            let local = local_lines.get(index).cloned();
+            let remote = remote_lines.get(index).cloned();
+            MergeLine {
+                result: base.clone().unwrap_or_default(),
+                include_in_result: base.is_some(),
+                base,
+                local,
+                remote,
+                kind: MergeLineKind::Conflict,
+                conflict_index: Some(0),
+                local_resolved: false,
+                remote_resolved: false,
+                local_taken: false,
+                remote_taken: false,
+            }
+        })
+        .collect();
+    MergeDocument {
+        lines,
+        conflicts: vec![ConflictBlock {
+            index: 0,
+            base: base_lines,
+            local: local_lines,
+            remote: remote_lines,
+            line_indices,
+        }],
+    }
+}
+
 impl MergeDocument {
     pub fn conflicts(&self) -> &[ConflictBlock] {
         &self.conflicts
@@ -264,18 +312,25 @@ impl MergeDocument {
     }
 
     fn apply_conflict(&mut self, index: usize, side: MergeSide) {
+        self.accept_conflict_side_only(index, side);
+    }
+
+    pub fn accept_conflict_side_only(&mut self, index: usize, side: MergeSide) {
         let Some(conflict) = self.conflicts.get(index).cloned() else {
             return;
         };
-        let replacement = match side {
-            MergeSide::Local => conflict.local,
-            MergeSide::Remote => conflict.remote,
-        };
-        for (offset, line_index) in conflict.line_indices.iter().copied().enumerate() {
+        for line_index in conflict.line_indices {
             if let Some(line) = self.lines.get_mut(line_index) {
-                line.result = replacement.get(offset).cloned().unwrap_or_default();
-                line.include_in_result = replacement.get(offset).is_some();
-                line.set_side(side, true);
+                match side {
+                    MergeSide::Local => {
+                        line.set_side(MergeSide::Local, true);
+                        line.set_side(MergeSide::Remote, false);
+                    }
+                    MergeSide::Remote => {
+                        line.set_side(MergeSide::Remote, true);
+                        line.set_side(MergeSide::Local, false);
+                    }
+                }
             }
         }
     }
@@ -334,6 +389,9 @@ impl MergeLine {
             if let Some(remote) = &self.remote {
                 lines.push(remote.as_str());
             }
+        }
+        if self.local_taken || self.remote_taken {
+            return lines;
         }
         if lines.is_empty() && self.include_in_result {
             lines.push(self.result.as_str());
