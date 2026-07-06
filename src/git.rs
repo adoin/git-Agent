@@ -1,8 +1,9 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -81,6 +82,51 @@ pub struct Tag {
     pub name: String,
     pub target: String,
     pub subject: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RepositoryBenchmarkReport {
+    #[serde(rename = "GetBranchesMs")]
+    pub get_branches_ms: u64,
+    #[serde(rename = "GetRemoteBranchesMs")]
+    pub get_remote_branches_ms: u64,
+    #[serde(rename = "GetTrackingBranchesForPullMs")]
+    pub get_tracking_branches_for_pull_ms: u64,
+    #[serde(rename = "GetSummaryMs")]
+    pub get_summary_ms: u64,
+    #[serde(rename = "GetTagsMs")]
+    pub get_tags_ms: u64,
+    #[serde(rename = "GetCommitLabelsMs")]
+    pub get_commit_labels_ms: u64,
+    #[serde(rename = "GetStashesMs")]
+    pub get_stashes_ms: u64,
+    #[serde(rename = "GetLogsMs")]
+    pub get_logs_ms: u64,
+    #[serde(rename = "GetCommitDetailsMs")]
+    pub get_commit_details_ms: u64,
+    #[serde(rename = "GetFileStatusAllMs")]
+    pub get_file_status_all_ms: u64,
+    #[serde(rename = "GetRemoteReposMs")]
+    pub get_remote_repos_ms: u64,
+    #[serde(rename = "TotalFiles")]
+    pub total_files: usize,
+    #[serde(rename = "HardwareStats")]
+    pub hardware_stats: Vec<BTreeMap<String, String>>,
+    #[serde(rename = "SourceTreeVersion")]
+    pub source_tree_version: String,
+    #[serde(rename = "GitVersion")]
+    pub git_version: String,
+    #[serde(rename = "IsSystemGit")]
+    pub is_system_git: bool,
+}
+
+pub const REPOSITORY_BENCHMARK_TOTAL_STEPS: usize = 13;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryBenchmarkStepProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub label_key: &'static str,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -232,6 +278,233 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         config,
         git_flow_config,
     })
+}
+
+#[allow(dead_code)]
+pub fn benchmark_repository(path: impl AsRef<Path>) -> Result<RepositoryBenchmarkReport> {
+    benchmark_repository_with_progress(path, |_| {})
+}
+
+pub fn benchmark_repository_with_progress<F>(
+    path: impl AsRef<Path>,
+    mut on_progress: F,
+) -> Result<RepositoryBenchmarkReport>
+where
+    F: FnMut(RepositoryBenchmarkStepProgress),
+{
+    let root = discover_root(path.as_ref())?;
+    let mut completed = 0;
+    let (get_branches_ms, _) = benchmark_git_output(
+        &root,
+        &[
+            "branch",
+            "--format=%(refname:short)%09%(objectname)%09%(upstream:short)",
+        ],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.branches");
+    let (get_remote_branches_ms, _) = benchmark_git_output(
+        &root,
+        &[
+            "branch",
+            "-r",
+            "--format=%(refname:short)%09%(objectname)%09%(upstream:short)",
+        ],
+    );
+    completed += 1;
+    report_benchmark_progress(
+        &mut on_progress,
+        completed,
+        "benchmark.step.remote_branches",
+    );
+    let (get_tracking_branches_for_pull_ms, _) = benchmark_git_output(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:short)",
+            "refs/heads",
+        ],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.tracking");
+    let (get_summary_ms, _) = benchmark_git_output(
+        &root,
+        &["status", "--short", "--branch", "--untracked-files=all"],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.summary");
+    let (get_tags_ms, _) = benchmark_git_output(
+        &root,
+        &["tag", "--list", "--format=%(refname:short)%09%(objectname)"],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.tags");
+    let (get_commit_labels_ms, _) = benchmark_git_output(
+        &root,
+        &["for-each-ref", "--format=%(objectname)%09%(refname:short)"],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.commit_labels");
+    let (get_stashes_ms, _) =
+        benchmark_git_output(&root, &["stash", "list", "--format=%gd%x09%gs"]);
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.stashes");
+    let (get_logs_ms, _) = benchmark_git_output(
+        &root,
+        &[
+            "log",
+            "--date-order",
+            "--all",
+            "--max-count=2000",
+            "--format=%H%x09%P%x09%an%x09%ad%x09%s",
+        ],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.logs");
+    let (get_commit_details_ms, _) =
+        benchmark_git_output(&root, &["log", "-1", "--stat", "--format=fuller"]);
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.commit_details");
+    let (get_file_status_all_ms, status_output) = benchmark_git_output(
+        &root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.file_status");
+    let (get_remote_repos_ms, _) = benchmark_git_output(&root, &["remote", "-v"]);
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.remotes");
+    let (_, file_output) = benchmark_git_output(&root, &["ls-files", "-co", "--exclude-standard"]);
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.files");
+    let hardware_stats = hardware_stats();
+    let git_version = git_version_string();
+    completed += 1;
+    report_benchmark_progress(&mut on_progress, completed, "benchmark.step.system");
+
+    Ok(RepositoryBenchmarkReport {
+        get_branches_ms,
+        get_remote_branches_ms,
+        get_tracking_branches_for_pull_ms,
+        get_summary_ms,
+        get_tags_ms,
+        get_commit_labels_ms,
+        get_stashes_ms,
+        get_logs_ms,
+        get_commit_details_ms,
+        get_file_status_all_ms,
+        get_remote_repos_ms,
+        total_files: file_output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            .max(
+                status_output
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count(),
+            ),
+        hardware_stats,
+        source_tree_version: format!("Git Agent {}", env!("CARGO_PKG_VERSION")),
+        git_version,
+        is_system_git: true,
+    })
+}
+
+fn report_benchmark_progress<F>(on_progress: &mut F, completed: usize, label_key: &'static str)
+where
+    F: FnMut(RepositoryBenchmarkStepProgress),
+{
+    on_progress(RepositoryBenchmarkStepProgress {
+        completed,
+        total: REPOSITORY_BENCHMARK_TOTAL_STEPS,
+        label_key,
+    });
+}
+
+fn benchmark_git_output(root: &Path, args: &[&str]) -> (u64, String) {
+    let started = Instant::now();
+    let output = git_output(root, args).unwrap_or_default();
+    (elapsed_ms(started), output)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn git_version_string() -> String {
+    git_command()
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "git version unknown".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn hardware_stats() -> Vec<BTreeMap<String, String>> {
+    let mut stats = Vec::new();
+    if let Some(mut processor) = powershell_object_map(
+        "Get-CimInstance Win32_Processor | Select-Object -First 1 MaxClockSpeed,NumberOfCores,NumberOfLogicalProcessors,Description | ConvertTo-Json -Compress",
+    ) {
+        processor.insert(
+            "WMIObjectSearchString".to_owned(),
+            "Select * from Win32_Processor".to_owned(),
+        );
+        stats.push(processor);
+    }
+    if let Some(mut memory) = powershell_object_map(
+        "$m=(Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum; [pscustomobject]@{MemoryBytes=[string]$m; MemoryGb=[string][math]::Round($m/1GB)} | ConvertTo-Json -Compress",
+    ) {
+        memory.insert(
+            "WMIObjectSearchString".to_owned(),
+            "Select * from Win32_PhysicalMemory".to_owned(),
+        );
+        stats.push(memory);
+    }
+    if let Some(mut os) = powershell_object_map(
+        "Get-CimInstance Win32_OperatingSystem | Select-Object -First 1 BuildNumber,@{Name='OSDescription';Expression={$_.Caption}} | ConvertTo-Json -Compress",
+    ) {
+        os.insert(
+            "WMIObjectSearchString".to_owned(),
+            "Select * from Win32_OperatingSystem".to_owned(),
+        );
+        stats.push(os);
+    }
+    stats
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hardware_stats() -> Vec<BTreeMap<String, String>> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_object_map(script: &str) -> Option<BTreeMap<String, String>> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
+    let object = value.as_object()?;
+    let mut map = BTreeMap::new();
+    for (key, value) in object {
+        let text = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string().trim_matches('"').to_owned());
+        if !text.is_empty() && text != "null" {
+            map.insert(key.clone(), text);
+        }
+    }
+    Some(map)
 }
 
 pub fn init_repository(path: impl AsRef<Path>) -> Result<PathBuf> {
@@ -726,6 +999,29 @@ impl Default for GitFlowConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitFlowFinishOptions {
+    pub rebase: bool,
+    pub delete_branch: bool,
+    pub force_delete: bool,
+    pub create_tag: bool,
+    pub tag_message: String,
+    pub push_remote: bool,
+}
+
+impl Default for GitFlowFinishOptions {
+    fn default() -> Self {
+        Self {
+            rebase: false,
+            delete_branch: true,
+            force_delete: false,
+            create_tag: true,
+            tag_message: String::new(),
+            push_remote: false,
+        }
+    }
+}
+
 fn git_config_get(root: &Path, key: &str) -> Option<String> {
     git_output(root, &["config", "--get", key])
         .ok()
@@ -882,63 +1178,174 @@ fn git_flow_tag_name(config: &GitFlowConfig, branch_name: &str, kind: GitFlowBra
         .trim()
         .strip_prefix(prefix)
         .unwrap_or(branch_name);
+    if config.version_tag_prefix.is_empty() || suffix.starts_with(&config.version_tag_prefix) {
+        return suffix.to_owned();
+    }
     format!("{}{}", config.version_tag_prefix, suffix)
 }
 
-fn git_flow_finish_feature_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
+fn git_flow_delete_branch_step(branch_name: &str, force_delete: bool) -> Vec<String> {
     vec![
+        "branch".to_owned(),
+        if force_delete { "-D" } else { "-d" }.to_owned(),
+        branch_name.to_owned(),
+    ]
+}
+
+fn git_flow_tag_step(
+    config: &GitFlowConfig,
+    branch_name: &str,
+    kind: GitFlowBranchKind,
+    options: &GitFlowFinishOptions,
+) -> Option<Vec<String>> {
+    if !options.create_tag {
+        return None;
+    }
+    let tag_name = git_flow_tag_name(config, branch_name, kind);
+    let tag_message = options.tag_message.trim();
+    if tag_message.is_empty() {
+        Some(vec!["tag".to_owned(), tag_name])
+    } else {
+        Some(vec![
+            "tag".to_owned(),
+            "-a".to_owned(),
+            tag_name,
+            "-m".to_owned(),
+            tag_message.to_owned(),
+        ])
+    }
+}
+
+fn git_flow_push_finish_step(
+    config: &GitFlowConfig,
+    options: &GitFlowFinishOptions,
+) -> Option<Vec<String>> {
+    if !options.push_remote {
+        return None;
+    }
+    let mut args = vec!["push".to_owned(), "origin".to_owned()];
+    for branch in [&config.production_branch, &config.development_branch] {
+        if !args.iter().any(|arg| arg == branch) {
+            args.push(branch.clone());
+        }
+    }
+    if options.create_tag {
+        args.push("--tags".to_owned());
+    }
+    Some(args)
+}
+
+fn git_flow_finish_feature_steps(
+    config: &GitFlowConfig,
+    branch_name: &str,
+    options: GitFlowFinishOptions,
+) -> Vec<Vec<String>> {
+    let mut steps = Vec::new();
+    if options.rebase {
+        steps.push(vec!["checkout".to_owned(), branch_name.to_owned()]);
+        steps.push(vec!["rebase".to_owned(), config.development_branch.clone()]);
+    }
+    steps.extend([
         vec!["checkout".to_owned(), config.development_branch.clone()],
         vec![
             "merge".to_owned(),
             "--no-ff".to_owned(),
             branch_name.to_owned(),
         ],
-        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
-    ]
+    ]);
+    if options.delete_branch {
+        steps.push(git_flow_delete_branch_step(
+            branch_name,
+            options.force_delete,
+        ));
+    }
+    steps
 }
 
-fn git_flow_finish_release_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
-    vec![
+fn git_flow_finish_release_steps(
+    config: &GitFlowConfig,
+    branch_name: &str,
+    options: GitFlowFinishOptions,
+) -> Vec<Vec<String>> {
+    let mut steps = Vec::new();
+    if options.rebase {
+        steps.push(vec!["checkout".to_owned(), branch_name.to_owned()]);
+        steps.push(vec!["rebase".to_owned(), config.development_branch.clone()]);
+    }
+    steps.extend([
         vec!["checkout".to_owned(), config.production_branch.clone()],
         vec![
             "merge".to_owned(),
             "--no-ff".to_owned(),
             branch_name.to_owned(),
         ],
-        vec![
-            "tag".to_owned(),
-            git_flow_tag_name(config, branch_name, GitFlowBranchKind::Release),
-        ],
+    ]);
+    if let Some(tag_step) =
+        git_flow_tag_step(config, branch_name, GitFlowBranchKind::Release, &options)
+    {
+        steps.push(tag_step);
+    }
+    steps.extend([
         vec!["checkout".to_owned(), config.development_branch.clone()],
         vec![
             "merge".to_owned(),
             "--no-ff".to_owned(),
             branch_name.to_owned(),
         ],
-        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
-    ]
+    ]);
+    if options.delete_branch {
+        steps.push(git_flow_delete_branch_step(
+            branch_name,
+            options.force_delete,
+        ));
+    }
+    if let Some(push_step) = git_flow_push_finish_step(config, &options) {
+        steps.push(push_step);
+    }
+    steps
 }
 
-fn git_flow_finish_hotfix_steps(config: &GitFlowConfig, branch_name: &str) -> Vec<Vec<String>> {
-    vec![
+fn git_flow_finish_hotfix_steps(
+    config: &GitFlowConfig,
+    branch_name: &str,
+    options: GitFlowFinishOptions,
+) -> Vec<Vec<String>> {
+    let mut steps = Vec::new();
+    if options.rebase {
+        steps.push(vec!["checkout".to_owned(), branch_name.to_owned()]);
+        steps.push(vec!["rebase".to_owned(), config.production_branch.clone()]);
+    }
+    steps.extend([
         vec!["checkout".to_owned(), config.production_branch.clone()],
         vec![
             "merge".to_owned(),
             "--no-ff".to_owned(),
             branch_name.to_owned(),
         ],
-        vec![
-            "tag".to_owned(),
-            git_flow_tag_name(config, branch_name, GitFlowBranchKind::Hotfix),
-        ],
+    ]);
+    if let Some(tag_step) =
+        git_flow_tag_step(config, branch_name, GitFlowBranchKind::Hotfix, &options)
+    {
+        steps.push(tag_step);
+    }
+    steps.extend([
         vec!["checkout".to_owned(), config.development_branch.clone()],
         vec![
             "merge".to_owned(),
             "--no-ff".to_owned(),
             branch_name.to_owned(),
         ],
-        vec!["branch".to_owned(), "-d".to_owned(), branch_name.to_owned()],
-    ]
+    ]);
+    if options.delete_branch {
+        steps.push(git_flow_delete_branch_step(
+            branch_name,
+            options.force_delete,
+        ));
+    }
+    if let Some(push_step) = git_flow_push_finish_step(config, &options) {
+        steps.push(push_step);
+    }
+    steps
 }
 
 pub fn start_git_flow_action(
@@ -965,6 +1372,7 @@ pub fn finish_git_flow_action(
     config: GitFlowConfig,
     kind: GitFlowBranchKind,
     branch_name: &str,
+    options: GitFlowFinishOptions,
 ) -> Result<()> {
     let root = root.as_ref();
     let branch_name = branch_name.trim();
@@ -980,9 +1388,9 @@ pub fn finish_git_flow_action(
         ));
     }
     let steps = match kind {
-        GitFlowBranchKind::Feature => git_flow_finish_feature_steps(&config, branch_name),
-        GitFlowBranchKind::Release => git_flow_finish_release_steps(&config, branch_name),
-        GitFlowBranchKind::Hotfix => git_flow_finish_hotfix_steps(&config, branch_name),
+        GitFlowBranchKind::Feature => git_flow_finish_feature_steps(&config, branch_name, options),
+        GitFlowBranchKind::Release => git_flow_finish_release_steps(&config, branch_name, options),
+        GitFlowBranchKind::Hotfix => git_flow_finish_hotfix_steps(&config, branch_name, options),
     };
 
     for step in steps {
@@ -1748,6 +2156,32 @@ pub fn push_selected(
         git_output(root, &refs)?;
     }
     Ok(())
+}
+
+pub fn push_pull_request_branch(
+    root: impl AsRef<Path>,
+    remote: &str,
+    local_branch: &str,
+    remote_branch: &str,
+) -> Result<()> {
+    let args = push_pull_request_branch_args(remote, local_branch, remote_branch);
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_output(root.as_ref(), &refs).map(|_| ())
+}
+
+fn push_pull_request_branch_args(
+    remote: &str,
+    local_branch: &str,
+    remote_branch: &str,
+) -> Vec<String> {
+    vec![
+        "push".to_owned(),
+        "-v".to_owned(),
+        "--tags".to_owned(),
+        "--set-upstream".to_owned(),
+        remote.to_owned(),
+        format!("{local_branch}:{remote_branch}"),
+    ]
 }
 
 fn push_branch_args(remote: &str, branch: &PushBranchSpec, force: bool) -> Vec<String> {
@@ -3179,7 +3613,11 @@ mod tests {
             vec!["checkout", "-b", "hotfix/1.2.1", "main"]
         );
         assert_eq!(
-            git_flow_finish_feature_steps(&config, "feature/login"),
+            git_flow_finish_feature_steps(
+                &config,
+                "feature/login",
+                GitFlowFinishOptions::default()
+            ),
             vec![
                 vec!["checkout", "develop"],
                 vec!["merge", "--no-ff", "feature/login"],
@@ -3187,7 +3625,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            git_flow_finish_release_steps(&config, "release/1.2.0"),
+            git_flow_finish_release_steps(
+                &config,
+                "release/1.2.0",
+                GitFlowFinishOptions::default()
+            ),
             vec![
                 vec!["checkout", "main"],
                 vec!["merge", "--no-ff", "release/1.2.0"],
@@ -3198,7 +3640,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            git_flow_finish_hotfix_steps(&config, "hotfix/1.2.1"),
+            git_flow_finish_hotfix_steps(&config, "hotfix/1.2.1", GitFlowFinishOptions::default()),
             vec![
                 vec!["checkout", "main"],
                 vec!["merge", "--no-ff", "hotfix/1.2.1"],
@@ -3208,6 +3650,210 @@ mod tests {
                 vec!["branch", "-d", "hotfix/1.2.1"],
             ]
         );
+    }
+
+    #[test]
+    fn git_flow_finish_feature_steps_honor_finish_options() {
+        let config = GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+
+        assert_eq!(
+            git_flow_finish_feature_steps(
+                &config,
+                "feature/login",
+                GitFlowFinishOptions {
+                    rebase: true,
+                    delete_branch: true,
+                    force_delete: true,
+                    ..GitFlowFinishOptions::default()
+                },
+            ),
+            vec![
+                vec!["checkout", "feature/login"],
+                vec!["rebase", "develop"],
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "feature/login"],
+                vec!["branch", "-D", "feature/login"],
+            ]
+        );
+        assert_eq!(
+            git_flow_finish_feature_steps(
+                &config,
+                "feature/login",
+                GitFlowFinishOptions {
+                    rebase: false,
+                    delete_branch: false,
+                    force_delete: false,
+                    ..GitFlowFinishOptions::default()
+                },
+            ),
+            vec![
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "feature/login"],
+            ]
+        );
+    }
+
+    #[test]
+    fn git_flow_finish_release_steps_honor_sourcetree_options() {
+        let config = GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+
+        assert_eq!(
+            git_flow_finish_release_steps(
+                &config,
+                "release/v1",
+                GitFlowFinishOptions {
+                    rebase: true,
+                    delete_branch: true,
+                    force_delete: false,
+                    create_tag: true,
+                    tag_message: "ship v1".to_owned(),
+                    push_remote: true,
+                },
+            ),
+            vec![
+                vec!["checkout", "release/v1"],
+                vec!["rebase", "develop"],
+                vec!["checkout", "main"],
+                vec!["merge", "--no-ff", "release/v1"],
+                vec!["tag", "-a", "v1", "-m", "ship v1"],
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "release/v1"],
+                vec!["branch", "-d", "release/v1"],
+                vec!["push", "origin", "main", "develop", "--tags"],
+            ]
+        );
+        assert_eq!(
+            git_flow_finish_release_steps(
+                &config,
+                "release/v1",
+                GitFlowFinishOptions {
+                    rebase: false,
+                    delete_branch: false,
+                    force_delete: false,
+                    create_tag: false,
+                    tag_message: String::new(),
+                    push_remote: false,
+                },
+            ),
+            vec![
+                vec!["checkout", "main"],
+                vec!["merge", "--no-ff", "release/v1"],
+                vec!["checkout", "develop"],
+                vec!["merge", "--no-ff", "release/v1"],
+            ]
+        );
+    }
+
+    #[test]
+    fn repository_benchmark_report_serializes_sourcetree_fields() {
+        let report = RepositoryBenchmarkReport {
+            get_branches_ms: 1,
+            get_remote_branches_ms: 2,
+            get_tracking_branches_for_pull_ms: 3,
+            get_summary_ms: 4,
+            get_tags_ms: 5,
+            get_commit_labels_ms: 6,
+            get_stashes_ms: 7,
+            get_logs_ms: 8,
+            get_commit_details_ms: 9,
+            get_file_status_all_ms: 10,
+            get_remote_repos_ms: 11,
+            total_files: 12,
+            hardware_stats: Vec::new(),
+            source_tree_version: "Git Agent 0.1.0".to_owned(),
+            git_version: "git version 2.45.1".to_owned(),
+            is_system_git: true,
+        };
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["GetBranchesMs"], 1);
+        assert_eq!(json["GetRemoteBranchesMs"], 2);
+        assert_eq!(json["GetTrackingBranchesForPullMs"], 3);
+        assert_eq!(json["GetSummaryMs"], 4);
+        assert_eq!(json["GetTagsMs"], 5);
+        assert_eq!(json["GetCommitLabelsMs"], 6);
+        assert_eq!(json["GetStashesMs"], 7);
+        assert_eq!(json["GetLogsMs"], 8);
+        assert_eq!(json["GetCommitDetailsMs"], 9);
+        assert_eq!(json["GetFileStatusAllMs"], 10);
+        assert_eq!(json["GetRemoteReposMs"], 11);
+        assert_eq!(json["TotalFiles"], 12);
+        assert_eq!(json["HardwareStats"].as_array().unwrap().len(), 0);
+        assert_eq!(json["SourceTreeVersion"], "Git Agent 0.1.0");
+        assert_eq!(json["GitVersion"], "git version 2.45.1");
+        assert_eq!(json["IsSystemGit"], true);
+    }
+
+    #[test]
+    fn benchmark_repository_collects_report_for_git_repo() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-benchmark-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        fs::write(root.join("story.txt"), "hello")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+
+        let report = benchmark_repository(&root)?;
+
+        assert!(report.git_version.starts_with("git version "));
+        assert!(report.is_system_git);
+        assert!(report.source_tree_version.starts_with("Git Agent "));
+        assert!(report.total_files >= 1);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_repository_reports_progress_for_each_step() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-benchmark-progress-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        fs::write(root.join("story.txt"), "hello")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+
+        let mut progress = Vec::new();
+        let report = benchmark_repository_with_progress(&root, |step| progress.push(step))?;
+
+        assert!(report.total_files >= 1);
+        assert_eq!(progress.len(), REPOSITORY_BENCHMARK_TOTAL_STEPS);
+        for (index, step) in progress.iter().enumerate() {
+            assert_eq!(step.completed, index + 1);
+            assert_eq!(step.total, REPOSITORY_BENCHMARK_TOTAL_STEPS);
+        }
+        assert_eq!(
+            progress.first().unwrap().label_key,
+            "benchmark.step.branches"
+        );
+        assert_eq!(progress.last().unwrap().label_key, "benchmark.step.system");
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]
@@ -3242,6 +3888,21 @@ mod tests {
             ]
         );
         assert_eq!(push_tags_args("origin"), vec!["push", "origin", "--tags"]);
+    }
+
+    #[test]
+    fn pull_request_push_matches_sourcetree_upstream_command() {
+        assert_eq!(
+            push_pull_request_branch_args("origin", "feature-batch", "feature-batch"),
+            vec![
+                "push",
+                "-v",
+                "--tags",
+                "--set-upstream",
+                "origin",
+                "feature-batch:feature-batch",
+            ]
+        );
     }
 
     #[test]

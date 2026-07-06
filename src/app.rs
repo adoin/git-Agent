@@ -375,6 +375,8 @@ pub struct GitAgentApp {
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
+    repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
     credential_login_task: Option<Receiver<anyhow::Result<()>>>,
     credential_retry_in_progress: bool,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
@@ -416,6 +418,8 @@ pub struct GitAgentApp {
     pending_rewritten_history_prompt_root: Option<PathBuf>,
     pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
     pending_credential_retry: Option<PendingCredentialRetryAction>,
+    pending_create_pull_request: Option<CreatePullRequestDialog>,
+    pending_pull_request_open_after_push: Option<PullRequestOpenAfterPush>,
     pending_archive_action: Option<ArchiveActionDialog>,
     pending_merge_action: Option<MergeActionDialog>,
     pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>,
@@ -478,6 +482,13 @@ type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
 type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
+type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
+
+#[derive(Debug)]
+enum RepositoryBenchmarkTaskMessage {
+    Progress(git::RepositoryBenchmarkStepProgress),
+    Finished(PathBuf, anyhow::Result<git::RepositoryBenchmarkReport>),
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UpstreamSyncCounts {
@@ -731,11 +742,31 @@ struct ConfirmForcePushDialog {
 }
 
 #[derive(Clone, Debug)]
+struct CreatePullRequestDialog {
+    remote: String,
+    local_branch: String,
+    remote_branch: String,
+    validation_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PullRequestOpenAfterPush {
+    root: PathBuf,
+    base_url: String,
+    branch: String,
+}
+
+#[derive(Clone, Debug)]
 enum PendingCredentialRetryAction {
     Push {
         remote: String,
         branches: Vec<git::PushBranchSpec>,
         options: git::PushOptions,
+    },
+    PullRequestPush {
+        remote: String,
+        local_branch: String,
+        remote_branch: String,
     },
 }
 
@@ -879,10 +910,7 @@ enum GitFlowActionDialog {
         config: git::GitFlowConfig,
         validation_error: Option<String>,
     },
-    NextAction {
-        config: git::GitFlowConfig,
-    },
-    OtherActions {
+    ActionPicker {
         config: git::GitFlowConfig,
     },
     Run {
@@ -891,6 +919,12 @@ enum GitFlowActionDialog {
         name: String,
         start_point: String,
         branch_name: String,
+        finish_rebase: bool,
+        finish_delete_branch: bool,
+        finish_force_delete: bool,
+        finish_create_tag: bool,
+        finish_tag_message: String,
+        finish_push_remote: bool,
         validation_error: Option<String>,
     },
 }
@@ -898,6 +932,13 @@ enum GitFlowActionDialog {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GitFlowStartPointOption {
     name: String,
+    subject: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitFlowFinishBranchOption {
+    branch_name: String,
+    display_name: String,
     subject: String,
 }
 
@@ -1952,6 +1993,8 @@ impl GitAgentApp {
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
             remote_git_task: None,
+            repository_benchmark_task: None,
+            repository_benchmark_progress: None,
             credential_login_task: None,
             credential_retry_in_progress: false,
             branch_checkout_task: None,
@@ -1993,6 +2036,8 @@ impl GitAgentApp {
             pending_rewritten_history_prompt_root: None,
             pending_rewritten_history_prompt: None,
             pending_credential_retry: None,
+            pending_create_pull_request: None,
+            pending_pull_request_open_after_push: None,
             pending_archive_action: None,
             pending_merge_action: None,
             pending_interactive_rebase_action: None,
@@ -2549,7 +2594,7 @@ impl GitAgentApp {
     }
 
     fn open_git_workflow(&mut self) {
-        self.open_git_flow_next_action();
+        self.open_git_flow_action_picker();
     }
 
     fn open_git_flow_initialize_dialog(&mut self) {
@@ -2566,13 +2611,13 @@ impl GitAgentApp {
         });
     }
 
-    fn open_git_flow_next_action(&mut self) {
+    fn open_git_flow_action_picker(&mut self) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
         match git::read_git_flow_config(&snapshot.root) {
             Ok(Some(config)) => {
-                self.pending_git_flow_action = Some(GitFlowActionDialog::NextAction { config })
+                self.pending_git_flow_action = Some(GitFlowActionDialog::ActionPicker { config })
             }
             Ok(None) => self.open_git_flow_initialize_dialog(),
             Err(error) => self.error = Some(error.to_string()),
@@ -2598,6 +2643,12 @@ impl GitAgentApp {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
+        let finish_branch = match operation {
+            GitFlowOperation::Finish(kind) => {
+                git_flow_default_finish_branch(snapshot, &config, kind).unwrap_or_default()
+            }
+            GitFlowOperation::Start(_) => String::new(),
+        };
         self.pending_git_flow_action = Some(GitFlowActionDialog::Run {
             operation,
             name: git_flow_operation_default_name(snapshot, &config, operation),
@@ -2609,10 +2660,19 @@ impl GitAgentApp {
             },
             branch_name: match operation {
                 GitFlowOperation::Start(_) => String::new(),
-                GitFlowOperation::Finish(kind) => {
-                    git_flow_current_branch_for_kind(snapshot, &config, kind).unwrap_or_default()
-                }
+                GitFlowOperation::Finish(_) => finish_branch,
             },
+            finish_rebase: false,
+            finish_delete_branch: true,
+            finish_force_delete: false,
+            finish_create_tag: matches!(
+                operation,
+                GitFlowOperation::Finish(
+                    git::GitFlowBranchKind::Release | git::GitFlowBranchKind::Hotfix
+                )
+            ),
+            finish_tag_message: String::new(),
+            finish_push_remote: false,
             config,
             validation_error: None,
         });
@@ -2660,23 +2720,52 @@ impl GitAgentApp {
         }
     }
 
-    fn open_branch_pull_request_url(&mut self, branch: &str) {
-        let Some(base_url) = self.default_remote_web_url() else {
-            self.error = Some(self.tr("repo.remote.missing").to_owned());
-            return;
-        };
-        let url = branch_pull_request_url(&base_url, branch);
-        if let Err(error) = open_url(&url) {
-            self.error = Some(format!("{}: {error}", self.tr("repo.remote.failed")));
-        }
-    }
-
     fn create_pull_request_current_branch(&mut self) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
         let branch = snapshot.branch.clone();
-        self.open_branch_pull_request_url(&branch);
+        self.open_create_pull_request_dialog(Some(branch));
+    }
+
+    fn open_create_pull_request_dialog(&mut self, branch: Option<String>) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let selected_branch = branch
+            .as_deref()
+            .and_then(|name| {
+                snapshot
+                    .branches
+                    .iter()
+                    .find(|candidate| !candidate.remote && candidate.name == name)
+            })
+            .or_else(|| current_named_local_branch(snapshot));
+        let Some(local_branch) = selected_branch else {
+            self.error = Some(self.tr("push.detached_error").to_owned());
+            return;
+        };
+        let upstream = local_branch
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.name.as_str())
+            .and_then(split_remote_branch_name);
+        let remote = upstream
+            .as_ref()
+            .map(|(remote, _)| remote.clone())
+            .unwrap_or_else(|| self.default_remote_name());
+        let remote_branch = upstream
+            .map(|(_, branch)| branch)
+            .unwrap_or_else(|| local_branch.name.clone());
+        self.pending_create_pull_request = Some(CreatePullRequestDialog {
+            remote,
+            local_branch: local_branch.name.clone(),
+            remote_branch,
+            validation_error: None,
+        });
     }
 
     fn open_commit_remote_url(&mut self, hash: &str) {
@@ -2946,11 +3035,73 @@ impl GitAgentApp {
         self.merge_tool_task.is_some()
     }
 
+    fn start_repository_benchmark(&mut self) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.repository_benchmark_task = Some(receiver);
+        self.repository_benchmark_progress = Some(git::RepositoryBenchmarkStepProgress {
+            completed: 0,
+            total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
+            label_key: "benchmark.running",
+        });
+        self.error = None;
+        self.last_notice = None;
+        thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let result = git::benchmark_repository_with_progress(&root, move |progress| {
+                let _ = progress_sender.send(RepositoryBenchmarkTaskMessage::Progress(progress));
+            });
+            let _ = sender.send(RepositoryBenchmarkTaskMessage::Finished(root, result));
+        });
+    }
+
+    fn save_repository_benchmark_report(
+        &mut self,
+        root: &Path,
+        report: &git::RepositoryBenchmarkReport,
+    ) {
+        let mut file_dialog = rfd::FileDialog::new()
+            .set_title(self.tr("benchmark.save_title"))
+            .add_filter("JSON files", &["json"])
+            .set_file_name("benchmark.json");
+        if let Some(parent) = root.parent() {
+            file_dialog = file_dialog.set_directory(parent);
+        }
+        let Some(mut path) = file_dialog.save_file() else {
+            self.last_notice = Some(self.tr("benchmark.cancelled").to_owned());
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("json");
+        }
+        match serde_json::to_string_pretty(report)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| fs::write(&path, raw).map_err(anyhow::Error::from))
+        {
+            Ok(()) => {
+                self.last_notice = Some(format!(
+                    "{}: {}",
+                    self.tr("benchmark.saved"),
+                    user_facing_path_string(&path)
+                ));
+            }
+            Err(error) => {
+                self.error = Some(format!("{}: {error}", self.tr("benchmark.save_failed")));
+            }
+        }
+    }
+
     fn branch_actions_busy(&self) -> bool {
         self.loading_repo
             || self.branch_checkout_busy()
             || self.remote_git_busy()
             || self.merge_tool_busy()
+            || self.repository_benchmark_task.is_some()
     }
 
     fn repo_toolbar_loading_busy(&self) -> bool {
@@ -3280,10 +3431,22 @@ impl GitAgentApp {
                 branches,
                 options,
             } => {
+                self.pending_pull_request_open_after_push = None;
                 self.pending_credential_retry = Some(action);
                 self.credential_retry_in_progress = after_login;
                 self.start_remote_git_action(move |root| {
                     git::push_selected(root, &remote, &branches, options)
+                });
+            }
+            PendingCredentialRetryAction::PullRequestPush {
+                remote,
+                local_branch,
+                remote_branch,
+            } => {
+                self.pending_credential_retry = Some(action);
+                self.credential_retry_in_progress = after_login;
+                self.start_remote_git_action(move |root| {
+                    git::push_pull_request_branch(root, &remote, &local_branch, &remote_branch)
                 });
             }
         }
@@ -3300,6 +3463,22 @@ impl GitAgentApp {
                 remote,
                 branches,
                 options,
+            },
+            false,
+        );
+    }
+
+    fn start_pull_request_push_with_credential_retry(
+        &mut self,
+        remote: String,
+        local_branch: String,
+        remote_branch: String,
+    ) {
+        self.start_credential_retry_action(
+            PendingCredentialRetryAction::PullRequestPush {
+                remote,
+                local_branch,
+                remote_branch,
             },
             false,
         );
@@ -3852,17 +4031,75 @@ impl GitAgentApp {
             }
         }
 
+        if let Some(receiver) = self.repository_benchmark_task.take() {
+            let mut keep_receiver = true;
+            loop {
+                match receiver.try_recv() {
+                    Ok(RepositoryBenchmarkTaskMessage::Progress(progress)) => {
+                        self.repository_benchmark_progress = Some(progress);
+                        ctx.request_repaint();
+                    }
+                    Ok(RepositoryBenchmarkTaskMessage::Finished(root, Ok(report))) => {
+                        keep_receiver = false;
+                        self.repository_benchmark_progress = None;
+                        self.error = None;
+                        self.save_repository_benchmark_report(&root, &report);
+                        ctx.request_repaint();
+                        break;
+                    }
+                    Ok(RepositoryBenchmarkTaskMessage::Finished(_, Err(error))) => {
+                        keep_receiver = false;
+                        self.repository_benchmark_progress = None;
+                        self.error = Some(error.to_string());
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        keep_receiver = false;
+                        self.repository_benchmark_progress = None;
+                        self.error = Some(self.tr("benchmark.stopped").to_owned());
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        break;
+                    }
+                }
+            }
+            if keep_receiver {
+                self.repository_benchmark_task = Some(receiver);
+            }
+        }
+
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
+                    let pull_request_to_open = self
+                        .pending_pull_request_open_after_push
+                        .take()
+                        .filter(|pending| paths_equal(&pending.root, &root));
                     self.pending_credential_retry = None;
                     self.credential_retry_in_progress = false;
                     self.error = None;
                     self.last_notice = None;
                     self.load_repository_uncached(root);
+                    if let Some(pending) = pull_request_to_open {
+                        let url = branch_pull_request_url(&pending.base_url, &pending.branch);
+                        if let Err(error) = open_url(&url) {
+                            self.error =
+                                Some(format!("{}: {error}", self.tr("repo.remote.failed")));
+                        }
+                    }
                     ctx.request_repaint();
                 }
                 Ok((root, Err(error))) => {
+                    let failed_pull_request_root = self
+                        .pending_pull_request_open_after_push
+                        .as_ref()
+                        .is_some_and(|pending| paths_equal(&pending.root, &root));
                     if self
                         .pending_rewritten_history_prompt_root
                         .as_ref()
@@ -3889,10 +4126,16 @@ impl GitAgentApp {
                     self.credential_retry_in_progress = false;
                     if was_login_retry && auth_error {
                         self.pending_credential_retry = None;
+                        if failed_pull_request_root {
+                            self.pending_pull_request_open_after_push = None;
+                        }
                         message.push_str("\n\n");
                         message.push_str(self.tr("credentials.github_retry_failed"));
                     } else if !auth_error {
                         self.pending_credential_retry = None;
+                        if failed_pull_request_root {
+                            self.pending_pull_request_open_after_push = None;
+                        }
                     }
                     self.error = Some(message);
                     self.last_notice = None;
@@ -3904,6 +4147,7 @@ impl GitAgentApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_rewritten_history_prompt_root = None;
+                    self.pending_pull_request_open_after_push = None;
                     self.loading_repo = false;
                     self.error = Some("Remote Git action stopped unexpectedly".to_owned());
                     self.last_notice = None;
@@ -4678,6 +4922,7 @@ impl App for GitAgentApp {
         self.pull_action_modal(ctx);
         self.push_action_modal(ctx);
         self.force_push_confirm_modal(ctx);
+        self.create_pull_request_action_modal(ctx);
         self.archive_action_modal(ctx);
         self.interactive_rebase_action_modal(ctx);
         self.rebase_control_modal(ctx);
@@ -4693,12 +4938,49 @@ impl App for GitAgentApp {
         self.settings_modal(ctx);
         self.repo_settings_modal(ctx);
         self.repo_remote_action_modal(ctx);
+        self.repository_benchmark_progress_modal(ctx);
         self.error_modal(ctx);
         self.toast_overlay(ctx);
     }
 }
 
 impl GitAgentApp {
+    fn repository_benchmark_progress_modal(&mut self, ctx: &egui::Context) {
+        if self.repository_benchmark_task.is_none() {
+            return;
+        }
+        compact_action_dialog(ctx, self.tr("benchmark.title"), 360.0, |ui| {
+            let progress = self.repository_benchmark_progress.clone().unwrap_or(
+                git::RepositoryBenchmarkStepProgress {
+                    completed: 0,
+                    total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
+                    label_key: "benchmark.running",
+                },
+            );
+            let fraction = if progress.total == 0 {
+                0.0
+            } else {
+                (progress.completed as f32 / progress.total as f32).clamp(0.0, 1.0)
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} ({}/{})",
+                    self.tr(progress.label_key),
+                    progress.completed,
+                    progress.total
+                ))
+                .small()
+                .color(theme::muted()),
+            );
+            ui.add_space(10.0);
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .text(format!("{:.0}%", fraction * 100.0))
+                    .desired_width(ui.available_width()),
+            );
+        });
+    }
+
     fn error_modal(&mut self, ctx: &egui::Context) {
         let Some(error) = self.error.clone() else {
             return;
@@ -5300,16 +5582,6 @@ impl GitAgentApp {
                     if menu_text_button(
                         ui,
                         git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_next_action"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_next_action();
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
                         menu_label(self.language, "repo_git_flow_start_feature"),
                     )
                     .clicked()
@@ -5390,11 +5662,16 @@ impl GitAgentApp {
                     self.create_pull_request_current_branch();
                     ui.close_menu();
                 }
-                menu_text_button(
+                if menu_text_button(
                     ui,
-                    false,
+                    git_dialog_enabled,
                     menu_label(self.language, "repo_benchmark_performance"),
-                );
+                )
+                .clicked()
+                {
+                    self.start_repository_benchmark();
+                    ui.close_menu();
+                }
             });
             top_menu_button(ui, menu_label(self.language, "actions"), |ui| {
                 if menu_text_button(ui, has_repo, self.tr("branch.local")).clicked() {
@@ -8082,7 +8359,7 @@ impl GitAgentApp {
                     Some(BranchActionDialog::ConfirmDeleteRemote { remote_branch });
             }
             BranchMenuAction::CreatePullRequest { name } => {
-                self.open_branch_pull_request_url(&name);
+                self.open_create_pull_request_dialog(Some(name));
             }
         }
     }
@@ -9005,6 +9282,233 @@ impl GitAgentApp {
         }
         if keep_open {
             self.pending_force_push_confirm = Some(dialog);
+        }
+    }
+
+    fn create_pull_request_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_create_pull_request.take() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_after = false;
+        let mut push_after_close: Option<(String, String, String)> = None;
+        let actions_enabled = !self.branch_actions_busy();
+        let remotes = self.remote_names();
+        if !remotes.iter().any(|remote| remote == &dialog.remote) {
+            dialog.remote = remotes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "origin".to_owned());
+        }
+        let local_branches = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .branches
+                    .iter()
+                    .filter(|branch| !branch.remote)
+                    .map(|branch| branch.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !local_branches
+            .iter()
+            .any(|branch| branch == &dialog.local_branch)
+        {
+            dialog.local_branch = local_branches
+                .first()
+                .cloned()
+                .unwrap_or_else(|| dialog.local_branch.clone());
+        }
+        if dialog.remote_branch.trim().is_empty() {
+            dialog.remote_branch = dialog.local_branch.clone();
+        }
+        let remote_branches = self.remote_branch_names_for(&dialog.remote);
+        let remote_branch_choices = pull_request_remote_branch_choices(
+            &dialog.local_branch,
+            &dialog.remote_branch,
+            &remote_branches,
+        );
+        let remote_base_url = self
+            .remote_url_for_name(&dialog.remote)
+            .and_then(|remote_url| remote_web_url(&remote_url));
+        let remote_display = remote_base_url
+            .as_ref()
+            .map(|base_url| format!("{}: {}", dialog.remote, base_url))
+            .unwrap_or_else(|| format!("{}: {}", dialog.remote, self.tr("repo.remote.missing")));
+
+        compact_action_dialog(
+            ctx,
+            self.tr("pull_request.title"),
+            PULL_DIALOG_WIDTH,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.tr("pull_request.remote"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    egui::ComboBox::from_id_salt("pull_request_remote_selector")
+                        .width(ui.available_width())
+                        .selected_text(remote_display.as_str())
+                        .show_ui(ui, |ui| {
+                            for remote in &remotes {
+                                let remote_label = self
+                                    .remote_url_for_name(remote)
+                                    .and_then(|remote_url| remote_web_url(&remote_url))
+                                    .map(|base_url| format!("{remote}: {base_url}"))
+                                    .unwrap_or_else(|| {
+                                        format!("{remote}: {}", self.tr("repo.remote.missing"))
+                                    });
+                                if ui
+                                    .selectable_value(
+                                        &mut dialog.remote,
+                                        remote.clone(),
+                                        remote_label,
+                                    )
+                                    .clicked()
+                                {
+                                    dialog.validation_error = None;
+                                    let branches = self.remote_branch_names_for(&dialog.remote);
+                                    let choices = pull_request_remote_branch_choices(
+                                        &dialog.local_branch,
+                                        &dialog.remote_branch,
+                                        &branches,
+                                    );
+                                    if !choices.iter().any(|branch| branch == &dialog.remote_branch)
+                                    {
+                                        dialog.remote_branch =
+                                            choices.first().cloned().unwrap_or_default();
+                                    }
+                                }
+                            }
+                        });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.tr("pull_request.local_branch"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    egui::ComboBox::from_id_salt("pull_request_local_branch_selector")
+                        .width(ui.available_width())
+                        .selected_text(dialog.local_branch.as_str())
+                        .show_ui(ui, |ui| {
+                            for branch in &local_branches {
+                                if ui
+                                    .selectable_value(
+                                        &mut dialog.local_branch,
+                                        branch.clone(),
+                                        branch,
+                                    )
+                                    .clicked()
+                                    && dialog.remote_branch.trim().is_empty()
+                                {
+                                    dialog.remote_branch = dialog.local_branch.clone();
+                                }
+                            }
+                        });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.tr("pull_request.remote_branch"))
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    egui::ComboBox::from_id_salt("pull_request_remote_branch_selector")
+                        .width(ui.available_width())
+                        .selected_text(dialog.remote_branch.as_str())
+                        .show_ui(ui, |ui| {
+                            for branch in &remote_branch_choices {
+                                ui.selectable_value(
+                                    &mut dialog.remote_branch,
+                                    branch.clone(),
+                                    branch,
+                                );
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(self.tr("pull_request.hint"))
+                        .small()
+                        .color(theme::muted()),
+                );
+                if let Some(error) = dialog.validation_error.as_ref() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).color(theme::warning()).strong());
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if dialog_primary_button(
+                            ui,
+                            self.tr("pull_request.submit"),
+                            actions_enabled,
+                        )
+                        .clicked()
+                            || (submit_requested && actions_enabled)
+                        {
+                            let remote = dialog.remote.trim().to_owned();
+                            let local_branch = dialog.local_branch.trim().to_owned();
+                            let remote_branch = dialog.remote_branch.trim().to_owned();
+                            let base_url = self
+                                .remote_url_for_name(&remote)
+                                .and_then(|remote_url| remote_web_url(&remote_url));
+                            let validation_error = if remote.is_empty() {
+                                Some(self.tr("pull_request.error.remote_invalid").to_owned())
+                            } else if base_url.is_none() {
+                                Some(self.tr("repo.remote.missing").to_owned())
+                            } else if !local_branches.iter().any(|branch| branch == &local_branch) {
+                                Some(
+                                    self.tr("pull_request.error.local_branch_invalid")
+                                        .to_owned(),
+                                )
+                            } else if !valid_checkout_local_branch_name(&remote_branch) {
+                                Some(
+                                    self.tr("pull_request.error.remote_branch_invalid")
+                                        .to_owned(),
+                                )
+                            } else {
+                                None
+                            };
+
+                            if let Some(error) = validation_error {
+                                dialog.validation_error = Some(error);
+                            } else if let (Some(snapshot), Some(base_url)) =
+                                (self.snapshot.as_ref(), base_url)
+                            {
+                                self.pending_pull_request_open_after_push =
+                                    Some(PullRequestOpenAfterPush {
+                                        root: snapshot.root.clone(),
+                                        base_url,
+                                        branch: remote_branch.clone(),
+                                    });
+                                push_after_close = Some((remote, local_branch, remote_branch));
+                                close_after = true;
+                            }
+                        }
+                    });
+                });
+            },
+        );
+
+        if let Some((remote, local_branch, remote_branch)) = push_after_close {
+            self.start_pull_request_push_with_credential_retry(remote, local_branch, remote_branch);
+        }
+        if close_after {
+            keep_open = false;
+        }
+        if keep_open {
+            self.pending_create_pull_request = Some(dialog);
         }
     }
 
@@ -10118,7 +10622,6 @@ impl GitAgentApp {
 
         let mut keep_open = true;
         let mut close_after = false;
-        let mut next_dialog: Option<GitFlowActionDialog> = None;
         let mut run_after_close: Option<(GitFlowOperation, git::GitFlowConfig)> = None;
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
             None;
@@ -10228,72 +10731,7 @@ impl GitAgentApp {
                     },
                 );
             }
-            GitFlowActionDialog::NextAction { config } => {
-                compact_action_dialog(ctx, self.tr("git_flow.next_action.title"), 280.0, |ui| {
-                    ui.label(
-                        RichText::new(self.tr("git_flow.next_action.recommended"))
-                            .color(theme::text()),
-                    );
-                    ui.add_space(6.0);
-                    if git_flow_next_action_button(
-                        ui,
-                        self.tr("git_flow.start_feature.title"),
-                        actions_enabled,
-                    )
-                    .clicked()
-                    {
-                        run_after_close = Some((
-                            GitFlowOperation::Start(git::GitFlowBranchKind::Feature),
-                            config.clone(),
-                        ));
-                    }
-                    ui.add_space(4.0);
-                    if git_flow_next_action_button(
-                        ui,
-                        self.tr("git_flow.start_release.title"),
-                        actions_enabled,
-                    )
-                    .clicked()
-                    {
-                        run_after_close = Some((
-                            GitFlowOperation::Start(git::GitFlowBranchKind::Release),
-                            config.clone(),
-                        ));
-                    }
-                    ui.add_space(4.0);
-                    if git_flow_next_action_button(
-                        ui,
-                        self.tr("git_flow.start_hotfix.title"),
-                        actions_enabled,
-                    )
-                    .clicked()
-                    {
-                        run_after_close = Some((
-                            GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix),
-                            config.clone(),
-                        ));
-                    }
-                    ui.add_space(4.0);
-                    if git_flow_next_action_button(
-                        ui,
-                        self.tr("git_flow.next_action.other"),
-                        actions_enabled,
-                    )
-                    .clicked()
-                    {
-                        next_dialog = Some(GitFlowActionDialog::OtherActions {
-                            config: config.clone(),
-                        });
-                    }
-                    ui.add_space(8.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
-                            close_after = true;
-                        }
-                    });
-                });
-            }
-            GitFlowActionDialog::OtherActions { config } => {
+            GitFlowActionDialog::ActionPicker { config } => {
                 compact_action_dialog(ctx, self.tr("git_flow.other_action.title"), 320.0, |ui| {
                     for operation in [
                         GitFlowOperation::Start(git::GitFlowBranchKind::Feature),
@@ -10303,7 +10741,7 @@ impl GitAgentApp {
                         GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix),
                         GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix),
                     ] {
-                        if git_flow_next_action_button(
+                        if git_flow_action_picker_button(
                             ui,
                             git_flow_operation_title(self.language, operation),
                             actions_enabled,
@@ -10314,12 +10752,9 @@ impl GitAgentApp {
                         }
                         ui.add_space(4.0);
                     }
-                    ui.add_space(4.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
-                            close_after = true;
-                        }
-                    });
+                    if git_flow_cancel_footer(ui, self.tr("dialog.cancel")) {
+                        close_after = true;
+                    }
                 });
             }
             GitFlowActionDialog::Run {
@@ -10328,6 +10763,12 @@ impl GitAgentApp {
                 name,
                 start_point,
                 branch_name,
+                finish_rebase,
+                finish_delete_branch,
+                finish_force_delete,
+                finish_create_tag,
+                finish_tag_message,
+                finish_push_remote,
                 validation_error,
             } => {
                 let title = git_flow_operation_title(self.language, *operation);
@@ -10345,12 +10786,28 @@ impl GitAgentApp {
                 {
                     *start_point = start_options[0].name.clone();
                 }
+                let finish_options = match *operation {
+                    GitFlowOperation::Finish(kind) => {
+                        git_flow_finish_branch_options(self.snapshot.as_ref(), config, kind)
+                    }
+                    GitFlowOperation::Start(_) => Vec::new(),
+                };
+                if matches!(*operation, GitFlowOperation::Finish(_))
+                    && !finish_options
+                        .iter()
+                        .any(|option| option.branch_name == *branch_name)
+                    && !finish_options.is_empty()
+                {
+                    *branch_name = finish_options[0].branch_name.clone();
+                }
                 compact_action_dialog(ctx, title, GIT_FLOW_DIALOG_WIDTH, |ui| {
-                    ui.label(
-                        RichText::new(git_flow_operation_detail(self.language, *operation))
-                            .color(theme::text()),
-                    );
-                    ui.add_space(8.0);
+                    if matches!(*operation, GitFlowOperation::Start(_)) {
+                        ui.label(
+                            RichText::new(git_flow_operation_detail(self.language, *operation))
+                                .color(theme::text()),
+                        );
+                        ui.add_space(8.0);
+                    }
                     match *operation {
                         GitFlowOperation::Start(kind) => {
                             git_flow_config_field(
@@ -10376,38 +10833,105 @@ impl GitAgentApp {
                                 &start_options,
                             );
                         }
-                        GitFlowOperation::Finish(_) => {
-                            git_flow_config_field(
+                        GitFlowOperation::Finish(kind) => {
+                            git_flow_finish_branch_row(
                                 ui,
-                                self.language,
-                                self.tr("git_flow.branch_name"),
+                                git_flow_finish_branch_label(self.language, kind),
                                 branch_name,
+                                &finish_options,
                             );
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(self.tr("pull.options"))
+                                    .small()
+                                    .color(theme::muted()),
+                            );
+                            match kind {
+                                git::GitFlowBranchKind::Feature => {
+                                    action_checkbox(
+                                        ui,
+                                        finish_rebase,
+                                        self.tr("git_flow.finish.rebase_development"),
+                                    );
+                                }
+                                git::GitFlowBranchKind::Release
+                                | git::GitFlowBranchKind::Hotfix => {
+                                    action_checkbox(
+                                        ui,
+                                        finish_create_tag,
+                                        self.tr("git_flow.finish.tag_message"),
+                                    );
+                                    ui.add_enabled_ui(*finish_create_tag, |ui| {
+                                        themed_text_edit_selection(ui);
+                                        ui.add_sized(
+                                            [ui.available_width(), 24.0],
+                                            themed_singleline_text_edit(
+                                                finish_tag_message,
+                                                self.tr("git_flow.finish.tag_message_placeholder"),
+                                            ),
+                                        );
+                                    });
+                                }
+                            }
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(self.tr("git_flow.finish.after"))
+                                        .small()
+                                        .color(theme::muted()),
+                                );
+                                action_checkbox(
+                                    ui,
+                                    finish_delete_branch,
+                                    self.tr("git_flow.finish.delete_branch"),
+                                );
+                                action_checkbox(
+                                    ui,
+                                    finish_force_delete,
+                                    self.tr("git_flow.finish.force_delete"),
+                                );
+                                if matches!(
+                                    kind,
+                                    git::GitFlowBranchKind::Release
+                                        | git::GitFlowBranchKind::Hotfix
+                                ) {
+                                    action_checkbox(
+                                        ui,
+                                        finish_push_remote,
+                                        self.tr("git_flow.finish.push_remote"),
+                                    );
+                                }
+                            });
                         }
                     }
                     if matches!(*operation, GitFlowOperation::Finish(_)) {
                         ui.add_space(8.0);
-                        egui::Frame::new()
-                            .fill(theme::panel_soft())
-                            .corner_radius(CornerRadius::same(6))
-                            .inner_margin(egui::Margin::symmetric(8, 8))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(self.tr("git_flow.preview"))
-                                        .small()
-                                        .color(theme::muted()),
-                                );
-                                for line in git_flow_operation_preview(
-                                    self.language,
-                                    config,
-                                    *operation,
-                                    name,
-                                    start_point,
-                                    branch_name,
-                                ) {
-                                    ui.label(RichText::new(line).small().color(theme::text()));
+                        if let GitFlowOperation::Finish(kind) = *operation {
+                            match kind {
+                                git::GitFlowBranchKind::Feature => {
+                                    git_flow_finish_preview_panel(
+                                        ui,
+                                        self.language,
+                                        config,
+                                        kind,
+                                        branch_name,
+                                        &finish_options,
+                                    );
                                 }
-                            });
+                                git::GitFlowBranchKind::Release
+                                | git::GitFlowBranchKind::Hotfix => {
+                                    git_flow_finish_release_preview_panel(
+                                        ui,
+                                        self.language,
+                                        config,
+                                        kind,
+                                        branch_name,
+                                        *finish_create_tag,
+                                        &finish_options,
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     if let Some(error) = validation_error.as_ref() {
@@ -10433,6 +10957,7 @@ impl GitAgentApp {
                             start_point,
                             branch_name,
                             &start_options,
+                            &finish_options,
                             &local_branch_names,
                         ) {
                             *validation_error = Some(error);
@@ -10454,12 +10979,21 @@ impl GitAgentApp {
                                 }
                                 GitFlowOperation::Finish(kind) => {
                                     let branch_name = branch_name.trim().to_owned();
+                                    let options = git::GitFlowFinishOptions {
+                                        rebase: *finish_rebase,
+                                        delete_branch: *finish_delete_branch,
+                                        force_delete: *finish_force_delete,
+                                        create_tag: *finish_create_tag,
+                                        tag_message: finish_tag_message.trim().to_owned(),
+                                        push_remote: *finish_push_remote,
+                                    };
                                     execute = Some(Box::new(move |root| {
                                         git::finish_git_flow_action(
                                             root,
                                             config,
                                             kind,
                                             &branch_name,
+                                            options,
                                         )
                                     }));
                                 }
@@ -10477,9 +11011,7 @@ impl GitAgentApp {
         if close_after {
             keep_open = false;
         }
-        if let Some(dialog) = next_dialog {
-            self.pending_git_flow_action = Some(dialog);
-        } else if let Some((operation, config)) = run_after_close {
+        if let Some((operation, config)) = run_after_close {
             self.open_git_flow_run_dialog(operation, config);
         } else if keep_open {
             self.pending_git_flow_action = Some(dialog);
@@ -10510,38 +11042,33 @@ impl GitAgentApp {
                     ui.label(RichText::new(self.tr("lfs.intro.body")).color(theme::text()));
                     ui.add_space(8.0);
                     ui.label(RichText::new(self.tr("lfs.intro.note")).color(theme::muted()));
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button(self.tr("dialog.cancel")).clicked() {
-                                close_after = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    actions_enabled,
-                                    egui::Button::new(self.tr("lfs.start")),
-                                )
-                                .clicked()
-                            {
-                                if let Some(snapshot) = self.snapshot.as_ref() {
-                                    match git::lfs_tracked_patterns(&snapshot.root) {
-                                        Ok(patterns) => {
-                                            next_dialog = Some(LfsActionDialog::Track {
-                                                original_patterns: patterns.clone(),
-                                                patterns,
-                                                selected: None,
-                                                validation_error: None,
-                                            });
-                                            close_after = true;
-                                        }
-                                        Err(error) => {
-                                            self.error = Some(error.to_string());
-                                            close_after = true;
-                                        }
+                    dialog_footer_row(ui, |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if dialog_primary_button(ui, self.tr("lfs.start"), actions_enabled)
+                            .clicked()
+                            || (submit_requested && actions_enabled)
+                        {
+                            if let Some(snapshot) = self.snapshot.as_ref() {
+                                match git::lfs_tracked_patterns(&snapshot.root) {
+                                    Ok(patterns) => {
+                                        next_dialog = Some(LfsActionDialog::Track {
+                                            original_patterns: patterns.clone(),
+                                            patterns,
+                                            selected: None,
+                                            validation_error: None,
+                                        });
+                                        close_after = true;
+                                    }
+                                    Err(error) => {
+                                        self.error = Some(error.to_string());
+                                        close_after = true;
                                     }
                                 }
                             }
-                        });
+                        }
                     });
                 });
             }
@@ -10602,36 +11129,28 @@ impl GitAgentApp {
                         ui.label(RichText::new(error).color(theme::warning()).small());
                     }
 
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button(self.tr("dialog.cancel")).clicked() {
+                    dialog_footer_row(ui, |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                        let submit_requested = dialog_default_submit_requested(ui);
+                        if dialog_primary_button(ui, self.tr("lfs.track_files"), actions_enabled)
+                            .clicked()
+                            || (submit_requested && actions_enabled)
+                        {
+                            if let Some(error) = validate_lfs_patterns(self.language, patterns) {
+                                *validation_error = Some(error);
+                            } else {
+                                let options = git::LfsTrackOptions {
+                                    original_patterns: original_patterns.clone(),
+                                    patterns: patterns.clone(),
+                                };
+                                execute = Some(Box::new(move |root| {
+                                    git::configure_lfs_patterns(root, options)
+                                }));
                                 close_after = true;
                             }
-                            let submit_requested = dialog_default_submit_requested(ui);
-                            if ui
-                                .add_enabled(
-                                    actions_enabled,
-                                    egui::Button::new(self.tr("lfs.track_files")),
-                                )
-                                .clicked()
-                                || (submit_requested && actions_enabled)
-                            {
-                                if let Some(error) = validate_lfs_patterns(self.language, patterns)
-                                {
-                                    *validation_error = Some(error);
-                                } else {
-                                    let options = git::LfsTrackOptions {
-                                        original_patterns: original_patterns.clone(),
-                                        patterns: patterns.clone(),
-                                    };
-                                    execute = Some(Box::new(move |root| {
-                                        git::configure_lfs_patterns(root, options)
-                                    }));
-                                    close_after = true;
-                                }
-                            }
-                        });
+                        }
                     });
                 });
             }
@@ -10709,35 +11228,29 @@ impl GitAgentApp {
                     ui.label(RichText::new(error).color(theme::warning()).small());
                 }
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                dialog_footer_row(ui, |ui| {
+                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if dialog_primary_button(ui, self.tr("dialog.ok"), actions_enabled).clicked()
+                        || (submit_requested && actions_enabled)
+                    {
+                        if let Some(error) =
+                            validate_submodule_action_dialog(self.language, &dialog)
+                        {
+                            dialog.validation_error = Some(error);
+                        } else {
+                            let options = git::SubmoduleAddOptions {
+                                source: dialog.source.trim().to_owned(),
+                                local_path: normalize_dialog_relative_path(&dialog.local_path),
+                                source_branch: dialog.source_branch.trim().to_owned(),
+                                recursive: dialog.recursive,
+                            };
+                            execute = Some(Box::new(move |root| git::add_submodule(root, options)));
                             close_after = true;
                         }
-                        let submit_requested = dialog_default_submit_requested(ui);
-                        if ui
-                            .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
-                            .clicked()
-                            || (submit_requested && actions_enabled)
-                        {
-                            if let Some(error) =
-                                validate_submodule_action_dialog(self.language, &dialog)
-                            {
-                                dialog.validation_error = Some(error);
-                            } else {
-                                let options = git::SubmoduleAddOptions {
-                                    source: dialog.source.trim().to_owned(),
-                                    local_path: normalize_dialog_relative_path(&dialog.local_path),
-                                    source_branch: dialog.source_branch.trim().to_owned(),
-                                    recursive: dialog.recursive,
-                                };
-                                execute =
-                                    Some(Box::new(move |root| git::add_submodule(root, options)));
-                                close_after = true;
-                            }
-                        }
-                    });
+                    }
                 });
             },
         );
@@ -10810,35 +11323,28 @@ impl GitAgentApp {
                     ui.label(RichText::new(error).color(theme::warning()).small());
                 }
 
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(self.tr("dialog.cancel")).clicked() {
+                dialog_footer_row(ui, |ui| {
+                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                    let submit_requested = dialog_default_submit_requested(ui);
+                    if dialog_primary_button(ui, self.tr("dialog.ok"), actions_enabled).clicked()
+                        || (submit_requested && actions_enabled)
+                    {
+                        if let Some(error) = validate_subtree_action_dialog(self.language, &dialog)
+                        {
+                            dialog.validation_error = Some(error);
+                        } else {
+                            let options = git::SubtreeAddOptions {
+                                source: dialog.source.trim().to_owned(),
+                                local_path: normalize_dialog_relative_path(&dialog.local_path),
+                                ref_name: dialog.ref_name.trim().to_owned(),
+                                squash: dialog.squash,
+                            };
+                            execute = Some(Box::new(move |root| git::add_subtree(root, options)));
                             close_after = true;
                         }
-                        let submit_requested = dialog_default_submit_requested(ui);
-                        if ui
-                            .add_enabled(actions_enabled, egui::Button::new(self.tr("dialog.ok")))
-                            .clicked()
-                            || (submit_requested && actions_enabled)
-                        {
-                            if let Some(error) =
-                                validate_subtree_action_dialog(self.language, &dialog)
-                            {
-                                dialog.validation_error = Some(error);
-                            } else {
-                                let options = git::SubtreeAddOptions {
-                                    source: dialog.source.trim().to_owned(),
-                                    local_path: normalize_dialog_relative_path(&dialog.local_path),
-                                    ref_name: dialog.ref_name.trim().to_owned(),
-                                    squash: dialog.squash,
-                                };
-                                execute =
-                                    Some(Box::new(move |root| git::add_subtree(root, options)));
-                                close_after = true;
-                            }
-                        }
-                    });
+                    }
                 });
             },
         );
@@ -13294,6 +13800,15 @@ fn dialog_sized_action_button(
     response
 }
 
+fn dialog_footer_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    ui.add_space(8.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 28.0),
+        Layout::right_to_left(Align::Center),
+        add_contents,
+    );
+}
+
 fn compact_action_dialog(
     ctx: &egui::Context,
     title: &str,
@@ -14943,7 +15458,6 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "repo_git_flow_initialize") => {
             "\u{521d}\u{59cb}\u{5316}\u{4ed3}\u{5e93}"
         }
-        (Language::Chinese, "repo_git_flow_next_action") => "\u{4e0b}\u{4e2a}\u{64cd}\u{4f5c}...",
         (Language::Chinese, "repo_git_flow_start_feature") => {
             "\u{5efa}\u{7acb}\u{65b0}\u{7684}\u{529f}\u{80fd}"
         }
@@ -15022,7 +15536,6 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "repo_lfs_prune") => "Prune LFS Content",
         (_, "repo_git_flow") => "Git Workflow",
         (_, "repo_git_flow_initialize") => "Initialize Repository",
-        (_, "repo_git_flow_next_action") => "Next Action...",
         (_, "repo_git_flow_start_feature") => "Start New Feature",
         (_, "repo_git_flow_finish_feature") => "Finish Feature",
         (_, "repo_git_flow_start_release") => "Start New Release",
@@ -19608,7 +20121,7 @@ fn branch_row(
     let badge_left =
         paint_branch_row_badges(ui, row_rect, current, remote, sync_counts, language, color)
             .unwrap_or(row_rect.right());
-    let name_left = rect.left() + 16.0 + depth as f32 * 14.0;
+    let name_left = branch_row_name_left(rect, depth);
     let name_right = (badge_left - 6.0).max(name_left);
     let name_rect = Rect::from_min_max(
         Pos2::new(name_left, rect.top()),
@@ -19656,6 +20169,10 @@ fn branch_current_indicator_rect(row_rect: Rect) -> Rect {
         Pos2::new(row_rect.left() + 7.0, row_rect.top() + 5.0),
         Pos2::new(row_rect.left() + 10.0, row_rect.bottom() - 5.0),
     )
+}
+
+fn branch_row_name_left(rect: Rect, depth: usize) -> f32 {
+    rect.left() + 16.0 + depth as f32 * 14.0
 }
 
 fn paint_branch_name(ui: &mut Ui, name_rect: Rect, name_text: RichText) {
@@ -19876,13 +20393,14 @@ fn local_branch_tree_rows(
         if let Some(full_name) = &node.full_name
             && let Some(branch) = branches_by_name.get(full_name.as_str())
         {
+            let row_depth = local_branch_leaf_row_depth(depth);
             branch_row(
                 ui,
                 branch_current_for_display(branch, pending_checkout),
                 false,
                 full_name,
                 &node.name,
-                depth,
+                row_depth,
                 branch
                     .upstream
                     .as_ref()
@@ -19910,13 +20428,14 @@ fn local_branch_tree_rows(
         if let Some(full_name) = &node.full_name
             && let Some(branch) = branches_by_name.get(full_name.as_str())
         {
+            let row_depth = local_branch_leaf_row_depth(depth + 1);
             branch_row(
                 ui,
                 branch_current_for_display(branch, pending_checkout),
                 false,
                 full_name,
                 &node.name,
-                depth + 1,
+                row_depth,
                 branch
                     .upstream
                     .as_ref()
@@ -19945,6 +20464,10 @@ fn local_branch_tree_rows(
             );
         }
     }
+}
+
+fn local_branch_leaf_row_depth(depth: usize) -> usize {
+    if depth == 0 { 0 } else { depth + 1 }
 }
 
 fn remote_branch_tree_rows(
@@ -22272,11 +22795,7 @@ fn git_flow_default_start_point(
     {
         return remote_base;
     }
-    snapshot
-        .branches
-        .first()
-        .map(|branch| branch.name.clone())
-        .unwrap_or_else(|| base.to_owned())
+    base.to_owned()
 }
 
 fn git_flow_start_point_options(
@@ -22309,6 +22828,106 @@ fn git_flow_start_point_options(
         }
     }
     options
+}
+
+fn git_flow_finish_branch_options(
+    snapshot: Option<&RepositorySnapshot>,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> Vec<GitFlowFinishBranchOption> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let prefix = git_flow_prefix(config, kind);
+    snapshot
+        .branches
+        .iter()
+        .filter(|branch| !branch.remote)
+        .filter(|branch| branch.name.starts_with(prefix))
+        .map(|branch| GitFlowFinishBranchOption {
+            display_name: branch
+                .name
+                .strip_prefix(prefix)
+                .unwrap_or(branch.name.as_str())
+                .to_owned(),
+            subject: git_flow_branch_subject(snapshot, &branch.name).unwrap_or_default(),
+            branch_name: branch.name.clone(),
+        })
+        .collect()
+}
+
+fn git_flow_default_finish_branch(
+    snapshot: &RepositorySnapshot,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> Option<String> {
+    let prefix = git_flow_prefix(config, kind);
+    if snapshot.branch.starts_with(prefix) {
+        return Some(snapshot.branch.clone());
+    }
+    git_flow_finish_branch_options(Some(snapshot), config, kind)
+        .first()
+        .map(|option| option.branch_name.clone())
+}
+
+fn git_flow_finish_target_branch(
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> &str {
+    match kind {
+        git::GitFlowBranchKind::Feature => &config.development_branch,
+        git::GitFlowBranchKind::Release | git::GitFlowBranchKind::Hotfix => {
+            &config.production_branch
+        }
+    }
+}
+
+fn git_flow_finish_target_branches(
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+) -> Vec<&str> {
+    match kind {
+        git::GitFlowBranchKind::Feature => vec![config.development_branch.as_str()],
+        git::GitFlowBranchKind::Release | git::GitFlowBranchKind::Hotfix => {
+            vec![
+                config.development_branch.as_str(),
+                config.production_branch.as_str(),
+            ]
+        }
+    }
+}
+
+fn git_flow_finish_branch_label(language: Language, kind: git::GitFlowBranchKind) -> &'static str {
+    match kind {
+        git::GitFlowBranchKind::Feature => i18n::t(language, "git_flow.feature_name"),
+        git::GitFlowBranchKind::Release => i18n::t(language, "git_flow.release_name"),
+        git::GitFlowBranchKind::Hotfix => i18n::t(language, "git_flow.hotfix_name"),
+    }
+}
+
+fn git_flow_finish_latest_label(language: Language, kind: git::GitFlowBranchKind) -> &'static str {
+    match kind {
+        git::GitFlowBranchKind::Feature => i18n::t(language, "git_flow.preview.latest_feature"),
+        git::GitFlowBranchKind::Release => i18n::t(language, "git_flow.preview.latest_release"),
+        git::GitFlowBranchKind::Hotfix => i18n::t(language, "git_flow.preview.latest_hotfix"),
+    }
+}
+
+fn git_flow_finish_tag_name(
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+    branch_name: &str,
+) -> String {
+    let prefix = git_flow_prefix(config, kind);
+    let suffix = branch_name
+        .strip_prefix(prefix)
+        .unwrap_or(branch_name)
+        .trim();
+    if config.version_tag_prefix.is_empty() || suffix.starts_with(&config.version_tag_prefix) {
+        suffix.to_owned()
+    } else {
+        format!("{}{}", config.version_tag_prefix, suffix)
+    }
 }
 
 fn git_flow_branch_subject(snapshot: &RepositorySnapshot, branch_name: &str) -> Option<String> {
@@ -22372,6 +22991,37 @@ fn git_flow_start_point_row(
             .show_ui(ui, |ui| {
                 for option in options {
                     ui.selectable_value(start_point, option.name.clone(), &option.name);
+                }
+            });
+    });
+}
+
+fn git_flow_finish_branch_row(
+    ui: &mut Ui,
+    label: &str,
+    branch_name: &mut String,
+    options: &[GitFlowFinishBranchOption],
+) {
+    let selected_text = options
+        .iter()
+        .find(|option| option.branch_name == *branch_name)
+        .map(|option| option.display_name.clone())
+        .unwrap_or_else(|| branch_name.clone());
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [132.0, 24.0],
+            egui::Label::new(RichText::new(label).small().color(theme::muted())),
+        );
+        egui::ComboBox::from_id_salt("git_flow_finish_branch")
+            .selected_text(selected_text)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for option in options {
+                    ui.selectable_value(
+                        branch_name,
+                        option.branch_name.clone(),
+                        &option.display_name,
+                    );
                 }
             });
     });
@@ -22482,11 +23132,280 @@ fn git_flow_start_preview_panel(
         });
 }
 
+fn git_flow_finish_preview_panel(
+    ui: &mut Ui,
+    language: Language,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+    branch_name: &str,
+    options: &[GitFlowFinishBranchOption],
+) {
+    let target_branch = git_flow_finish_target_branch(config, kind);
+    let subject = options
+        .iter()
+        .find(|option| option.branch_name == branch_name)
+        .map(|option| option.subject.as_str())
+        .unwrap_or_default();
+
+    ui.label(
+        RichText::new(i18n::t(language, "git_flow.preview"))
+            .small()
+            .color(theme::muted()),
+    );
+    egui::Frame::new()
+        .fill(theme::panel_soft())
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            let height = 68.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let x = rect.left() + 32.0;
+            let y_top = rect.top() + 18.0;
+            let y_bottom = rect.top() + 45.0;
+            let accent = theme::accent();
+            let muted = theme::muted();
+            painter.line_segment(
+                [Pos2::new(x - 12.0, y_top), Pos2::new(x, y_bottom)],
+                Stroke::new(2.0, accent),
+            );
+            painter.line_segment(
+                [Pos2::new(x, y_bottom), Pos2::new(x, rect.bottom() - 7.0)],
+                Stroke::new(2.0, muted),
+            );
+            painter.circle_filled(Pos2::new(x - 12.0, y_top), 3.0, accent);
+            painter.circle_filled(Pos2::new(x, y_bottom), 3.0, muted);
+
+            let label_x = x + 24.0;
+            let badge_height = 18.0;
+            let target_width = inline_button_width_from_text(
+                text_width(ui, target_branch, FontId::proportional(12.0), theme::text()),
+                42.0,
+                180.0,
+                12.0,
+            );
+            let target_rect = Rect::from_min_size(
+                Pos2::new(label_x, y_top - badge_height / 2.0),
+                Vec2::new(target_width, badge_height),
+            );
+            painter.rect_filled(target_rect, CornerRadius::same(3), theme::accent_deep());
+            painter.text(
+                target_rect.center(),
+                Align2::CENTER_CENTER,
+                target_branch,
+                FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+            painter.text(
+                Pos2::new(target_rect.right() + 10.0, y_top),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} {} {} {}",
+                    i18n::t(language, "git_flow.preview.merge_prefix"),
+                    branch_name.trim(),
+                    i18n::t(language, "git_flow.preview.merge_suffix"),
+                    target_branch
+                ),
+                FontId::proportional(12.0),
+                theme::text(),
+            );
+            painter.text(
+                Pos2::new(label_x, y_bottom),
+                Align2::LEFT_CENTER,
+                if subject.is_empty() {
+                    git_flow_finish_latest_label(language, kind).to_owned()
+                } else {
+                    subject.to_owned()
+                },
+                FontId::proportional(12.0),
+                theme::text(),
+            );
+            painter.text(
+                Pos2::new(label_x, rect.bottom() - 8.0),
+                Align2::LEFT_CENTER,
+                "...",
+                FontId::proportional(12.0),
+                theme::muted(),
+            );
+        });
+}
+
+fn git_flow_finish_release_preview_panel(
+    ui: &mut Ui,
+    language: Language,
+    config: &git::GitFlowConfig,
+    kind: git::GitFlowBranchKind,
+    branch_name: &str,
+    create_tag: bool,
+    options: &[GitFlowFinishBranchOption],
+) {
+    let targets = git_flow_finish_target_branches(config, kind);
+    let subject = options
+        .iter()
+        .find(|option| option.branch_name == branch_name)
+        .map(|option| option.subject.as_str())
+        .unwrap_or_default();
+    let tag_name = git_flow_finish_tag_name(config, kind, branch_name);
+
+    ui.label(
+        RichText::new(i18n::t(language, "git_flow.preview"))
+            .small()
+            .color(theme::muted()),
+    );
+    egui::Frame::new()
+        .fill(theme::panel_soft())
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            let height = 82.0;
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let x = rect.left() + 28.0;
+            let y_top = rect.top() + 16.0;
+            let y_mid = rect.top() + 40.0;
+            let y_bottom = rect.top() + 64.0;
+            let accent = theme::accent();
+            let production = theme::warning();
+            let muted = theme::muted();
+
+            painter.line_segment(
+                [Pos2::new(x, y_top), Pos2::new(x, y_bottom)],
+                Stroke::new(2.0, accent),
+            );
+            painter.line_segment(
+                [Pos2::new(x, y_top), Pos2::new(x + 12.0, y_mid)],
+                Stroke::new(2.0, production),
+            );
+            painter.line_segment(
+                [Pos2::new(x + 12.0, y_mid), Pos2::new(x + 12.0, y_bottom)],
+                Stroke::new(2.0, production),
+            );
+            painter.circle_filled(Pos2::new(x, y_top), 3.0, accent);
+            painter.circle_filled(Pos2::new(x + 12.0, y_mid), 3.0, production);
+            painter.circle_filled(Pos2::new(x, y_bottom), 3.0, muted);
+
+            let label_x = x + 36.0;
+            let badge_height = 18.0;
+            if let Some(development_branch) = targets.first() {
+                let dev_rect = git_flow_preview_badge_rect(
+                    ui,
+                    label_x,
+                    y_top,
+                    badge_height,
+                    development_branch,
+                );
+                painter.rect_filled(dev_rect, CornerRadius::same(3), theme::accent_deep());
+                painter.text(
+                    dev_rect.center(),
+                    Align2::CENTER_CENTER,
+                    development_branch,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+                painter.text(
+                    Pos2::new(dev_rect.right() + 10.0, y_top),
+                    Align2::LEFT_CENTER,
+                    format!(
+                        "{} {} {} {}",
+                        i18n::t(language, "git_flow.preview.merge_prefix"),
+                        branch_name.trim(),
+                        i18n::t(language, "git_flow.preview.merge_suffix"),
+                        development_branch
+                    ),
+                    FontId::proportional(12.0),
+                    theme::text(),
+                );
+            }
+
+            if let Some(production_branch) = targets.get(1) {
+                let main_rect = git_flow_preview_badge_rect(
+                    ui,
+                    label_x,
+                    y_mid,
+                    badge_height,
+                    production_branch,
+                );
+                painter.rect_filled(main_rect, CornerRadius::same(3), theme::accent_deep());
+                painter.text(
+                    main_rect.center(),
+                    Align2::CENTER_CENTER,
+                    production_branch,
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+                let mut text_x = main_rect.right() + 8.0;
+                if create_tag {
+                    let tag_rect =
+                        git_flow_preview_badge_rect(ui, text_x, y_mid, badge_height, &tag_name);
+                    painter.rect_filled(tag_rect, CornerRadius::same(3), theme::warning());
+                    painter.text(
+                        tag_rect.center(),
+                        Align2::CENTER_CENTER,
+                        tag_name,
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    text_x = tag_rect.right() + 10.0;
+                }
+                painter.text(
+                    Pos2::new(text_x, y_mid),
+                    Align2::LEFT_CENTER,
+                    format!(
+                        "{} {} {} {}",
+                        i18n::t(language, "git_flow.preview.merge_prefix"),
+                        branch_name.trim(),
+                        i18n::t(language, "git_flow.preview.merge_suffix"),
+                        production_branch
+                    ),
+                    FontId::proportional(12.0),
+                    theme::text(),
+                );
+            }
+
+            painter.text(
+                Pos2::new(label_x, y_bottom),
+                Align2::LEFT_CENTER,
+                if subject.is_empty() {
+                    git_flow_finish_latest_label(language, kind).to_owned()
+                } else {
+                    subject.to_owned()
+                },
+                FontId::proportional(12.0),
+                theme::text(),
+            );
+        });
+}
+
+fn git_flow_preview_badge_rect(ui: &Ui, x: f32, y: f32, height: f32, label: &str) -> Rect {
+    let width = inline_button_width_from_text(
+        text_width(ui, label, FontId::proportional(12.0), theme::text()),
+        42.0,
+        180.0,
+        12.0,
+    );
+    Rect::from_min_size(Pos2::new(x, y - height / 2.0), Vec2::new(width, height))
+}
+
 #[derive(Default)]
 struct GitFlowActionFooterResponse {
     reset_clicked: bool,
     submit_requested: bool,
     cancel_clicked: bool,
+}
+
+fn git_flow_cancel_footer(ui: &mut Ui, cancel_label: &str) -> bool {
+    let mut cancel_clicked = false;
+    ui.add_space(8.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 28.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            cancel_clicked = dialog_cancel_button(ui, cancel_label).clicked();
+        },
+    );
+    cancel_clicked
 }
 
 fn git_flow_action_footer(
@@ -22517,7 +23436,7 @@ fn git_flow_action_footer(
     response
 }
 
-fn git_flow_next_action_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+fn git_flow_action_picker_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
     dialog_sized_action_button(
         ui,
         label,
@@ -22575,60 +23494,6 @@ fn git_flow_operation_submit_label(
     }
 }
 
-fn git_flow_operation_preview(
-    language: Language,
-    config: &git::GitFlowConfig,
-    operation: GitFlowOperation,
-    name: &str,
-    start_point: &str,
-    branch_name: &str,
-) -> Vec<String> {
-    match operation {
-        GitFlowOperation::Start(kind) => {
-            let branch = git_flow_full_branch_name(config, kind, name);
-            vec![format!("checkout -b {} {}", branch, start_point.trim())]
-        }
-        GitFlowOperation::Finish(git::GitFlowBranchKind::Feature) => vec![
-            format!("checkout {}", config.development_branch),
-            format!("merge --no-ff {}", branch_name.trim()),
-            format!("branch -d {}", branch_name.trim()),
-        ],
-        GitFlowOperation::Finish(git::GitFlowBranchKind::Release) => git_flow_finish_preview_lines(
-            language,
-            config,
-            branch_name,
-            git::GitFlowBranchKind::Release,
-        ),
-        GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix) => git_flow_finish_preview_lines(
-            language,
-            config,
-            branch_name,
-            git::GitFlowBranchKind::Hotfix,
-        ),
-    }
-}
-
-fn git_flow_finish_preview_lines(
-    _language: Language,
-    config: &git::GitFlowConfig,
-    branch_name: &str,
-    kind: git::GitFlowBranchKind,
-) -> Vec<String> {
-    let branch_name = branch_name.trim();
-    let version = branch_name
-        .strip_prefix(git_flow_prefix(config, kind))
-        .unwrap_or(branch_name);
-    let tag = format!("{}{}", config.version_tag_prefix, version);
-    vec![
-        format!("checkout {}", config.production_branch),
-        format!("merge --no-ff {}", branch_name),
-        format!("tag {}", tag),
-        format!("checkout {}", config.development_branch),
-        format!("merge --no-ff {}", branch_name),
-        format!("branch -d {}", branch_name),
-    ]
-}
-
 fn validate_git_flow_config_dialog(
     language: Language,
     config: &git::GitFlowConfig,
@@ -22669,6 +23534,7 @@ fn validate_git_flow_run_dialog(
     start_point: &str,
     branch_name: &str,
     start_options: &[GitFlowStartPointOption],
+    finish_options: &[GitFlowFinishBranchOption],
     local_branch_names: &[String],
 ) -> Option<String> {
     let mut issues = Vec::new();
@@ -22698,6 +23564,11 @@ fn validate_git_flow_run_dialog(
                 issues.push(i18n::t(language, "git_flow.error.branch_invalid"));
             } else if !branch_name.starts_with(expected_prefix) {
                 issues.push(i18n::t(language, "git_flow.error.branch_prefix"));
+            } else if !finish_options
+                .iter()
+                .any(|option| option.branch_name == branch_name)
+            {
+                issues.push(i18n::t(language, "git_flow.error.branch_missing"));
             } else if !local_branch_names
                 .iter()
                 .any(|branch| branch == branch_name)
@@ -22986,6 +23857,14 @@ fn push_remote_branch_choices(
         }
     }
     choices
+}
+
+fn pull_request_remote_branch_choices(
+    local_branch: &str,
+    selected_branch: &str,
+    remote_branches: &[String],
+) -> Vec<String> {
+    push_remote_branch_choices(local_branch, selected_branch, remote_branches)
 }
 
 fn push_remote_branch_column_width(table_width: f32) -> f32 {
@@ -23923,9 +24802,12 @@ mod ui_tests {
         let branch_row_source =
             &implementation_source[branch_row_start..branch_row_start + branch_row_end];
 
+        assert!(branch_row_source.contains("let name_left = branch_row_name_left(rect, depth);"));
         assert!(
-            branch_row_source.contains("let name_left = rect.left() + 16.0 + depth as f32 * 14.0;")
+            implementation_source
+                .contains("fn branch_row_name_left(rect: Rect, depth: usize) -> f32")
         );
+        assert!(implementation_source.contains("rect.left() + 16.0 + depth as f32 * 14.0"));
         assert!(!branch_row_source.contains("if current { 22.0 } else { 16.0 }"));
         assert!(branch_row_source.contains("paint_branch_name(ui, name_rect, name_text);"));
         assert!(!branch_row_source.contains("egui::Label::new(name_text).truncate()"));
@@ -23949,6 +24831,18 @@ mod ui_tests {
         assert!(paint_name_source.contains("anchor_size(name_rect.left_center(), galley.size())"));
         assert!(compact_paint_name_source.contains(".min;"));
         assert!(paint_name_source.contains("with_clip_rect(name_rect)"));
+    }
+
+    #[test]
+    fn nested_local_branch_leaf_rows_indent_beyond_parent_group() {
+        let row_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(240.0, 24.0));
+
+        let parent_group_left = branch_group_header_layout(row_rect, 0).label.left();
+        let root_leaf_left = branch_row_name_left(row_rect, local_branch_leaf_row_depth(0));
+        let nested_leaf_left = branch_row_name_left(row_rect, local_branch_leaf_row_depth(1));
+
+        assert_eq!(root_leaf_left, 16.0);
+        assert!(nested_leaf_left >= parent_group_left + 8.0);
     }
 
     #[test]
@@ -25894,7 +26788,6 @@ mod ui_tests {
             "repo_lfs_initialize",
             "repo_git_flow",
             "repo_git_flow_initialize",
-            "repo_git_flow_next_action",
             "repo_create_pull_request",
             "repo_benchmark_performance",
             "self.open_repo_settings_from_menu();",
@@ -25918,9 +26811,29 @@ mod ui_tests {
             "self.handle_branch_action(BranchMenuAction::Create);",
             "self.handle_tag_action(TagMenuAction::Create);",
             "self.create_pull_request_current_branch();",
+            "self.start_repository_benchmark();",
         ] {
             assert!(repo_source.contains(required), "{required}");
         }
+        assert!(!repo_source.contains("menu_text_button(\n                    ui,\n                    false,\n                    menu_label(self.language, \"repo_benchmark_performance\")"));
+        assert!(implementation_source.contains(
+            "repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>"
+        ));
+        assert!(implementation_source.contains(
+            "repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>"
+        ));
+        assert!(implementation_source.contains("fn start_repository_benchmark("));
+        assert!(implementation_source.contains("fn repository_benchmark_progress_modal("));
+        assert!(implementation_source.contains("git::benchmark_repository_with_progress(&root"));
+        assert!(
+            implementation_source.contains("RepositoryBenchmarkTaskMessage::Progress(progress)")
+        );
+        assert!(
+            implementation_source
+                .contains("RepositoryBenchmarkTaskMessage::Finished(root, result)")
+        );
+        assert!(implementation_source.contains("egui::ProgressBar::new(fraction)"));
+        assert!(implementation_source.contains("add_filter(\"JSON files\", &[\"json\"])"));
         assert!(!repo_source.contains("repo_add_remote"));
         assert!(!repo_source.contains("self.begin_add_remote_settings();"));
         assert!(!repo_source.contains("repo_commit_all"));
@@ -25952,7 +26865,47 @@ mod ui_tests {
             .unwrap();
         let pr_source = &implementation_source[pr_start..pr_start + pr_end];
         assert!(pr_source.contains("let branch = snapshot.branch.clone();"));
-        assert!(pr_source.contains("self.open_branch_pull_request_url(&branch);"));
+        assert!(pr_source.contains("self.open_create_pull_request_dialog(Some(branch));"));
+
+        assert!(
+            implementation_source
+                .contains("pending_create_pull_request: Option<CreatePullRequestDialog>")
+        );
+        assert!(
+            implementation_source
+                .contains("pending_pull_request_open_after_push: Option<PullRequestOpenAfterPush>")
+        );
+        assert!(implementation_source.contains("fn create_pull_request_action_modal("));
+        let pr_modal_start = implementation_source
+            .find("fn create_pull_request_action_modal(")
+            .unwrap();
+        let pr_modal_end = implementation_source[pr_modal_start..]
+            .find("fn commit_action_modal(")
+            .unwrap();
+        let pr_modal_source = &implementation_source[pr_modal_start..pr_modal_start + pr_modal_end];
+        for required in [
+            "pull_request.title",
+            "pull_request.remote",
+            "pull_request.local_branch",
+            "pull_request.remote_branch",
+            "pull_request.hint",
+            "pull_request.submit",
+            "pull_request_remote_branch_selector",
+            "pull_request_remote_branch_choices(",
+            "self.start_pull_request_push_with_credential_retry(",
+            "self.pending_pull_request_open_after_push",
+            "Some(PullRequestOpenAfterPush",
+        ] {
+            assert!(pr_modal_source.contains(required), "{required}");
+        }
+        assert!(
+            !pr_modal_source.contains("themed_singleline_text_edit(&mut dialog.remote_branch"),
+            "PR remote branch should use a dropdown, not a text input"
+        );
+        assert!(
+            !pr_modal_source.contains("ui.indent(\"pull_request_hint\""),
+            "PR hint should not render an indent guide before the text"
+        );
 
         assert_eq!(
             menu_label(Language::Chinese, "repo_stash_changes"),
@@ -25969,10 +26922,6 @@ mod ui_tests {
         assert_eq!(
             menu_label(Language::Chinese, "repo_benchmark_performance"),
             "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}"
-        );
-        assert_eq!(
-            menu_label(Language::English, "repo_git_flow_next_action"),
-            "Next Action..."
         );
     }
 
@@ -27076,7 +28025,7 @@ mod ui_tests {
             "enum GitFlowOperation",
             "start_point: String",
             "fn open_git_flow_initialize_dialog(&mut self)",
-            "fn open_git_flow_next_action(&mut self)",
+            "fn open_git_flow_action_picker(&mut self)",
             "fn git_flow_action_modal(&mut self",
             "self.git_flow_action_modal(ctx);",
             "git::read_git_flow_config",
@@ -27097,7 +28046,6 @@ mod ui_tests {
         for required in [
             "repo_git_flow",
             "repo_git_flow_initialize",
-            "repo_git_flow_next_action",
             "repo_git_flow_start_feature",
             "repo_git_flow_finish_feature",
             "repo_git_flow_start_release",
@@ -27105,7 +28053,6 @@ mod ui_tests {
             "repo_git_flow_start_hotfix",
             "repo_git_flow_finish_hotfix",
             "self.open_git_flow_initialize_dialog();",
-            "self.open_git_flow_next_action();",
             "self.open_git_flow_action_dialog(GitFlowOperation::Start(",
             "git::GitFlowBranchKind::Feature",
             "self.open_git_flow_action_dialog(GitFlowOperation::Finish(",
@@ -27114,9 +28061,7 @@ mod ui_tests {
         }
         assert!(menu_source.contains("let git_flow_operation_enabled"));
         assert!(menu_source.contains("git_flow_operation_menu_enabled("));
-        assert!(menu_source.contains(
-            "menu_text_button(\n                        ui,\n                        git_flow_operation_enabled,\n                        menu_label(self.language, \"repo_git_flow_next_action\"),"
-        ));
+        assert!(!menu_source.contains("repo_git_flow_next_action"));
         assert!(menu_source.contains(
             "menu_text_button(\n                        ui,\n                        git_flow_operation_enabled,\n                        menu_label(self.language, \"repo_git_flow_start_feature\"),"
         ));
@@ -27140,20 +28085,18 @@ mod ui_tests {
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
         for required in [
             "GitFlowActionDialog::Initialize",
-            "GitFlowActionDialog::NextAction",
+            "GitFlowActionDialog::ActionPicker",
             "GitFlowActionDialog::Run",
-            "git_flow.next_action.title",
-            "git_flow.next_action.recommended",
-            "git_flow_next_action_button(",
+            "git_flow_action_picker_button(",
             "git_flow.use_defaults",
             "git_flow_action_footer(",
             "git_flow_start_point_row(",
             "git_flow_start_preview_panel(",
+            "git_flow_finish_preview_panel(",
             "git_flow_start_point_options(",
             "git_flow.start_from",
             "git_flow_config_defaults(snapshot)",
             "git_flow_operation_title(",
-            "git_flow_operation_preview(",
         ] {
             assert!(dialog_source.contains(required), "{required}");
         }
@@ -27162,17 +28105,16 @@ mod ui_tests {
         assert!(implementation_source.contains("git_flow_current_branch_for_kind("));
         assert!(implementation_source.contains("git_flow_operation_default_name("));
         assert!(implementation_source.contains("git_flow_config_defaults("));
-        let next_action_start = implementation_source
-            .find("fn open_git_flow_next_action(&mut self)")
+        let picker_start = implementation_source
+            .find("fn open_git_flow_action_picker(&mut self)")
             .unwrap();
-        let next_action_end = implementation_source[next_action_start..]
+        let picker_end = implementation_source[picker_start..]
             .find("fn open_git_flow_action_dialog(&mut self")
             .unwrap();
-        let next_action_source =
-            &implementation_source[next_action_start..next_action_start + next_action_end];
-        assert!(next_action_source.contains("GitFlowActionDialog::NextAction"));
-        assert!(!next_action_source.contains("git_flow_next_operation("));
-        assert!(!next_action_source.contains("self.open_git_flow_run_dialog(operation, config)"));
+        let picker_source = &implementation_source[picker_start..picker_start + picker_end];
+        assert!(picker_source.contains("GitFlowActionDialog::ActionPicker"));
+        assert!(!picker_source.contains("GitFlowActionDialog::NextAction"));
+        assert!(!picker_source.contains("self.open_git_flow_run_dialog(operation, config)"));
         let compact_dialog_start = implementation_source
             .find("fn compact_action_dialog(")
             .unwrap();
@@ -27196,18 +28138,6 @@ mod ui_tests {
             "\u{4f7f}\u{7528}\u{9ed8}\u{8ba4}\u{8bbe}\u{7f6e}"
         );
         assert_eq!(
-            i18n::t(Language::Chinese, "git_flow.next_action"),
-            "\u{4e0b}\u{4e00}\u{4e2a}\u{52a8}\u{4f5c}"
-        );
-        assert_eq!(
-            i18n::t(Language::Chinese, "git_flow.next_action.title"),
-            "\u{9009}\u{62e9}\u{4e0b}\u{4e00}\u{4e2a}\u{6d41}\u{52a8}\u{4f5c}"
-        );
-        assert_eq!(
-            i18n::t(Language::Chinese, "git_flow.next_action.other"),
-            "\u{5176}\u{4ed6}\u{64cd}\u{4f5c}..."
-        );
-        assert_eq!(
             i18n::t(Language::Chinese, "git_flow.start_from"),
             "\u{5f00}\u{59cb}\u{4e8e}:"
         );
@@ -27225,6 +28155,262 @@ mod ui_tests {
         };
         assert!(git_flow_operation_menu_enabled(Some(&initialized), true));
         assert!(!git_flow_operation_menu_enabled(Some(&initialized), false));
+    }
+
+    #[test]
+    fn git_flow_action_picker_is_single_full_action_dialog() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let dialog_start = implementation_source
+            .find("fn git_flow_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn lfs_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+
+        assert!(!dialog_source.contains("GitFlowActionDialog::NextAction"));
+        assert!(!dialog_source.contains("git_flow.next_action.recommended"));
+        assert!(!dialog_source.contains("git_flow.next_action.other"));
+
+        let section_start = dialog_source
+            .find("GitFlowActionDialog::ActionPicker { config } =>")
+            .unwrap();
+        let section_end = dialog_source[section_start..]
+            .find("GitFlowActionDialog::Run {")
+            .unwrap();
+        let section = &dialog_source[section_start..section_start + section_end];
+        assert!(section.contains("git_flow_cancel_footer("));
+        assert!(section.contains("GitFlowOperation::Start(git::GitFlowBranchKind::Feature)"));
+        assert!(section.contains("GitFlowOperation::Finish(git::GitFlowBranchKind::Feature)"));
+        assert!(section.contains("GitFlowOperation::Start(git::GitFlowBranchKind::Release)"));
+        assert!(section.contains("GitFlowOperation::Finish(git::GitFlowBranchKind::Release)"));
+        assert!(section.contains("GitFlowOperation::Start(git::GitFlowBranchKind::Hotfix)"));
+        assert!(section.contains("GitFlowOperation::Finish(git::GitFlowBranchKind::Hotfix)"));
+        assert!(
+            !section.contains("ui.with_layout(Layout::right_to_left(Align::Center)"),
+            "action picker should not use an unbounded right-aligned footer"
+        );
+
+        let footer_start = implementation_source
+            .find("fn git_flow_cancel_footer(")
+            .unwrap();
+        let footer_end = implementation_source[footer_start..]
+            .find("fn git_flow_action_footer(")
+            .unwrap();
+        let footer_source = &implementation_source[footer_start..footer_start + footer_end];
+        assert!(footer_source.contains("Vec2::new(ui.available_width(), 28.0)"));
+        assert!(footer_source.contains("Layout::right_to_left(Align::Center)"));
+    }
+
+    #[test]
+    fn git_flow_finish_feature_dialog_uses_branch_dropdown_options_and_preview() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let dialog_start = implementation_source
+            .find("fn git_flow_action_modal(&mut self")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("fn lfs_action_modal(")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+
+        for required in [
+            "finish_rebase: bool",
+            "finish_delete_branch: bool",
+            "finish_force_delete: bool",
+            "git_flow_finish_branch_options(",
+            "git_flow_finish_branch_row(",
+            "git_flow_finish_preview_panel(",
+            "git_flow.finish.rebase_development",
+            "git_flow.finish.delete_branch",
+            "git_flow.finish.force_delete",
+            "GitFlowFinishOptions",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+        assert!(dialog_source.contains("finish_delete_branch"));
+        assert!(dialog_source.contains("finish_force_delete"));
+        assert!(dialog_source.contains("finish_rebase"));
+
+        let config = git::GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+        let snapshot = RepositorySnapshot {
+            branch: "feature/text".to_owned(),
+            branches: vec![
+                git::Branch {
+                    name: "feature/text".to_owned(),
+                    remote: false,
+                    current: true,
+                    upstream: None,
+                },
+                git::Branch {
+                    name: "feature/other".to_owned(),
+                    remote: false,
+                    current: false,
+                    upstream: None,
+                },
+                git::Branch {
+                    name: "develop".to_owned(),
+                    remote: false,
+                    current: false,
+                    upstream: None,
+                },
+            ],
+            ..RepositorySnapshot::default()
+        };
+
+        let options = git_flow_finish_branch_options(
+            Some(&snapshot),
+            &config,
+            git::GitFlowBranchKind::Feature,
+        );
+        assert_eq!(options[0].branch_name, "feature/text");
+        assert_eq!(options[0].display_name, "text");
+        assert_eq!(
+            git_flow_default_finish_branch(&snapshot, &config, git::GitFlowBranchKind::Feature)
+                .as_deref(),
+            Some("feature/text")
+        );
+        assert_eq!(
+            git_flow_finish_target_branch(&config, git::GitFlowBranchKind::Feature),
+            "develop"
+        );
+    }
+
+    #[test]
+    fn git_flow_finish_release_dialog_uses_tag_push_and_two_target_preview() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for required in [
+            "finish_create_tag: bool",
+            "finish_tag_message: String",
+            "finish_push_remote: bool",
+            "git_flow_finish_branch_label(",
+            "git_flow_finish_target_branches(",
+            "git_flow_finish_release_preview_panel(",
+            "git_flow.finish.tag_message",
+            "git_flow.finish.push_remote",
+            "git_flow.preview.latest_release",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+
+        let config = git::GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+        let snapshot = RepositorySnapshot {
+            branch: "release/v1".to_owned(),
+            branches: vec![
+                git::Branch {
+                    name: "release/v1".to_owned(),
+                    remote: false,
+                    current: true,
+                    upstream: None,
+                },
+                git::Branch {
+                    name: "develop".to_owned(),
+                    remote: false,
+                    current: false,
+                    upstream: None,
+                },
+                git::Branch {
+                    name: "main".to_owned(),
+                    remote: false,
+                    current: false,
+                    upstream: None,
+                },
+            ],
+            ..RepositorySnapshot::default()
+        };
+
+        let options = git_flow_finish_branch_options(
+            Some(&snapshot),
+            &config,
+            git::GitFlowBranchKind::Release,
+        );
+        assert_eq!(options[0].branch_name, "release/v1");
+        assert_eq!(options[0].display_name, "v1");
+        assert_eq!(
+            git_flow_finish_target_branches(&config, git::GitFlowBranchKind::Release),
+            vec!["develop", "main"]
+        );
+        assert_eq!(
+            git_flow_finish_branch_label(Language::Chinese, git::GitFlowBranchKind::Release),
+            "发布版本名"
+        );
+    }
+
+    #[test]
+    fn git_flow_start_defaults_keep_configured_base_when_branch_missing() {
+        let config = git::GitFlowConfig {
+            production_branch: "main".to_owned(),
+            development_branch: "develop".to_owned(),
+            feature_prefix: "feature/".to_owned(),
+            release_prefix: "release/".to_owned(),
+            hotfix_prefix: "hotfix/".to_owned(),
+            version_tag_prefix: "v".to_owned(),
+        };
+        let snapshot = RepositorySnapshot {
+            branch: "main".to_owned(),
+            branches: vec![git::Branch {
+                name: "main".to_owned(),
+                remote: false,
+                current: true,
+                upstream: None,
+            }],
+            ..RepositorySnapshot::default()
+        };
+
+        assert_eq!(
+            git_flow_default_start_point(&snapshot, &config, git::GitFlowBranchKind::Release),
+            "develop"
+        );
+        assert_eq!(
+            git_flow_default_start_point(&snapshot, &config, git::GitFlowBranchKind::Hotfix),
+            "main"
+        );
+    }
+
+    #[test]
+    fn repository_submenu_dialogs_use_bounded_footer_rows() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        for (start, end, expected_count) in [
+            ("fn lfs_action_modal(", "fn submodule_action_modal(", 2),
+            ("fn submodule_action_modal(", "fn subtree_action_modal(", 1),
+            ("fn subtree_action_modal(", "fn merge_action_modal(", 1),
+        ] {
+            let section_start = implementation_source
+                .find(start)
+                .unwrap_or_else(|| panic!("{start}"));
+            let section_end = implementation_source[section_start..]
+                .find(end)
+                .unwrap_or_else(|| panic!("{end}"));
+            let section = &implementation_source[section_start..section_start + section_end];
+            assert_eq!(
+                section.matches("dialog_footer_row(").count(),
+                expected_count,
+                "{start}"
+            );
+            assert!(
+                !section.contains("ui.with_layout(Layout::right_to_left(Align::Center)"),
+                "{start} should not use an unbounded right-aligned footer"
+            );
+        }
     }
 
     #[test]
@@ -29399,7 +30585,7 @@ diff --git a/file.txt b/file.txt
             "self.open_push_dialog(Some(name), None);",
             "self.open_push_dialog(Some(name), Some(remote));",
             "self.open_branch_compare_url(&name);",
-            "self.open_branch_pull_request_url(&name);",
+            "self.open_create_pull_request_dialog(Some(name));",
             "BranchActionDialog::Rename",
         ] {
             assert!(handler_source.contains(required), "{required}");

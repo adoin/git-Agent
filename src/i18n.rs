@@ -117,6 +117,46 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{5df2}\u{6253}\u{5f00} Git \u{5de5}\u{4f5c}\u{6d41}",
     ),
     (
+        "pull_request.title",
+        "\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}",
+    ),
+    (
+        "pull_request.remote",
+        "\u{901a}\u{8fc7}\u{8fdc}\u{7aef}\u{63d0}\u{4ea4}:",
+    ),
+    (
+        "pull_request.local_branch",
+        "\u{672c}\u{5730}\u{5206}\u{652f}",
+    ),
+    (
+        "pull_request.remote_branch",
+        "\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "pull_request.remote_branch_placeholder",
+        "\u{8bf7}\u{8f93}\u{5165}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "pull_request.hint",
+        "\u{5728}\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}\u{4e4b}\u{524d}\u{7684}\u{6700}\u{540e}\u{4e00}\u{6b21}\u{63d0}\u{4ea4}\u{5c06}\u{88ab}\u{63a8}\u{9001}",
+    ),
+    (
+        "pull_request.submit",
+        "\u{5728}\u{7f51}\u{4e0a}\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}",
+    ),
+    (
+        "pull_request.error.remote_invalid",
+        "\u{8bf7}\u{9009}\u{62e9}\u{6709}\u{6548}\u{8fdc}\u{7aef}",
+    ),
+    (
+        "pull_request.error.local_branch_invalid",
+        "\u{8bf7}\u{9009}\u{62e9}\u{6709}\u{6548}\u{672c}\u{5730}\u{5206}\u{652f}",
+    ),
+    (
+        "pull_request.error.remote_branch_invalid",
+        "\u{8bf7}\u{8f93}\u{5165}\u{6709}\u{6548}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
         "git_flow.initialize.title",
         "\u{521d}\u{59cb}\u{5316} Git \u{5de5}\u{4f5c}\u{6d41}",
     ),
@@ -136,26 +176,19 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     ("git_flow.initialize.submit", "\u{521d}\u{59cb}\u{5316}"),
     (
-        "git_flow.next_action",
-        "\u{4e0b}\u{4e00}\u{4e2a}\u{52a8}\u{4f5c}",
-    ),
-    (
-        "git_flow.next_action.title",
-        "\u{9009}\u{62e9}\u{4e0b}\u{4e00}\u{4e2a}\u{6d41}\u{52a8}\u{4f5c}",
-    ),
-    (
-        "git_flow.next_action.recommended",
-        "\u{63a8}\u{8350}\u{52a8}\u{4f5c}:",
-    ),
-    (
-        "git_flow.next_action.other",
-        "\u{5176}\u{4ed6}\u{64cd}\u{4f5c}...",
-    ),
-    (
         "git_flow.other_action.title",
         "\u{9009}\u{62e9} Git Flow \u{64cd}\u{4f5c}",
     ),
     ("git_flow.name", "\u{540d}\u{79f0}"),
+    ("git_flow.feature_name", "\u{529f}\u{80fd}\u{540d}\u{79f0}"),
+    (
+        "git_flow.release_name",
+        "\u{53d1}\u{5e03}\u{7248}\u{672c}\u{540d}",
+    ),
+    (
+        "git_flow.hotfix_name",
+        "\u{4fee}\u{590d}\u{8865}\u{4e01}\u{540d}",
+    ),
     ("git_flow.start_from", "\u{5f00}\u{59cb}\u{4e8e}:"),
     ("git_flow.branch_name", "\u{5206}\u{652f}\u{540d}"),
     (
@@ -170,6 +203,20 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "git_flow.preview.missing_start",
         "\u{672a}\u{9009}\u{62e9}\u{5f00}\u{59cb}\u{70b9}",
+    ),
+    ("git_flow.preview.merge_prefix", "\u{5c06}"),
+    ("git_flow.preview.merge_suffix", "\u{5408}\u{5e76}\u{5230}"),
+    (
+        "git_flow.preview.latest_feature",
+        "\u{6700}\u{65b0}\u{7684}\u{529f}\u{80fd}\u{5206}\u{652f}",
+    ),
+    (
+        "git_flow.preview.latest_release",
+        "\u{6700}\u{65b0}\u{7684}\u{53d1}\u{5e03}\u{7248}\u{672c}\u{5206}\u{652f}",
+    ),
+    (
+        "git_flow.preview.latest_hotfix",
+        "\u{6700}\u{65b0}\u{7684}\u{4fee}\u{590d}\u{8865}\u{4e01}\u{5206}\u{652f}",
     ),
     (
         "git_flow.start_feature.title",
@@ -213,6 +260,31 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     ("git_flow.start", "\u{5f00}\u{59cb}"),
     ("git_flow.finish", "\u{5b8c}\u{6210}"),
+    (
+        "git_flow.finish.rebase_development",
+        "\u{5728}\u{5f00}\u{53d1}\u{5206}\u{652f}\u{4e0a}\u{8fdb}\u{884c}\u{53d8}\u{57fa}",
+    ),
+    ("git_flow.finish.after", "\u{5b8c}\u{6210}\u{540e}:"),
+    (
+        "git_flow.finish.delete_branch",
+        "\u{5220}\u{9664}\u{5206}\u{652f}",
+    ),
+    (
+        "git_flow.finish.force_delete",
+        "\u{5f3a}\u{5236}\u{5220}\u{9664}",
+    ),
+    (
+        "git_flow.finish.tag_message",
+        "\u{6b64}\u{4fe1}\u{606f}\u{7684}\u{6807}\u{7b7e}:",
+    ),
+    (
+        "git_flow.finish.tag_message_placeholder",
+        "\u{8bf7}\u{8f93}\u{5165}\u{6807}\u{7b7e}\u{4fe1}\u{606f}",
+    ),
+    (
+        "git_flow.finish.push_remote",
+        "\u{63a8}\u{9001}\u{53d8}\u{66f4}\u{5230}\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
+    ),
     (
         "git_flow.error.fix_inputs",
         "\u{8bf7}\u{4fee}\u{6b63}\u{4ee5}\u{4e0b}\u{8f93}\u{5165}:",
@@ -260,6 +332,86 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "repo.remote.failed",
         "\u{6253}\u{5f00}\u{8fdc}\u{7aef} URL \u{5931}\u{8d25}",
+    ),
+    (
+        "benchmark.title",
+        "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}",
+    ),
+    (
+        "benchmark.running",
+        "\u{6b63}\u{5728}\u{6d4b}\u{8bd5}\u{4ed3}\u{5e93}\u{6027}\u{80fd}...",
+    ),
+    (
+        "benchmark.step.branches",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{672c}\u{5730}\u{5206}\u{652f}",
+    ),
+    (
+        "benchmark.step.remote_branches",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{8fdc}\u{7aef}\u{5206}\u{652f}",
+    ),
+    (
+        "benchmark.step.tracking",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{8ddf}\u{8e2a}\u{5206}\u{652f}",
+    ),
+    (
+        "benchmark.step.summary",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{4ed3}\u{5e93}\u{6458}\u{8981}",
+    ),
+    (
+        "benchmark.step.tags",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{6807}\u{7b7e}",
+    ),
+    (
+        "benchmark.step.commit_labels",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{63d0}\u{4ea4}\u{6807}\u{8bb0}",
+    ),
+    (
+        "benchmark.step.stashes",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{8d2e}\u{85cf}",
+    ),
+    (
+        "benchmark.step.logs",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{63d0}\u{4ea4}\u{5386}\u{53f2}",
+    ),
+    (
+        "benchmark.step.commit_details",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{63d0}\u{4ea4}\u{8be6}\u{60c5}",
+    ),
+    (
+        "benchmark.step.file_status",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{6587}\u{4ef6}\u{72b6}\u{6001}",
+    ),
+    (
+        "benchmark.step.remotes",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
+    ),
+    (
+        "benchmark.step.files",
+        "\u{6b63}\u{5728}\u{7edf}\u{8ba1}\u{6587}\u{4ef6}\u{6570}",
+    ),
+    (
+        "benchmark.step.system",
+        "\u{6b63}\u{5728}\u{8bfb}\u{53d6}\u{7cfb}\u{7edf}\u{4fe1}\u{606f}",
+    ),
+    (
+        "benchmark.save_title",
+        "\u{4fdd}\u{5b58} Benchmark \u{6587}\u{4ef6}",
+    ),
+    (
+        "benchmark.saved",
+        "\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}\u{5df2}\u{4fdd}\u{5b58}",
+    ),
+    (
+        "benchmark.save_failed",
+        "\u{4fdd}\u{5b58}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}\u{5931}\u{8d25}",
+    ),
+    (
+        "benchmark.cancelled",
+        "\u{5df2}\u{53d6}\u{6d88}\u{4fdd}\u{5b58}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}",
+    ),
+    (
+        "benchmark.stopped",
+        "\u{4ed3}\u{5e93}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}\u{5df2}\u{505c}\u{6b62}",
     ),
     (
         "repo.source.clone_missing",
@@ -1005,6 +1157,28 @@ const EN: &[(&str, &str)] = &[
         "This uses --force-with-lease to update the remote branch. Confirm the remote does not contain someone else's new commits.",
     ),
     ("push.force_confirm.submit", "Confirm Safe Force Push"),
+    ("pull_request.title", "Create Pull Request"),
+    ("pull_request.remote", "Submit through remote:"),
+    ("pull_request.local_branch", "Local branch"),
+    ("pull_request.remote_branch", "Remote branch"),
+    (
+        "pull_request.remote_branch_placeholder",
+        "Enter remote branch",
+    ),
+    (
+        "pull_request.hint",
+        "The latest commit will be pushed before creating the pull request",
+    ),
+    ("pull_request.submit", "Create Pull Request Online"),
+    ("pull_request.error.remote_invalid", "Select a valid remote"),
+    (
+        "pull_request.error.local_branch_invalid",
+        "Select a valid local branch",
+    ),
+    (
+        "pull_request.error.remote_branch_invalid",
+        "Enter a valid remote branch",
+    ),
     ("rewrite_prompt.title", "History Rewritten"),
     (
         "rewrite_prompt.message",
@@ -1147,18 +1321,22 @@ const EN: &[(&str, &str)] = &[
     ("git_flow.version_tag_prefix", "Tag prefix"),
     ("git_flow.use_defaults", "Use defaults"),
     ("git_flow.initialize.submit", "Initialize"),
-    ("git_flow.next_action", "Next action"),
-    ("git_flow.next_action.title", "Choose Next Flow Action"),
-    ("git_flow.next_action.recommended", "Recommended actions:"),
-    ("git_flow.next_action.other", "Other actions..."),
     ("git_flow.other_action.title", "Choose Git Flow Action"),
     ("git_flow.name", "Name"),
+    ("git_flow.feature_name", "Feature name"),
+    ("git_flow.release_name", "Release name"),
+    ("git_flow.hotfix_name", "Hotfix name"),
     ("git_flow.start_from", "Start from:"),
     ("git_flow.branch_name", "Branch name"),
     ("git_flow.branch_preview", "Branch to create:"),
     ("git_flow.preview", "Preview"),
     ("git_flow.preview.create_branch", "Create branch"),
     ("git_flow.preview.missing_start", "No start point"),
+    ("git_flow.preview.merge_prefix", "Merge"),
+    ("git_flow.preview.merge_suffix", "into"),
+    ("git_flow.preview.latest_feature", "Latest feature branch"),
+    ("git_flow.preview.latest_release", "Latest release branch"),
+    ("git_flow.preview.latest_hotfix", "Latest hotfix branch"),
     ("git_flow.start_feature.title", "Start New Feature"),
     ("git_flow.finish_feature.title", "Finish Feature"),
     ("git_flow.start_release.title", "Start New Release"),
@@ -1183,6 +1361,19 @@ const EN: &[(&str, &str)] = &[
     ),
     ("git_flow.start", "Start"),
     ("git_flow.finish", "Finish"),
+    (
+        "git_flow.finish.rebase_development",
+        "Rebase on the development branch",
+    ),
+    ("git_flow.finish.after", "After finish:"),
+    ("git_flow.finish.delete_branch", "Delete branch"),
+    ("git_flow.finish.force_delete", "Force delete"),
+    ("git_flow.finish.tag_message", "Tag this message:"),
+    (
+        "git_flow.finish.tag_message_placeholder",
+        "Enter tag message",
+    ),
+    ("git_flow.finish.push_remote", "Push changes to remote"),
     ("git_flow.error.fix_inputs", "Fix these inputs:"),
     ("git_flow.error.required", "Required fields cannot be empty"),
     ("git_flow.error.branch_invalid", "Branch name is invalid"),
@@ -1207,6 +1398,26 @@ const EN: &[(&str, &str)] = &[
     ),
     ("repo.remote.missing", "No remote URL configured"),
     ("repo.remote.failed", "Failed to open remote URL"),
+    ("benchmark.title", "Benchmark Repository Performance"),
+    ("benchmark.running", "Testing repository performance..."),
+    ("benchmark.step.branches", "Reading local branches"),
+    ("benchmark.step.remote_branches", "Reading remote branches"),
+    ("benchmark.step.tracking", "Reading tracking branches"),
+    ("benchmark.step.summary", "Reading repository summary"),
+    ("benchmark.step.tags", "Reading tags"),
+    ("benchmark.step.commit_labels", "Reading commit labels"),
+    ("benchmark.step.stashes", "Reading stashes"),
+    ("benchmark.step.logs", "Reading commit history"),
+    ("benchmark.step.commit_details", "Reading commit details"),
+    ("benchmark.step.file_status", "Reading file status"),
+    ("benchmark.step.remotes", "Reading remote repositories"),
+    ("benchmark.step.files", "Counting files"),
+    ("benchmark.step.system", "Reading system information"),
+    ("benchmark.save_title", "Save Benchmark File"),
+    ("benchmark.saved", "Benchmark saved"),
+    ("benchmark.save_failed", "Failed to save benchmark"),
+    ("benchmark.cancelled", "Benchmark save cancelled"),
+    ("benchmark.stopped", "Repository benchmark stopped"),
     (
         "repo.source.clone_missing",
         "Enter a source URL and destination path.",
@@ -1816,5 +2027,49 @@ mod tests {
             t(Language::Chinese, "repo.remote.missing"),
             "\u{672a}\u{914d}\u{7f6e}\u{8fdc}\u{7aef} URL"
         );
+    }
+
+    #[test]
+    fn git_flow_finish_release_labels_are_translated() {
+        for (key, zh, en) in [
+            (
+                "git_flow.release_name",
+                "\u{53d1}\u{5e03}\u{7248}\u{672c}\u{540d}",
+                "Release name",
+            ),
+            (
+                "git_flow.hotfix_name",
+                "\u{4fee}\u{590d}\u{8865}\u{4e01}\u{540d}",
+                "Hotfix name",
+            ),
+            (
+                "git_flow.finish.tag_message",
+                "\u{6b64}\u{4fe1}\u{606f}\u{7684}\u{6807}\u{7b7e}:",
+                "Tag this message:",
+            ),
+            (
+                "git_flow.finish.tag_message_placeholder",
+                "\u{8bf7}\u{8f93}\u{5165}\u{6807}\u{7b7e}\u{4fe1}\u{606f}",
+                "Enter tag message",
+            ),
+            (
+                "git_flow.finish.push_remote",
+                "\u{63a8}\u{9001}\u{53d8}\u{66f4}\u{5230}\u{8fdc}\u{7aef}\u{4ed3}\u{5e93}",
+                "Push changes to remote",
+            ),
+            (
+                "git_flow.preview.latest_release",
+                "\u{6700}\u{65b0}\u{7684}\u{53d1}\u{5e03}\u{7248}\u{672c}\u{5206}\u{652f}",
+                "Latest release branch",
+            ),
+            (
+                "git_flow.preview.latest_hotfix",
+                "\u{6700}\u{65b0}\u{7684}\u{4fee}\u{590d}\u{8865}\u{4e01}\u{5206}\u{652f}",
+                "Latest hotfix branch",
+            ),
+        ] {
+            assert_eq!(t(Language::Chinese, key), zh, "{key}");
+            assert_eq!(t(Language::English, key), en, "{key}");
+        }
     }
 }
