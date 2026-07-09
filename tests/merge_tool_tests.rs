@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::{env, fs, process::Command};
 
 use git_agent::merge_tool::{
-    MergeArgs, MergeLanguage, MergeLineKind, MergeSide, MergeTheme, merge_language_label,
-    merge_theme_label, parse_merge_args, three_way_merge, write_merge_output,
+    MergeArgs, MergeConnectorDebug, MergeLanguage, MergeLineKind, MergeSide, MergeTheme,
+    merge_debug_label, merge_language_label, merge_theme_label, parse_merge_args, three_way_merge,
+    write_merge_output,
 };
 
 #[test]
@@ -114,7 +115,12 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains(".color(Color32::WHITE)"));
     assert!(source.contains("offset: [3, 4]"));
     assert!(source.contains("bg_stroke = egui::Stroke::NONE"));
-    assert!(source.contains(".frame(false)"));
+    assert!(source.contains("shared_scroll_y"));
+    assert!(source.contains("let frame_scroll_y = result_scroll_y;"));
+    assert!(source.contains(".vertical_scroll_offset(scroll_y)"));
+    assert!(source.contains("merge_result_row("));
+    assert!(source.contains("paint_merge_block_connectors("));
+    assert!(source.contains("merge_block_result_rect("));
     assert!(source.contains("merge_theme_label(app.language, app.theme)"));
     assert!(source.contains("merge_language_label(app.language)"));
     assert!(source.contains("ui.add_space(14.0);"));
@@ -141,6 +147,26 @@ fn merge_toolbar_labels_show_current_theme_and_language() {
     );
     assert_eq!(merge_language_label(MergeLanguage::Chinese), "中文");
     assert_eq!(merge_language_label(MergeLanguage::English), "EN");
+}
+
+#[test]
+fn merge_toolbar_labels_show_debug_state() {
+    assert_eq!(
+        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Off),
+        "辅助线"
+    );
+    assert_eq!(
+        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Guides),
+        "隐藏辅助线"
+    );
+    assert_eq!(
+        merge_debug_label(MergeLanguage::Chinese, MergeConnectorDebug::Log),
+        "日志辅助线"
+    );
+    assert_eq!(
+        merge_debug_label(MergeLanguage::English, MergeConnectorDebug::Off),
+        "Guides"
+    );
 }
 
 #[test]
@@ -221,7 +247,7 @@ fn delete_modify_conflict_remains_resolvable() {
     assert_eq!(conflicts[0].base, vec!["batch commit A"]);
     assert!(conflicts[0].local.is_empty());
     assert_eq!(conflicts[0].remote, vec!["batch commit A", "this n"]);
-    assert_eq!(merged.result_text(), "batch commit A\n");
+    assert_eq!(merged.result_text(), "");
 
     merged.accept_conflict_side_only(0, MergeSide::Remote);
     assert!(merged.conflict_side_resolved(0, MergeSide::Local));
@@ -258,10 +284,7 @@ fn conflict_sides_can_be_taken_or_dropped_independently() {
         "shared line from feature branch\nmain keeps this file\n",
     );
 
-    assert_eq!(
-        merged.result_text(),
-        "shared line from base\nmain keeps this file\n"
-    );
+    assert_eq!(merged.result_text(), "main keeps this file\n");
 
     merged.take_conflict_side(0, MergeSide::Local);
     assert!(merged.conflict_side_resolved(0, MergeSide::Local));

@@ -4988,14 +4988,14 @@ impl GitAgentApp {
 
         let mut close_requested = false;
         let screen = ctx.screen_rect();
-        let size = Vec2::new(
-            (screen.width() * 0.54).clamp(460.0, 760.0),
-            (screen.height() * 0.42).clamp(260.0, 480.0),
-        );
         let mut message = error;
+        let layout = error_dialog_layout(screen, &message);
 
-        compact_action_dialog(ctx, self.tr("dialog.error.title"), size.x, |ui| {
-            safe_set_min_size(ui, Vec2::new((size.x - 24.0).max(420.0), 220.0));
+        compact_action_dialog(ctx, self.tr("dialog.error.title"), layout.width, |ui| {
+            safe_set_min_size(
+                ui,
+                Vec2::new((layout.width - 24.0).max(420.0), layout.body_min_height),
+            );
             ui.label(
                 RichText::new(self.tr("dialog.error.message"))
                     .small()
@@ -5004,14 +5004,14 @@ impl GitAgentApp {
             ui.add_space(8.0);
             ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .max_height((size.y - 120.0).max(120.0))
+                .max_height(layout.message_height)
                 .show(ui, |ui| {
                     ui.add(
                         TextEdit::multiline(&mut message)
                             .id_salt("error_message_text")
                             .font(FontId::monospace(12.0))
                             .desired_width(f32::INFINITY)
-                            .desired_rows(10),
+                            .desired_rows(layout.desired_rows),
                     );
                 });
             ui.add_space(10.0);
@@ -13807,6 +13807,43 @@ fn dialog_footer_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
         Layout::right_to_left(Align::Center),
         add_contents,
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ErrorDialogLayout {
+    width: f32,
+    body_min_height: f32,
+    message_height: f32,
+    desired_rows: usize,
+}
+
+fn error_dialog_layout(screen: Rect, message: &str) -> ErrorDialogLayout {
+    let max_width = (screen.width() * 0.54).clamp(460.0, 760.0);
+    let longest_line_chars = message
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0) as f32;
+    let width = (longest_line_chars * 7.2 + 64.0).clamp(460.0, max_width);
+    let text_width = (width - 48.0).max(240.0);
+    let chars_per_line = (text_width / 7.2).floor().max(24.0) as usize;
+    let visual_lines = message
+        .lines()
+        .map(|line| {
+            let chars = line.chars().count().max(1);
+            chars.div_ceil(chars_per_line)
+        })
+        .sum::<usize>()
+        .max(1);
+    let desired_rows = visual_lines.clamp(3, 14);
+    let max_message_height = (screen.height() * 0.38).clamp(120.0, 360.0);
+    let message_height = ((desired_rows as f32) * 18.0 + 20.0).clamp(74.0, max_message_height);
+    ErrorDialogLayout {
+        width,
+        body_min_height: message_height + 74.0,
+        message_height,
+        desired_rows,
+    }
 }
 
 fn compact_action_dialog(
@@ -28969,6 +29006,23 @@ mod ui_tests {
         assert!(modal_source.contains("self.tr(\"dialog.error.title\")"));
         assert!(modal_source.contains("self.tr(\"dialog.close\")"));
         assert!(modal_source.contains("self.error = None"));
+    }
+
+    #[test]
+    fn git_error_dialog_sizes_to_message_content() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1366.0, 760.0));
+        let short = error_dialog_layout(
+            screen,
+            "git push failed: rejected non-fast-forward\nhint: Updates were rejected.",
+        );
+        let long = error_dialog_layout(screen, &"error line\n".repeat(40));
+
+        assert!(short.body_min_height < 190.0);
+        assert!(short.message_height < 130.0);
+        assert!(short.desired_rows <= 4);
+        assert!(long.message_height > short.message_height);
+        assert!(long.message_height <= 360.0);
+        assert!(long.desired_rows > short.desired_rows);
     }
 
     #[test]
