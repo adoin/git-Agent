@@ -429,6 +429,7 @@ pub struct GitAgentApp {
     pending_lfs_action: Option<LfsActionDialog>,
     pending_git_flow_action: Option<GitFlowActionDialog>,
     commit_message: String,
+    commit_message_drafts: HashMap<String, String>,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
     language: Language,
@@ -2047,6 +2048,7 @@ impl GitAgentApp {
             pending_lfs_action: None,
             pending_git_flow_action: None,
             commit_message: String::new(),
+            commit_message_drafts: HashMap::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
             language: app_settings.language.into(),
@@ -2127,8 +2129,10 @@ impl GitAgentApp {
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| paths_equal(&snapshot.root, &path));
+        self.save_commit_message_draft_for_active_repo();
         self.ensure_repo_tab(path.clone());
         self.load_commit_state_for_active_repo();
+        self.load_commit_message_draft_for_active_repo();
         let applied_cached_snapshot = use_cache && self.apply_cached_snapshot_for(&path);
         if use_cache {
             if !applied_cached_snapshot {
@@ -2230,10 +2234,12 @@ impl GitAgentApp {
     }
 
     fn open_repository_source_tab(&mut self) {
+        self.save_commit_message_draft_for_active_repo();
         self.source_tab_open = true;
         self.active_repo_tab = None;
         self.active_view = MainView::Workspace;
         self.commit_state = RepoCommitState::default();
+        self.commit_message.clear();
         self.refresh_known_repositories();
         self.save_repo_tabs();
     }
@@ -2250,9 +2256,11 @@ impl GitAgentApp {
         if !self.source_tab_open {
             return;
         }
+        self.save_commit_message_draft_for_active_repo();
         self.active_repo_tab = None;
         self.active_view = MainView::Workspace;
         self.commit_state = RepoCommitState::default();
+        self.commit_message.clear();
         self.refresh_known_repositories();
         self.save_repo_tabs();
     }
@@ -2286,6 +2294,7 @@ impl GitAgentApp {
             return;
         }
         if let Some(tab) = self.repo_tabs.get(index).cloned() {
+            self.save_commit_message_draft_for_active_repo();
             self.active_repo_tab = Some(index);
             self.save_repo_tabs();
             self.load_repository(tab.root);
@@ -2325,6 +2334,9 @@ impl GitAgentApp {
         }
 
         let was_active = self.active_repo_tab == Some(index);
+        if was_active {
+            self.save_commit_message_draft_for_active_repo();
+        }
         self.repo_tabs.remove(index);
         self.active_repo_tab = match self.active_repo_tab {
             Some(active) if active == index && !self.repo_tabs.is_empty() => {
@@ -2339,6 +2351,8 @@ impl GitAgentApp {
             self.snapshot = None;
             self.source_tab_open = true;
             self.active_repo_tab = None;
+            self.commit_message.clear();
+            self.commit_state = RepoCommitState::default();
         }
         self.refresh_known_repositories();
         self.save_repo_tabs();
@@ -4766,6 +4780,28 @@ impl GitAgentApp {
         }
     }
 
+    fn save_commit_message_draft_for_active_repo(&mut self) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let key = repo_state_key(&root);
+        if self.commit_message.is_empty() {
+            self.commit_message_drafts.remove(&key);
+        } else {
+            self.commit_message_drafts
+                .insert(key, self.commit_message.clone());
+        }
+    }
+
+    fn load_commit_message_draft_for_active_repo(&mut self) {
+        self.commit_message = self
+            .active_repo_root()
+            .as_ref()
+            .and_then(|root| self.commit_message_drafts.get(&repo_state_key(root)))
+            .cloned()
+            .unwrap_or_default();
+    }
+
     fn add_commit_message_history(&mut self, message: String) {
         let message = message.trim().to_owned();
         if message.is_empty() {
@@ -4850,6 +4886,7 @@ impl GitAgentApp {
             }
         });
         self.commit_message.clear();
+        self.save_commit_message_draft_for_active_repo();
     }
 
     fn show_toast(&mut self, message: impl Into<String>) {
@@ -8304,6 +8341,7 @@ impl GitAgentApp {
             BranchMenuAction::MergeIntoCurrent { name } => {
                 self.active_view = MainView::Workspace;
                 self.commit_message.clear();
+                self.save_commit_message_draft_for_active_repo();
                 self.start_remote_git_action(move |root| git::merge_branch(root, &name));
             }
             BranchMenuAction::RebaseCurrentOnto { name } => {
@@ -8743,6 +8781,7 @@ impl GitAgentApp {
                     .clicked()
                 {
                     self.commit_message = message.clone();
+                    self.save_commit_message_draft_for_active_repo();
                     ui.close_menu();
                 }
                 if ui.button("\u{00d7}").clicked() {
@@ -25576,6 +25615,79 @@ mod ui_tests {
         assert!(panel_source.contains("self.tr(\"commit.button.short\")"));
         assert!(panel_source.contains("commit_history_menu("));
         assert!(panel_source.contains("commit_options_menu("));
+    }
+
+    #[test]
+    fn commit_message_draft_is_scoped_per_repository_tab() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let fields_start = implementation_source
+            .find("pub struct GitAgentApp")
+            .unwrap();
+        let fields_end = implementation_source[fields_start..]
+            .find("#[derive(Clone, Debug)]\nstruct RepoTab")
+            .unwrap();
+        let fields_source = &implementation_source[fields_start..fields_start + fields_end];
+        assert!(fields_source.contains("commit_message_drafts: HashMap<String, String>"));
+        assert!(implementation_source.contains("fn save_commit_message_draft_for_active_repo("));
+        assert!(implementation_source.contains("fn load_commit_message_draft_for_active_repo("));
+
+        let load_start = implementation_source
+            .find("fn load_repository_with_cache_mode(")
+            .unwrap();
+        let load_end = implementation_source[load_start..]
+            .find("fn spawn_repository_snapshot_load(")
+            .unwrap();
+        let load_source = &implementation_source[load_start..load_start + load_end];
+        assert!(load_source.contains("self.save_commit_message_draft_for_active_repo();"));
+        assert!(load_source.contains("self.load_commit_message_draft_for_active_repo();"));
+        assert!(
+            load_source
+                .find("self.save_commit_message_draft_for_active_repo();")
+                .unwrap()
+                < load_source
+                    .find("self.ensure_repo_tab(path.clone());")
+                    .unwrap()
+        );
+        assert!(
+            load_source
+                .find("self.load_commit_message_draft_for_active_repo();")
+                .unwrap()
+                > load_source
+                    .find("self.load_commit_state_for_active_repo();")
+                    .unwrap()
+        );
+
+        let switch_start = implementation_source.find("fn switch_repo_tab(").unwrap();
+        let switch_end = implementation_source[switch_start..]
+            .find("fn switch_to_next_tab(")
+            .unwrap();
+        let switch_source = &implementation_source[switch_start..switch_start + switch_end];
+        assert!(switch_source.contains("self.save_commit_message_draft_for_active_repo();"));
+        assert!(
+            switch_source
+                .find("self.save_commit_message_draft_for_active_repo();")
+                .unwrap()
+                < switch_source
+                    .find("self.active_repo_tab = Some(index);")
+                    .unwrap()
+        );
+
+        let commit_start = implementation_source
+            .find("fn commit_current_message(&mut self")
+            .unwrap();
+        let commit_end = implementation_source[commit_start..]
+            .find("fn show_toast(")
+            .unwrap();
+        let commit_source = &implementation_source[commit_start..commit_start + commit_end];
+        assert!(commit_source.contains("self.commit_message.clear();"));
+        assert!(commit_source.contains("self.save_commit_message_draft_for_active_repo();"));
+        assert!(
+            commit_source
+                .find("self.save_commit_message_draft_for_active_repo();")
+                .unwrap()
+                > commit_source.find("self.commit_message.clear();").unwrap()
+        );
     }
 
     #[test]
