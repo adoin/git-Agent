@@ -2030,20 +2030,117 @@ pub fn stop_tracking_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
     git_output(root.as_ref(), &["rm", "--cached", "--", path]).map(|_| ())
 }
 
+pub fn create_worktree_patch_for_paths(
+    root: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    paths: &[String],
+) -> Result<Vec<PathBuf>> {
+    let root = root.as_ref();
+    let output_path = output_path.as_ref();
+    if paths.is_empty() {
+        return Err(anyhow!("no working-copy paths selected"));
+    }
+
+    let mut tracked = Vec::new();
+    let mut untracked = Vec::new();
+    for path in paths {
+        let is_tracked = git_command()
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(path)
+            .output()
+            .with_context(|| format!("failed to classify patch path {path}"))?
+            .status
+            .success();
+        if is_tracked {
+            tracked.push(path.clone());
+        } else {
+            untracked.push(path.clone());
+        }
+    }
+
+    let mut patch = Vec::new();
+    if !tracked.is_empty() {
+        let mut command = git_command();
+        command
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--binary", "--full-index", "HEAD", "--"])
+            .args(&tracked);
+        let output = command.output().context("failed to create tracked patch")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        patch.extend_from_slice(&output.stdout);
+    }
+
+    for path in untracked {
+        let output = git_command()
+            .arg("-C")
+            .arg(root)
+            .args(["diff", "--binary", "--full-index", "--no-index", "--"])
+            .arg("/dev/null")
+            .arg(&path)
+            .output()
+            .with_context(|| format!("failed to create untracked patch for {path}"))?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(anyhow!(
+                "git diff --no-index failed for {path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        patch.extend_from_slice(&output.stdout);
+    }
+
+    write_patch_atomically(output_path, &patch)?;
+    Ok(vec![output_path.to_path_buf()])
+}
+
 pub fn create_worktree_patch(root: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
-    let mut patch = git_output(root, &["diff", "--binary", "HEAD", "--"])?;
+    let mut paths = git_output(root, &["diff", "--name-only", "HEAD", "--"])?
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard"])?;
     for path in untracked
         .lines()
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
-        if let Ok(content) = fs::read_to_string(root.join(path)) {
-            patch.push_str(&new_file_unified_diff(path, &content));
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.to_owned());
         }
     }
-    fs::write(output_path, patch)?;
+    create_worktree_patch_for_paths(root, output_path, &paths)?;
+    Ok(())
+}
+
+fn write_patch_atomically(output_path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("patch.diff");
+    let temp_path = parent.join(format!(".{file_name}.git-agent-tmp-{}", std::process::id()));
+    fs::write(&temp_path, contents)?;
+    if output_path.exists() {
+        fs::remove_file(output_path)?;
+    }
+    fs::rename(&temp_path, output_path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+    })?;
     Ok(())
 }
 
@@ -3632,6 +3729,62 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("tracked.txt"))?, "after\n");
         assert_eq!(fs::read_to_string(root.join("new.txt"))?, "new file\n");
 
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn init_patch_test_repo(label: &str) -> Result<PathBuf> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-worktree-patch-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        fs::write(root.join("selected.txt"), "before\n")?;
+        fs::write(root.join("ignored.txt"), "before\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        Ok(root)
+    }
+
+    #[test]
+    fn selected_worktree_patch_excludes_unselected_paths() -> Result<()> {
+        let root = init_patch_test_repo("selected-paths")?;
+        fs::write(root.join("selected.txt"), "changed\n")?;
+        fs::write(root.join("ignored.txt"), "changed\n")?;
+        let output = root.join("selected.diff");
+
+        create_worktree_patch_for_paths(&root, &output, &["selected.txt".to_owned()])?;
+
+        let patch = fs::read_to_string(output)?;
+        assert!(patch.contains("selected.txt"));
+        assert!(!patch.contains("ignored.txt"));
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_worktree_patch_includes_untracked_text_and_binary() -> Result<()> {
+        let root = init_patch_test_repo("untracked-paths")?;
+        fs::write(root.join("new.txt"), "new text\n")?;
+        fs::write(root.join("new.bin"), [0_u8, 1, 2, 255])?;
+        let output = root.join("untracked.diff");
+
+        create_worktree_patch_for_paths(
+            &root,
+            &output,
+            &["new.txt".to_owned(), "new.bin".to_owned()],
+        )?;
+
+        let patch = fs::read(output)?;
+        let patch = String::from_utf8_lossy(&patch);
+        assert!(patch.contains("new file mode"));
+        assert!(patch.contains("new.txt"));
+        assert!(patch.contains("new.bin"));
+        assert!(patch.contains("GIT binary patch"));
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
