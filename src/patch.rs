@@ -72,10 +72,6 @@ impl CommitPatchSelection {
         }
     }
 
-    pub(crate) fn contains(&self, hash: &str) -> bool {
-        self.selected.contains(hash)
-    }
-
     pub(crate) fn ordered(&self) -> Vec<String> {
         self.ordered.clone()
     }

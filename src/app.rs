@@ -29,7 +29,7 @@ use crate::{
     i18n::{self, Language},
     patch::{
         CommitPatchSelection, CreatePatchTab, PatchPathError, PatchSelectionGesture,
-        selection_gesture, validate_patch_output_path,
+        numbered_patch_paths, selection_gesture, validate_patch_output_path,
     },
     theme,
 };
@@ -379,6 +379,7 @@ pub struct GitAgentApp {
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
     repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
     repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
     credential_login_task: Option<Receiver<anyhow::Result<()>>>,
@@ -491,6 +492,7 @@ struct KnownRepository {
 }
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
+type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>);
 type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
@@ -718,7 +720,12 @@ struct CreatePatchDialog {
     search: String,
     show_remote_refs: bool,
     separate_files: bool,
+    selected_file_path: Option<String>,
+    selected_diff_rows: Vec<DiffLineKey>,
+    diff_display_mode: DiffDisplayMode,
     validation_error_key: Option<&'static str>,
+    overwrite_request: Option<git::CreatePatchRequest>,
+    overwrite_paths: Vec<PathBuf>,
     history_cache: HistoryCommitBrowserCache,
 }
 
@@ -742,14 +749,31 @@ impl CreatePatchDialog {
             selected_worktree_paths,
             commit_selection: CommitPatchSelection::default(),
             focused_commit_hash,
-            branch_scope: HistoryBranchScope::Current,
+            branch_scope: HistoryBranchScope::All,
             sort_order: HistorySortOrder::Date,
             search: String::new(),
             show_remote_refs: true,
             separate_files: false,
+            selected_file_path: None,
+            selected_diff_rows: Vec::new(),
+            diff_display_mode: DiffDisplayMode::Blocks,
             validation_error_key: None,
+            overwrite_request: None,
+            overwrite_paths: Vec::new(),
             history_cache: HistoryCommitBrowserCache::default(),
         }
+    }
+}
+
+fn create_patch_output_paths(request: &git::CreatePatchRequest) -> Vec<PathBuf> {
+    match request {
+        git::CreatePatchRequest::Worktree { output_path, .. } => vec![output_path.clone()],
+        git::CreatePatchRequest::Commits {
+            output_path,
+            hashes,
+            separate,
+        } if *separate => numbered_patch_paths(output_path, hashes.len()),
+        git::CreatePatchRequest::Commits { output_path, .. } => vec![output_path.clone()],
     }
 }
 
@@ -2087,6 +2111,7 @@ impl GitAgentApp {
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
             remote_git_task: None,
+            create_patch_task: None,
             repository_benchmark_task: None,
             repository_benchmark_progress: None,
             credential_login_task: None,
@@ -3376,6 +3401,7 @@ impl GitAgentApp {
         self.loading_repo
             || self.branch_checkout_busy()
             || self.remote_git_busy()
+            || self.create_patch_busy()
             || self.merge_tool_busy()
             || self.repository_benchmark_task.is_some()
     }
@@ -3681,6 +3707,10 @@ impl GitAgentApp {
         self.remote_git_task.is_some() || self.credential_login_task.is_some()
     }
 
+    fn create_patch_busy(&self) -> bool {
+        self.create_patch_task.is_some()
+    }
+
     fn start_github_credential_login(&mut self) {
         if self.remote_git_busy() || self.loading_repo {
             return;
@@ -3780,6 +3810,25 @@ impl GitAgentApp {
 
         thread::spawn(move || {
             let result = action(&root);
+            let _ = sender.send((root, result));
+        });
+    }
+
+    fn start_create_patch_task(&mut self, request: git::CreatePatchRequest) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        self.create_patch_task = Some(receiver);
+        self.error = None;
+        self.last_notice = None;
+
+        thread::spawn(move || {
+            let result = git::create_patch(&root, &request);
             let _ = sender.send((root, result));
         });
     }
@@ -4350,6 +4399,36 @@ impl GitAgentApp {
             }
         }
 
+        if let Some(receiver) = self.create_patch_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(paths))) => {
+                    self.pending_create_patch_action = None;
+                    self.error = None;
+                    self.last_notice = None;
+                    let destination = paths
+                        .first()
+                        .map(|path| user_facing_path_string(path))
+                        .unwrap_or_else(|| user_facing_path_string(&root));
+                    self.show_toast(format!("{} {destination}", self.tr("patch.create.success")));
+                    ctx.request_repaint();
+                }
+                Ok((_, Err(error))) => {
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.create_patch_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some(self.tr("patch.create.disconnected").to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
@@ -4679,15 +4758,21 @@ impl GitAgentApp {
         let Some(commit) = selected_commit.and_then(|index| snapshot.commits.get(index)) else {
             return;
         };
+        self.request_commit_details_hash(commit.hash.clone());
+    }
 
-        if self.details_cache.contains_key(&commit.hash)
-            || self.loading_details_hash.as_deref() == Some(commit.hash.as_str())
+    fn request_commit_details_hash(&mut self, hash: String) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+
+        if self.details_cache.contains_key(&hash)
+            || self.loading_details_hash.as_deref() == Some(hash.as_str())
         {
             return;
         }
 
         let root = snapshot.root.clone();
-        let hash = commit.hash.clone();
         let (sender, receiver) = mpsc::channel();
         self.details_task = Some(receiver);
         self.loading_details_hash = Some(hash.clone());
@@ -10719,6 +10804,58 @@ impl GitAgentApp {
             return;
         }
 
+        if dialog.overwrite_request.is_some() {
+            let mut confirm_overwrite = false;
+            let mut return_to_dialog = false;
+            compact_action_dialog(ctx, self.tr("patch.create.overwrite_title"), 560.0, |ui| {
+                ui.label(
+                    RichText::new(self.tr("patch.create.overwrite_message")).color(theme::text()),
+                );
+                ui.add_space(6.0);
+                ScrollArea::vertical()
+                    .id_salt("create_patch_overwrite_paths")
+                    .max_height(150.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for path in &dialog.overwrite_paths {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(user_facing_path_string(path))
+                                        .monospace()
+                                        .color(theme::muted()),
+                                )
+                                .selectable(true),
+                            );
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                        return_to_dialog = true;
+                    }
+                    if dialog_primary_button(
+                        ui,
+                        self.tr("patch.create.overwrite_confirm"),
+                        !self.branch_actions_busy(),
+                    )
+                    .clicked()
+                    {
+                        confirm_overwrite = true;
+                    }
+                });
+            });
+            if return_to_dialog {
+                dialog.overwrite_request = None;
+                dialog.overwrite_paths.clear();
+            } else if confirm_overwrite {
+                let request = dialog.overwrite_request.take().expect("checked above");
+                dialog.overwrite_paths.clear();
+                self.start_create_patch_task(request);
+            }
+            self.pending_create_patch_action = Some(dialog);
+            return;
+        }
+
         let worktree_files = self
             .snapshot
             .as_ref()
@@ -10733,9 +10870,42 @@ impl GitAgentApp {
                 files.into_values().collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let commits = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &dialog.repo_root))
+            .map(|snapshot| {
+                history_dialog_commits(snapshot, dialog.branch_scope, dialog.sort_order)
+            })
+            .unwrap_or_default();
+        let available_hashes = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &dialog.repo_root))
+            .map(|snapshot| {
+                history_dialog_commits(snapshot, HistoryBranchScope::All, dialog.sort_order)
+                    .into_iter()
+                    .map(|commit| commit.hash)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        dialog.commit_selection.retain_available(&available_hashes);
+        if !commits
+            .iter()
+            .any(|commit| commit.hash == dialog.focused_commit_hash)
+        {
+            dialog.focused_commit_hash = commits
+                .first()
+                .map(|commit| commit.hash.clone())
+                .unwrap_or_default();
+            dialog.selected_file_path = None;
+            dialog.selected_diff_rows.clear();
+        }
+        let patch_running = self.create_patch_busy();
         let actions_enabled = !self.branch_actions_busy();
         let mut close_after = false;
         let mut request = None;
+        let mut hash_copied = false;
 
         compact_action_dialog(ctx, self.tr("patch.create.title"), 960.0, |ui| {
             ui.horizontal(|ui| {
@@ -10764,6 +10934,13 @@ impl GitAgentApp {
             });
 
             ui.add_space(8.0);
+            if patch_running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(self.tr("patch.create.running")).color(theme::muted()));
+                });
+                ui.add_space(6.0);
+            }
             match dialog.tab {
                 CreatePatchTab::Worktree => {
                     if worktree_files.is_empty() {
@@ -10820,14 +10997,7 @@ impl GitAgentApp {
                     }
                 }
                 CreatePatchTab::History => {
-                    ui.allocate_ui(Vec2::new(ui.available_width(), 300.0), |ui| {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                RichText::new(self.tr("patch.create.history_empty"))
-                                    .color(theme::muted()),
-                            );
-                        });
-                    });
+                    hash_copied |= self.create_patch_history_tab(ui, &mut dialog, &commits);
                 }
             }
 
@@ -10885,9 +11055,11 @@ impl GitAgentApp {
 
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
-                    close_after = true;
-                }
+                ui.add_enabled_ui(!patch_running, |ui| {
+                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                        close_after = true;
+                    }
+                });
                 if dialog_primary_button(ui, self.tr("patch.create.submit"), can_submit).clicked() {
                     if no_selection {
                         dialog.validation_error_key = Some("patch.create.no_selection");
@@ -10898,7 +11070,7 @@ impl GitAgentApp {
                             | PatchPathError::MissingParent => "patch.create.invalid_output",
                         });
                     } else {
-                        request = Some(match dialog.tab {
+                        let candidate = match dialog.tab {
                             CreatePatchTab::Worktree => git::CreatePatchRequest::Worktree {
                                 output_path,
                                 paths: dialog.selected_worktree_paths.iter().cloned().collect(),
@@ -10908,19 +11080,213 @@ impl GitAgentApp {
                                 hashes: dialog.commit_selection.ordered(),
                                 separate: dialog.separate_files,
                             },
-                        });
-                        close_after = true;
+                        };
+                        let existing_paths = create_patch_output_paths(&candidate)
+                            .into_iter()
+                            .filter(|path| path.exists())
+                            .collect::<Vec<_>>();
+                        if existing_paths.is_empty() {
+                            request = Some(candidate);
+                        } else {
+                            dialog.overwrite_request = Some(candidate);
+                            dialog.overwrite_paths = existing_paths;
+                        }
                     }
                 }
             });
         });
 
         if let Some(request) = request {
-            self.start_remote_git_action(move |root| git::create_patch(root, &request).map(|_| ()));
+            self.start_create_patch_task(request);
+        }
+        if hash_copied {
+            self.show_toast(self.tr("status.hash_copied"));
         }
         if !close_after {
             self.pending_create_patch_action = Some(dialog);
         }
+    }
+
+    fn create_patch_history_tab(
+        &mut self,
+        ui: &mut Ui,
+        dialog: &mut CreatePatchDialog,
+        commits: &[Commit],
+    ) -> bool {
+        if commits.is_empty() {
+            ui.allocate_ui(Vec2::new(ui.available_width(), 470.0), |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new(self.tr("patch.create.history_empty")).color(theme::muted()),
+                    );
+                });
+            });
+            return false;
+        }
+
+        let selected_hashes = dialog
+            .commit_selection
+            .ordered()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let browser_outcome = history_commit_browser(
+            ui,
+            commits,
+            &dialog.focused_commit_hash,
+            &mut dialog.branch_scope,
+            &mut dialog.sort_order,
+            &mut dialog.search,
+            &mut dialog.show_remote_refs,
+            self.history_show_branch_refs,
+            self.history_show_tag_refs,
+            &mut self.layout_prefs,
+            self.language,
+            &selected_hashes,
+            &HashSet::new(),
+            &mut dialog.history_cache,
+            HistoryCommitBrowserConfig {
+                id_salt: "create_patch_commit_browser_scroll",
+                show_view_controls: true,
+                show_search: true,
+                show_cherry_pick: false,
+                show_jump: false,
+                show_context_menu: false,
+                select_rows: false,
+                multi_select: true,
+                max_height: Some(245.0),
+            },
+        );
+        if browser_outcome.prefs_changed {
+            self.layout_prefs.save();
+        }
+        if let Some(intent) = browser_outcome.selection_intent {
+            dialog.commit_selection.apply(
+                &browser_outcome.visible_hashes,
+                &intent.hash,
+                intent.gesture,
+            );
+        }
+        if browser_outcome.toggle_all_visible {
+            let commit_selection = &mut dialog.commit_selection;
+            commit_selection.toggle_visible(&browser_outcome.visible_hashes);
+        }
+        if let Some(commit) = browser_outcome.picked_commit {
+            if dialog.focused_commit_hash != commit.hash {
+                dialog.focused_commit_hash = commit.hash;
+                dialog.selected_file_path = None;
+                dialog.selected_diff_rows.clear();
+            }
+        }
+
+        self.request_commit_details_hash(dialog.focused_commit_hash.clone());
+        ui.add_space(8.0);
+        self.create_patch_commit_preview(ui, dialog, commits);
+        browser_outcome.hash_copied
+    }
+
+    fn create_patch_commit_preview(
+        &mut self,
+        ui: &mut Ui,
+        dialog: &mut CreatePatchDialog,
+        commits: &[Commit],
+    ) {
+        let Some(commit) = commits
+            .iter()
+            .find(|commit| commit.hash == dialog.focused_commit_hash)
+            .cloned()
+        else {
+            return;
+        };
+        let details = self.details_cache.get(&commit.hash).cloned();
+        if dialog.selected_file_path.is_none()
+            && let Some(path) = details
+                .as_ref()
+                .and_then(|details| details.files.first())
+                .map(|file| file.diff_path.clone())
+        {
+            dialog.selected_file_path = Some(path.clone());
+            self.request_file_diff(commit.hash.clone(), path);
+        }
+
+        let height = 205.0;
+        let width = ui.available_width();
+        let gap = LAYOUT_GAP as f32;
+        let left_width = (width * 0.42).max(300.0);
+        let right_width = (width - left_width - gap).max(280.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        let left_rect = Rect::from_min_size(rect.left_top(), Vec2::new(left_width, height));
+        let right_rect = Rect::from_min_size(
+            Pos2::new(left_rect.right() + gap, rect.top()),
+            Vec2::new(right_width, height),
+        );
+
+        let mut clicked_file = None;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+            source_tree_panel_frame().show(ui, |ui| {
+                safe_set_min_size(ui, frame_inner_size(left_width, height, 8, 8));
+                source_tree_meta_line(ui, self.tr("commit.author"), &commit.author);
+                source_tree_meta_line(ui, self.tr("commit.when"), &commit.date);
+                ui.label(RichText::new(&commit.subject).color(theme::text()));
+                ui.add_space(4.0);
+                history_file_table_header(ui, self.language);
+                if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
+                    ui.spinner();
+                } else if let Some(details) = details.as_ref() {
+                    ScrollArea::vertical()
+                        .id_salt("create_patch_changed_files_scroll")
+                        .max_height(112.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for file in &details.files {
+                                let selected = dialog.selected_file_path.as_deref()
+                                    == Some(file.diff_path.as_str());
+                                if history_file_table_row(ui, &file.status, &file.path, selected)
+                                    .clicked()
+                                {
+                                    clicked_file = Some(file.diff_path.clone());
+                                }
+                            }
+                        });
+                }
+            });
+        });
+
+        if let Some(path) = clicked_file {
+            dialog.selected_file_path = Some(path.clone());
+            dialog.selected_diff_rows.clear();
+            self.request_file_diff(commit.hash.clone(), path);
+        }
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+            source_tree_panel_frame().show(ui, |ui| {
+                safe_set_min_size(ui, frame_inner_size(right_width, height, 8, 8));
+                let Some(path) = dialog.selected_file_path.as_ref() else {
+                    ui.label(RichText::new(self.tr("commit.select_file")).color(theme::muted()));
+                    return;
+                };
+                let key = git::diff_key(&commit.hash, path);
+                if self.loading_diff_key.as_deref() == Some(key.as_str()) {
+                    ui.spinner();
+                    return;
+                }
+                let Some(diff) = self.diff_cache.get(&key) else {
+                    ui.label(RichText::new(self.tr("diff.queued")).color(theme::muted()));
+                    return;
+                };
+                ScrollArea::both()
+                    .id_salt(("create_patch_diff_scroll", &commit.hash, path))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        render_unified_diff(
+                            ui,
+                            &diff.text,
+                            dialog.diff_display_mode,
+                            self.language,
+                            &mut dialog.selected_diff_rows,
+                        );
+                    });
+            });
+        });
     }
 
     fn archive_action_modal(&mut self, ctx: &egui::Context) {
@@ -25508,6 +25874,105 @@ mod ui_tests {
             "create_patch_action_modal(ctx)",
         ] {
             assert!(implementation.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn create_patch_history_reuses_complete_virtualized_browser() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation.find("fn create_patch_history_tab(").unwrap();
+        let body = &implementation[start..];
+        for required in [
+            "history_commit_browser(",
+            "multi_select: true",
+            "show_view_controls: true",
+            "show_search: true",
+            "commit_selection.apply(",
+            "commit_selection.toggle_visible(",
+            "create_patch_commit_preview(",
+        ] {
+            assert!(body.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn create_patch_history_submits_exact_selected_hashes() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation.contains("CreatePatchRequest::Commits"));
+        assert!(implementation.contains("dialog.commit_selection.ordered()"));
+    }
+
+    #[test]
+    fn create_patch_overwrite_checks_every_separate_destination() {
+        let request = git::CreatePatchRequest::Commits {
+            output_path: PathBuf::from("D:/repo/patch.diff"),
+            hashes: vec!["a".into(), "b".into(), "c".into()],
+            separate: true,
+        };
+        assert_eq!(
+            create_patch_output_paths(&request),
+            [
+                "D:/repo/patch-0001.diff",
+                "D:/repo/patch-0002.diff",
+                "D:/repo/patch-0003.diff",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn create_patch_uses_named_async_task_and_shared_busy_gate() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        for required in [
+            "type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>)",
+            "create_patch_task: Option<Receiver<CreatePatchTaskResult>>",
+            "fn create_patch_busy(&self) -> bool",
+            "fn start_create_patch_task(",
+            "self.create_patch_task = Some(receiver)",
+            "git::create_patch(&root, &request)",
+            "|| self.create_patch_busy()",
+        ] {
+            assert!(implementation.contains(required), "missing {required}");
+        }
+
+        let modal_start = implementation
+            .find("fn create_patch_action_modal(")
+            .unwrap();
+        let modal_end = implementation[modal_start..]
+            .find("fn create_patch_history_tab(")
+            .unwrap();
+        let modal = &implementation[modal_start..modal_start + modal_end];
+        assert!(modal.contains("self.start_create_patch_task(request)"));
+        assert!(!modal.contains("self.start_remote_git_action"));
+    }
+
+    #[test]
+    fn create_patch_task_releases_gate_for_every_terminal_state() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let poll_start = implementation
+            .find("if let Some(receiver) = self.create_patch_task.take()")
+            .unwrap();
+        let poll_end = implementation[poll_start..]
+            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .unwrap();
+        let poll = &implementation[poll_start..poll_start + poll_end];
+        for required in [
+            "Ok((root, Ok(paths)))",
+            "self.pending_create_patch_action = None",
+            "Ok((_, Err(error)))",
+            "self.error = Some(error.to_string())",
+            "mpsc::TryRecvError::Empty",
+            "self.create_patch_task = Some(receiver)",
+            "mpsc::TryRecvError::Disconnected",
+            "patch.create.disconnected",
+        ] {
+            assert!(poll.contains(required), "missing {required}");
         }
     }
 

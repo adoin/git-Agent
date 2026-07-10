@@ -520,6 +520,18 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{8865}\u{4e01}\u{4efb}\u{52a1}\u{610f}\u{5916}\u{505c}\u{6b62}\u{3002}",
     ),
     (
+        "patch.create.overwrite_title",
+        "\u{8986}\u{76d6}\u{5df2}\u{6709}\u{8865}\u{4e01}\u{ff1f}",
+    ),
+    (
+        "patch.create.overwrite_message",
+        "\u{4ee5}\u{4e0b}\u{6587}\u{4ef6}\u{5df2}\u{5b58}\u{5728}\u{3002}\u{7ee7}\u{7eed}\u{5c06}\u{8986}\u{76d6}\u{5b83}\u{4eec}\u{3002}",
+    ),
+    (
+        "patch.create.overwrite_confirm",
+        "\u{8986}\u{76d6}\u{5e76}\u{521b}\u{5efa}",
+    ),
+    (
         "stash.staged_files",
         "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}",
     ),
@@ -1817,6 +1829,15 @@ const EN: &[(&str, &str)] = &[
         "patch.create.disconnected",
         "The patch task stopped unexpectedly.",
     ),
+    (
+        "patch.create.overwrite_title",
+        "Overwrite existing patches?",
+    ),
+    (
+        "patch.create.overwrite_message",
+        "The following files already exist. Continuing will overwrite them.",
+    ),
+    ("patch.create.overwrite_confirm", "Overwrite and Create"),
     ("worktree.resolve_conflict", "Resolve conflict"),
     ("worktree.resolve_conflicts", "Resolve conflicts"),
     ("worktree.conflicts.title", "Conflicts"),
@@ -2143,6 +2164,9 @@ mod tests {
             "patch.create.running",
             "patch.create.success",
             "patch.create.disconnected",
+            "patch.create.overwrite_title",
+            "patch.create.overwrite_message",
+            "patch.create.overwrite_confirm",
         ] {
             assert_ne!(t(Language::Chinese, key), key, "missing Chinese {key}");
             assert_ne!(t(Language::English, key), key, "missing English {key}");

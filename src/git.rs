@@ -3227,6 +3227,9 @@ fn git_command() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_COMMIT_PATCH_REPO: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn history_commit_limit_supports_large_repositories() {
@@ -4012,8 +4015,11 @@ mod tests {
     }
 
     fn init_commit_patch_repo() -> Result<CommitPatchFixture> {
-        let root =
-            std::env::temp_dir().join(format!("git-agent-commit-patch-{}", std::process::id()));
+        let sequence = NEXT_COMMIT_PATCH_REPO.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-commit-patch-{}-{sequence}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         git_output(&root, &["init"])?;
