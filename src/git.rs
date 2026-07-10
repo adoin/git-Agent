@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -13,6 +13,8 @@ use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+use crate::patch::numbered_patch_paths;
 
 const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
@@ -2144,6 +2146,219 @@ fn write_patch_atomically(output_path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub enum CreatePatchRequest {
+    Worktree {
+        output_path: PathBuf,
+        paths: Vec<String>,
+    },
+    Commits {
+        output_path: PathBuf,
+        hashes: Vec<String>,
+        separate: bool,
+    },
+}
+
+pub fn create_patch(root: &Path, request: &CreatePatchRequest) -> Result<Vec<PathBuf>> {
+    match request {
+        CreatePatchRequest::Worktree { output_path, paths } => {
+            create_worktree_patch_for_paths(root, output_path, paths)
+        }
+        CreatePatchRequest::Commits {
+            output_path,
+            hashes,
+            separate,
+        } => create_commit_patches(root, output_path, hashes, *separate),
+    }
+}
+
+pub fn create_commit_patches(
+    root: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    hashes: &[String],
+    separate: bool,
+) -> Result<Vec<PathBuf>> {
+    let root = root.as_ref();
+    let output_path = output_path.as_ref();
+    let ordered = canonical_patch_commit_order(root, hashes)?;
+    if ordered.is_empty() {
+        return Err(anyhow!("no commits selected"));
+    }
+
+    let total = ordered.len();
+    let rendered = ordered
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| {
+            render_commit_patch(root, hash)
+                .map(|patch| number_mail_patch_subject(patch, index + 1, total))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if !separate {
+        let mut combined = Vec::new();
+        for patch in rendered {
+            if !combined.is_empty() && !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(patch.as_bytes());
+        }
+        write_patch_atomically(output_path, &combined)?;
+        return Ok(vec![output_path.to_path_buf()]);
+    }
+
+    let paths = numbered_patch_paths(output_path, rendered.len());
+    let outputs = paths
+        .iter()
+        .cloned()
+        .zip(rendered.into_iter().map(String::into_bytes))
+        .collect::<Vec<_>>();
+    write_patch_set_atomically(&outputs)?;
+    Ok(paths)
+}
+
+fn canonical_patch_commit_order(root: &Path, hashes: &[String]) -> Result<Vec<String>> {
+    let mut selected = HashSet::new();
+    for hash in hashes {
+        if !selected.insert(hash.clone()) {
+            continue;
+        }
+        let commit_ref = format!("{hash}^{{commit}}");
+        git_output(root, &["cat-file", "-e", &commit_ref])?;
+    }
+
+    let mut ordered = Vec::new();
+    for hash in git_output(root, &["rev-list", "--topo-order", "--reverse", "--all"])?
+        .lines()
+        .map(str::trim)
+    {
+        if selected.remove(hash) {
+            ordered.push(hash.to_owned());
+        }
+    }
+
+    let mut unreachable = selected
+        .into_iter()
+        .map(|hash| {
+            let timestamp = git_output(root, &["show", "-s", "--format=%ct", &hash])?
+                .trim()
+                .parse::<i64>()
+                .unwrap_or_default();
+            Ok((timestamp, hash))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    unreachable.sort_by(|left, right| left.cmp(right));
+    ordered.extend(unreachable.into_iter().map(|(_, hash)| hash));
+    Ok(ordered)
+}
+
+fn render_commit_patch(root: &Path, hash: &str) -> Result<String> {
+    git_output(
+        root,
+        &[
+            "show",
+            "--format=mboxrd",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--diff-merges=first-parent",
+            hash,
+            "--",
+        ],
+    )
+}
+
+fn number_mail_patch_subject(patch: String, index: usize, total: usize) -> String {
+    let numbered = format!("Subject: [PATCH {index}/{total}]");
+    if patch.contains("Subject: [PATCH]") {
+        patch.replacen("Subject: [PATCH]", &numbered, 1)
+    } else if patch.contains("Subject:") {
+        patch.replacen("Subject:", &numbered, 1)
+    } else {
+        patch
+    }
+}
+
+fn write_patch_set_atomically(outputs: &[(PathBuf, Vec<u8>)]) -> Result<()> {
+    let mut temp_paths = Vec::with_capacity(outputs.len());
+    let mut backup_paths = vec![None; outputs.len()];
+
+    for (index, (output_path, contents)) in outputs.iter().enumerate() {
+        let parent = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("patch.diff");
+        let temp_path = parent.join(format!(
+            ".{file_name}.git-agent-tmp-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&temp_path);
+        fs::write(&temp_path, contents).inspect_err(|_| {
+            for path in &temp_paths {
+                let _ = fs::remove_file(path);
+            }
+        })?;
+        temp_paths.push(temp_path);
+    }
+
+    for (index, (output_path, _)) in outputs.iter().enumerate() {
+        if !output_path.exists() {
+            continue;
+        }
+        let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("patch.diff");
+        let backup_path = parent.join(format!(
+            ".{file_name}.git-agent-backup-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&backup_path);
+        if let Err(error) = fs::rename(output_path, &backup_path) {
+            restore_patch_backups(outputs, &backup_paths);
+            for path in &temp_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error.into());
+        }
+        backup_paths[index] = Some(backup_path);
+    }
+
+    for (index, ((output_path, _), temp_path)) in outputs.iter().zip(temp_paths.iter()).enumerate()
+    {
+        if let Err(error) = fs::rename(temp_path, output_path) {
+            for (installed, _) in outputs.iter().take(index) {
+                let _ = fs::remove_file(installed);
+            }
+            restore_patch_backups(outputs, &backup_paths);
+            for path in temp_paths.iter().skip(index) {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error.into());
+        }
+    }
+
+    for backup in backup_paths.into_iter().flatten() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn restore_patch_backups(outputs: &[(PathBuf, Vec<u8>)], backups: &[Option<PathBuf>]) {
+    for ((output, _), backup) in outputs.iter().zip(backups) {
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(output);
+            let _ = fs::rename(backup, output);
+        }
+    }
+}
+
 pub fn apply_patch(root: impl AsRef<Path>, patch_path: impl AsRef<Path>) -> Result<()> {
     let patch_path = patch_path.as_ref().to_string_lossy();
     git_output(
@@ -3786,6 +4001,119 @@ mod tests {
         assert!(patch.contains("new.bin"));
         assert!(patch.contains("GIT binary patch"));
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    struct CommitPatchFixture {
+        root: PathBuf,
+        a: String,
+        b: String,
+        c: String,
+    }
+
+    fn init_commit_patch_repo() -> Result<CommitPatchFixture> {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-commit-patch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("a.txt"), "A\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "commit A"])?;
+        let a = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("b.txt"), "B\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "commit B"])?;
+        let b = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("c.txt"), "C\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "commit C"])?;
+        let c = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        Ok(CommitPatchFixture { root, a, b, c })
+    }
+
+    #[test]
+    fn combined_commit_patch_is_exact_and_oldest_first() -> Result<()> {
+        let fixture = init_commit_patch_repo()?;
+        let output = fixture.root.join("series.patch");
+
+        create_commit_patches(
+            &fixture.root,
+            &output,
+            &[fixture.c.clone(), fixture.a.clone()],
+            false,
+        )?;
+
+        let patch = fs::read_to_string(output)?;
+        assert!(patch.contains("Subject: [PATCH 1/2] commit A"));
+        assert!(patch.contains("Subject: [PATCH 2/2] commit C"));
+        assert!(!patch.contains("commit B"));
+        assert!(patch.find("commit A").unwrap() < patch.find("commit C").unwrap());
+        let _ = fs::remove_dir_all(&fixture.root);
+        Ok(())
+    }
+
+    #[test]
+    fn separate_commit_patches_are_numbered_oldest_first() -> Result<()> {
+        let fixture = init_commit_patch_repo()?;
+        let output = fixture.root.join("series.diff");
+        let files = create_commit_patches(
+            &fixture.root,
+            &output,
+            &[fixture.c.clone(), fixture.a.clone()],
+            true,
+        )?;
+
+        assert_eq!(files[0].file_name().unwrap(), "series-0001.diff");
+        assert_eq!(files[1].file_name().unwrap(), "series-0002.diff");
+        assert!(fs::read_to_string(&files[0])?.contains("commit A"));
+        assert!(fs::read_to_string(&files[1])?.contains("commit C"));
+        let _ = fs::remove_dir_all(&fixture.root);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_patch_handles_root_and_merge_commits() -> Result<()> {
+        let fixture = init_commit_patch_repo()?;
+        git_output(&fixture.root, &["checkout", "-b", "feature", &fixture.b])?;
+        fs::write(fixture.root.join("feature.txt"), "feature\n")?;
+        git_output(&fixture.root, &["add", "."])?;
+        git_output(&fixture.root, &["commit", "-m", "feature commit"])?;
+        git_output(&fixture.root, &["checkout", "master"])?;
+        git_output(
+            &fixture.root,
+            &["merge", "--no-ff", "feature", "-m", "merge feature"],
+        )?;
+        let merge = git_output(&fixture.root, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+
+        let root_output = fixture.root.join("root.patch");
+        create_commit_patches(
+            &fixture.root,
+            &root_output,
+            std::slice::from_ref(&fixture.a),
+            false,
+        )?;
+        assert!(fs::read_to_string(root_output)?.contains("a.txt"));
+
+        let merge_output = fixture.root.join("merge.patch");
+        create_commit_patches(
+            &fixture.root,
+            &merge_output,
+            std::slice::from_ref(&merge),
+            false,
+        )?;
+        let merge_patch = fs::read_to_string(merge_output)?;
+        assert!(merge_patch.contains("merge feature"));
+        assert!(merge_patch.contains("feature.txt"));
+        let _ = fs::remove_dir_all(&fixture.root);
         Ok(())
     }
 
