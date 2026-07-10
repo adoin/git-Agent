@@ -385,6 +385,7 @@ pub struct GitAgentApp {
     details_task: Option<Receiver<anyhow::Result<CommitDetails>>>,
     diff_task: Option<Receiver<anyhow::Result<FileDiff>>>,
     file_search_task: Option<Receiver<(String, anyhow::Result<Vec<String>>)>>,
+    blame_task: Option<Receiver<(String, anyhow::Result<Vec<git::BlameLine>>)>>,
     file_search_started_at: Option<Instant>,
     file_search_query: String,
     file_search_hashes: HashSet<String>,
@@ -411,6 +412,7 @@ pub struct GitAgentApp {
     toast_notice: Option<(String, Instant)>,
     pending_toolbar_single_click: Option<PendingToolbarClick>,
     pending_worktree_action: Option<WorktreeActionDialog>,
+    pending_blame_action: Option<BlameActionDialog>,
     pending_fetch_action: Option<FetchActionDialog>,
     pending_pull_action: Option<PullActionDialog>,
     pending_push_action: Option<PushActionDialog>,
@@ -453,6 +455,10 @@ pub struct GitAgentApp {
     remote_account_name_input: String,
     remote_account_host_input: String,
     remote_account_error: Option<String>,
+    custom_actions: Vec<CustomGitActionSettings>,
+    custom_action_name_input: String,
+    custom_action_command_input: String,
+    custom_action_error: Option<String>,
     theme_mode: theme::ThemeMode,
     theme_accent: theme::ThemeAccent,
     layout_prefs: LayoutPrefs,
@@ -685,6 +691,13 @@ enum WorktreeActionDialog {
     ConfirmDiscard { path: String, untracked: bool },
     ConfirmDiscardAll,
     ResolveConflicts { selected_path: Option<String> },
+}
+
+#[derive(Clone, Debug)]
+struct BlameActionDialog {
+    path: String,
+    display_path: String,
+    lines: Option<Vec<git::BlameLine>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1075,6 +1088,13 @@ struct SelectedWorktreeFile {
     untracked: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct CustomGitActionSettings {
+    name: String,
+    command: String,
+}
+
 #[derive(Clone, Debug)]
 struct WorktreeRowClick {
     file: SelectedWorktreeFile,
@@ -1379,6 +1399,7 @@ struct AppSettings {
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_accounts: Vec<RemoteAccountSettings>,
+    custom_actions: Vec<CustomGitActionSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1430,6 +1451,7 @@ impl Default for AppSettings {
             active_repo_refresh_seconds: DEFAULT_ACTIVE_REPO_REFRESH_SECONDS,
             inactive_repo_refresh_seconds: DEFAULT_INACTIVE_REPO_REFRESH_SECONDS,
             remote_accounts: vec![RemoteAccountSettings::default()],
+            custom_actions: Vec::new(),
         }
     }
 }
@@ -1512,6 +1534,24 @@ fn validate_remote_account_settings(name: &str, host: &str) -> Result<(), String
     }
     if !remote_account_host_is_valid(host) {
         return Err("remote account host is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_custom_git_action_settings(name: &str, command: &str) -> Result<(), String> {
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() {
+        return Err("custom action name is empty".to_owned());
+    }
+    if command.is_empty() {
+        return Err("custom action command is empty".to_owned());
+    }
+    if command.contains(['\n', '\r']) {
+        return Err("custom action command must be single line".to_owned());
+    }
+    if command != "git" && !command.starts_with("git ") {
+        return Err("custom action command must start with git".to_owned());
     }
     Ok(())
 }
@@ -2004,6 +2044,7 @@ impl GitAgentApp {
             details_task: None,
             diff_task: None,
             file_search_task: None,
+            blame_task: None,
             file_search_started_at: None,
             file_search_query: String::new(),
             file_search_hashes: HashSet::new(),
@@ -2030,6 +2071,7 @@ impl GitAgentApp {
             toast_notice: None,
             pending_toolbar_single_click: None,
             pending_worktree_action: None,
+            pending_blame_action: None,
             pending_fetch_action: None,
             pending_pull_action: None,
             pending_push_action: None,
@@ -2076,6 +2118,10 @@ impl GitAgentApp {
             remote_account_name_input: String::new(),
             remote_account_host_input: String::new(),
             remote_account_error: None,
+            custom_actions: app_settings.custom_actions,
+            custom_action_name_input: String::new(),
+            custom_action_command_input: String::new(),
+            custom_action_error: None,
             theme_mode: if env::var("GIT_AGENT_THEME").ok().as_deref() == Some("light") {
                 theme::ThemeMode::Light
             } else if env::var("GIT_AGENT_THEME").ok().as_deref() == Some("dark") {
@@ -2448,6 +2494,8 @@ impl GitAgentApp {
         self.details_cache.clear();
         self.diff_cache.clear();
         self.file_search_task = None;
+        self.blame_task = None;
+        self.pending_blame_action = None;
         self.file_search_started_at = None;
         self.file_search_query.clear();
         self.file_search_hashes.clear();
@@ -2474,6 +2522,8 @@ impl GitAgentApp {
         self.details_cache.clear();
         self.diff_cache.clear();
         self.file_search_task = None;
+        self.blame_task = None;
+        self.pending_blame_action = None;
         self.file_search_started_at = None;
         self.file_search_query.clear();
         self.file_search_hashes.clear();
@@ -2710,6 +2760,93 @@ impl GitAgentApp {
         }
     }
 
+    fn selected_worktree_action_state(&self) -> Option<SelectedWorktreeFile> {
+        self.selected_worktree_file.clone()
+    }
+
+    fn selected_worktree_absolute_path(&self) -> Option<PathBuf> {
+        let root = self.active_repo_root()?;
+        let selected = self.selected_worktree_file.as_ref()?;
+        Some(root.join(&selected.path))
+    }
+
+    fn open_selected_worktree_file(&mut self) {
+        let Some(path) = self.selected_worktree_absolute_path() else {
+            return;
+        };
+        if let Err(error) = open_path(&path) {
+            self.error = Some(format!(
+                "{}: {error}",
+                menu_label(self.language, "actions_open")
+            ));
+        }
+    }
+
+    fn copy_selected_worktree_file_path(&self, ctx: &egui::Context) {
+        if let Some(selected) = self.selected_worktree_file.as_ref() {
+            ctx.copy_text(selected.display_path.clone());
+        }
+    }
+
+    fn open_selected_worktree_history(&mut self) {
+        let Some(selected) = self.selected_worktree_file.clone() else {
+            return;
+        };
+        self.active_view = MainView::Search;
+        self.search_dimension = SearchDimension::Files;
+        self.search_view_query = normalize_worktree_path(&selected.display_path);
+        self.search_selected_commit = None;
+        self.search_selected_file_path = None;
+        self.search_selected_diff_rows.clear();
+        self.start_file_change_search();
+    }
+
+    fn open_selected_worktree_blame(&mut self) {
+        let Some(selected) = self.selected_worktree_file.clone() else {
+            return;
+        };
+        if selected.untracked {
+            return;
+        }
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let path = selected.path.clone();
+        self.pending_blame_action = Some(BlameActionDialog {
+            path: path.clone(),
+            display_path: selected.display_path,
+            lines: None,
+        });
+        let (sender, receiver) = mpsc::channel();
+        self.blame_task = Some(receiver);
+        thread::spawn(move || {
+            let result = git::blame_file(root, &path);
+            let _ = sender.send((path, result));
+        });
+    }
+
+    fn selected_or_first_conflict_path(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        let conflicts = worktree_conflict_files(snapshot);
+        selected_or_first_conflict(&conflicts, self.selected_worktree_file.as_ref())
+            .map(|file| file.path.clone())
+    }
+
+    fn open_selected_or_first_conflict_merge_tool(&mut self) {
+        if let Some(path) = self.selected_or_first_conflict_path() {
+            self.open_conflict_merge_tool(&path);
+        }
+    }
+
+    fn open_custom_actions_settings(&mut self) {
+        self.settings_tab = SettingsTab::CustomActions;
+        self.settings_open = true;
+    }
+
+    fn execute_custom_git_action(&mut self, action: CustomGitActionSettings) {
+        self.start_remote_git_action(move |root| run_custom_git_action(root, &action.command));
+    }
+
     fn open_remote_url(&mut self) {
         let Some(url) = self.default_remote_web_url() else {
             self.error = Some(self.tr("repo.remote.missing").to_owned());
@@ -2828,6 +2965,81 @@ impl GitAgentApp {
                 .map(|_| ())
                 .map_err(Into::into)
         });
+    }
+
+    fn open_selected_worktree_external_diff(&mut self) {
+        let Some(selected) = self.selected_worktree_file.clone() else {
+            return;
+        };
+        let path = selected.path;
+        let display_path = selected.display_path;
+        let staged = selected.staged;
+        let untracked = selected.untracked;
+        let title = display_path.clone();
+        let theme = merge_theme_arg(self.theme_mode).to_owned();
+        let language = merge_language_arg(self.language).to_owned();
+        self.start_remote_git_action(move |root| {
+            let diff = git::load_worktree_diff(root, &path, staged, untracked)?;
+            let temp_dir = env::temp_dir()
+                .join("git-agent-diffs")
+                .join(format!("{}-worktree", std::process::id()));
+            fs::create_dir_all(&temp_dir)?;
+            let diff_path = temp_dir.join("changes.patch");
+            fs::write(&diff_path, diff.text)?;
+            let diff_exe = env::current_exe()?.with_file_name(if cfg!(windows) {
+                "git-agent-diff.exe"
+            } else {
+                "git-agent-diff"
+            });
+            let left_label = if staged { "HEAD" } else { "index" };
+            let right_label = if staged { "index" } else { "worktree" };
+            Command::new(&diff_exe)
+                .current_dir(root)
+                .arg("--title")
+                .arg(&title)
+                .arg("--left")
+                .arg(left_label)
+                .arg("--right")
+                .arg(right_label)
+                .arg("--diff")
+                .arg(&diff_path)
+                .arg("--theme")
+                .arg(&theme)
+                .arg("--language")
+                .arg(&language)
+                .spawn()
+                .map(|_| ())
+                .map_err(Into::into)
+        });
+    }
+
+    fn create_worktree_patch(&mut self) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let Some(output_path) = rfd::FileDialog::new()
+            .set_directory(&root)
+            .set_file_name("changes.patch")
+            .add_filter("Patch", &["patch", "diff"])
+            .save_file()
+        else {
+            return;
+        };
+        self.start_remote_git_action(move |root| git::create_worktree_patch(root, &output_path));
+    }
+
+    fn apply_patch_file(&mut self) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let Some(patch_path) = rfd::FileDialog::new()
+            .set_directory(&root)
+            .add_filter("Patch", &["patch", "diff"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.start_remote_git_action(move |root| git::apply_patch(root, &patch_path));
     }
 
     fn default_remote_web_url(&self) -> Option<String> {
@@ -4304,6 +4516,39 @@ impl GitAgentApp {
             }
         }
 
+        if let Some(receiver) = self.blame_task.take() {
+            match receiver.try_recv() {
+                Ok((path, Ok(lines))) => {
+                    if let Some(dialog) = self.pending_blame_action.as_mut()
+                        && dialog.path == path
+                    {
+                        dialog.lines = Some(lines);
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((path, Err(error))) => {
+                    if self
+                        .pending_blame_action
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.path == path)
+                    {
+                        self.pending_blame_action = None;
+                    }
+                    self.error = Some(error.to_string());
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.blame_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_blame_action = None;
+                    self.error = Some("Blame loader stopped unexpectedly".to_owned());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         if let Some(receiver) = self.details_task.take() {
             match receiver.try_recv() {
                 Ok(Ok(details)) => {
@@ -4697,6 +4942,7 @@ impl GitAgentApp {
             active_repo_refresh_seconds: self.active_repo_refresh_seconds,
             inactive_repo_refresh_seconds: self.inactive_repo_refresh_seconds,
             remote_accounts: self.remote_accounts.clone(),
+            custom_actions: self.custom_actions.clone(),
         }
         .save();
     }
@@ -4955,6 +5201,7 @@ impl App for GitAgentApp {
 
         self.commit_action_modal(ctx);
         self.worktree_action_modal(ctx);
+        self.blame_action_modal(ctx);
         self.fetch_action_modal(ctx);
         self.pull_action_modal(ctx);
         self.push_action_modal(ctx);
@@ -5711,16 +5958,305 @@ impl GitAgentApp {
                 }
             });
             top_menu_button(ui, menu_label(self.language, "actions"), |ui| {
-                if menu_text_button(ui, has_repo, self.tr("branch.local")).clicked() {
-                    self.active_view = MainView::Branches;
+                let selected_worktree_action_state = self.selected_worktree_action_state();
+                let selected_conflict_path = self.selected_or_first_conflict_path();
+                let stage_toggle_enabled = git_dialog_enabled
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .and_then(shortcut_stage_toggle_action)
+                        .is_some();
+                let has_staged_changes = self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.staged.is_empty());
+                let rebase_in_progress = self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.rebase_in_progress);
+
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_open"),
+                    "Shift+Ctrl+O",
+                )
+                .clicked()
+                {
+                    self.open_selected_worktree_file();
                     ui.close_menu();
                 }
-                if menu_text_button(ui, has_repo, self.tr("tag.title")).clicked() {
-                    self.active_view = MainView::Tags;
+                if menu_text_button(
+                    ui,
+                    has_repo,
+                    menu_label(self.language, "actions_show_in_file_manager"),
+                )
+                .clicked()
+                {
+                    self.open_resource_manager();
                     ui.close_menu();
                 }
-                if menu_text_button(ui, has_repo, self.tr("stash.title")).clicked() {
-                    self.active_view = MainView::Stashes;
+                if menu_shortcut_button(
+                    ui,
+                    has_repo,
+                    menu_label(self.language, "actions_open_terminal"),
+                    "Shift+Alt+T",
+                )
+                .clicked()
+                {
+                    self.open_command_mode();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_external_diff"),
+                    "Ctrl+D",
+                )
+                .clicked()
+                {
+                    self.open_selected_worktree_external_diff();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled
+                        && self
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| !snapshot.status.is_empty()),
+                    menu_label(self.language, "actions_create_patch"),
+                )
+                .clicked()
+                {
+                    self.create_worktree_patch();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled,
+                    menu_label(self.language, "actions_apply_patch"),
+                )
+                .clicked()
+                {
+                    self.apply_patch_file();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled
+                        && selected_worktree_action_state
+                            .as_ref()
+                            .is_some_and(|file| !file.staged),
+                    menu_label(self.language, "actions_add"),
+                    "Ctrl+Shift+Plus",
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::Stage { path: file.path });
+                    }
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled
+                        && selected_worktree_action_state
+                            .as_ref()
+                            .is_some_and(|file| !file.untracked),
+                    menu_label(self.language, "actions_remove"),
+                    "Ctrl+Del",
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::Remove { path: file.path });
+                    }
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled
+                        && selected_worktree_action_state
+                            .as_ref()
+                            .is_some_and(|file| file.staged),
+                    menu_label(self.language, "actions_unstage"),
+                    "Ctrl+Shift+Minus",
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::Unstage {
+                            path: file.path,
+                        });
+                    }
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    stage_toggle_enabled,
+                    menu_label(self.language, "actions_add_remove"),
+                    "Ctrl+Shift+Alt+Plus",
+                )
+                .clicked()
+                {
+                    self.stage_toggle_current_repository();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled
+                        && selected_worktree_action_state
+                            .as_ref()
+                            .is_some_and(|file| !file.untracked),
+                    menu_label(self.language, "actions_stop_tracking"),
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::StopTracking {
+                            path: file.path,
+                        });
+                    }
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_ignore"),
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore {
+                            pattern: normalize_worktree_path(&file.display_path),
+                        });
+                    }
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled && has_staged_changes,
+                    menu_label(self.language, "actions_commit_staged"),
+                    "Shift+Alt+C",
+                )
+                .clicked()
+                {
+                    self.active_view = MainView::Workspace;
+                    self.focus_commit_message = true;
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_discard_selected"),
+                    "Shift+Ctrl+R",
+                )
+                .clicked()
+                {
+                    if let Some(file) = selected_worktree_action_state.clone() {
+                        self.handle_worktree_action(WorktreeMenuAction::Discard {
+                            path: file.path,
+                            untracked: file.untracked,
+                        });
+                    }
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && rebase_in_progress,
+                    menu_label(self.language, "actions_rebase_continue"),
+                )
+                .clicked()
+                {
+                    self.start_rebase_control_action(RebaseControlAction::Continue);
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && rebase_in_progress,
+                    menu_label(self.language, "actions_rebase_abort"),
+                )
+                .clicked()
+                {
+                    self.start_rebase_control_action(RebaseControlAction::Abort);
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    git_dialog_enabled && selected_conflict_path.is_some(),
+                    menu_label(self.language, "actions_resolve_conflicts"),
+                )
+                .clicked()
+                {
+                    self.open_selected_or_first_conflict_merge_tool();
+                    ui.close_menu();
+                }
+                hover_submenu_button_enabled(
+                    ui,
+                    true,
+                    menu_label(self.language, "actions_custom"),
+                    |ui| {
+                        for custom_action in self.custom_actions.clone() {
+                            if menu_text_button_with_text(
+                                ui,
+                                git_dialog_enabled,
+                                custom_action.name.clone(),
+                            )
+                            .clicked()
+                            {
+                                self.execute_custom_git_action(custom_action);
+                                ui.close_menu();
+                            }
+                        }
+                        if !self.custom_actions.is_empty() {
+                            ui.add_space(4.0);
+                        }
+                        if menu_text_button(
+                            ui,
+                            true,
+                            menu_label(self.language, "actions_configure_custom"),
+                        )
+                        .clicked()
+                        {
+                            self.open_custom_actions_settings();
+                            ui.close_menu();
+                        }
+                    },
+                );
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_selected_history"),
+                    "Shift+Alt+L",
+                )
+                .clicked()
+                {
+                    self.open_selected_worktree_history();
+                    ui.close_menu();
+                }
+                if menu_shortcut_button(
+                    ui,
+                    git_dialog_enabled
+                        && selected_worktree_action_state
+                            .as_ref()
+                            .is_some_and(|file| !file.untracked),
+                    menu_label(self.language, "actions_line_review"),
+                    "Shift+Alt+B",
+                )
+                .clicked()
+                {
+                    self.open_selected_worktree_blame();
+                    ui.close_menu();
+                }
+                if menu_text_button(
+                    ui,
+                    selected_worktree_action_state.is_some(),
+                    menu_label(self.language, "actions_copy"),
+                )
+                .clicked()
+                {
+                    self.copy_selected_worktree_file_path(ui.ctx());
                     ui.close_menu();
                 }
             });
@@ -8169,6 +8705,12 @@ impl GitAgentApp {
                 self.pending_worktree_action =
                     Some(WorktreeActionDialog::ConfirmDiscard { path, untracked });
             }
+            WorktreeMenuAction::Remove { path } => {
+                self.execute_git_action(move |root| git::remove_path(root, &path));
+            }
+            WorktreeMenuAction::StopTracking { path } => {
+                self.execute_git_action(move |root| git::stop_tracking_path(root, &path));
+            }
             WorktreeMenuAction::ResolveConflict { path } => {
                 self.pending_worktree_action = Some(WorktreeActionDialog::ResolveConflicts {
                     selected_path: Some(path),
@@ -9817,35 +10359,40 @@ impl GitAgentApp {
 
         match dialog {
             WorktreeActionDialog::ConfirmDiscard { path, untracked } => {
-                compact_action_dialog(ctx, "Discard changes", ACTION_DIALOG_WIDTH, |ui| {
-                    ui.label(RichText::new(&path).monospace().color(theme::text()));
-                    ui.label(
-                        RichText::new(if untracked {
-                            "This will delete the untracked file or directory."
-                        } else {
-                            "This will restore the path from HEAD."
-                        })
-                        .color(theme::warning()),
-                    );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        let submit_requested = dialog_default_submit_requested(ui);
-                        if ui.button("Discard").clicked() || submit_requested {
-                            let path = path.clone();
-                            execute = Some(Box::new(move |root| {
-                                if untracked {
-                                    git::clean_untracked_path(root, &path)
-                                } else {
-                                    git::discard_path(root, &path)
-                                }
-                            }));
-                            close_after = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close_after = true;
-                        }
-                    });
-                });
+                compact_action_dialog(
+                    ctx,
+                    self.tr("worktree.discard"),
+                    ACTION_DIALOG_WIDTH,
+                    |ui| {
+                        ui.label(RichText::new(&path).monospace().color(theme::text()));
+                        ui.label(
+                            RichText::new(if untracked {
+                                self.tr("worktree.discard_untracked_warning")
+                            } else {
+                                self.tr("worktree.discard_tracked_warning")
+                            })
+                            .color(theme::warning()),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            let submit_requested = dialog_default_submit_requested(ui);
+                            if ui.button(self.tr("dialog.discard")).clicked() || submit_requested {
+                                let path = path.clone();
+                                execute = Some(Box::new(move |root| {
+                                    if untracked {
+                                        git::clean_untracked_path(root, &path)
+                                    } else {
+                                        git::discard_path(root, &path)
+                                    }
+                                }));
+                                close_after = true;
+                            }
+                            if ui.button(self.tr("dialog.cancel")).clicked() {
+                                close_after = true;
+                            }
+                        });
+                    },
+                );
 
                 if let Some(action) = execute {
                     self.execute_git_action(action);
@@ -9998,6 +10545,120 @@ impl GitAgentApp {
                         Some(WorktreeActionDialog::ResolveConflicts { selected_path });
                 }
             }
+        }
+    }
+
+    fn blame_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.pending_blame_action.take() else {
+            return;
+        };
+        let title = format!("{}: {}", self.tr("blame.title"), dialog.display_path);
+        let path_label = self.tr("blame.path");
+        let loading_label = self.tr("blame.loading");
+        let empty_label = self.tr("blame.empty");
+        let line_label = self.tr("blame.line");
+        let commit_label = self.tr("blame.commit");
+        let author_label = self.tr("blame.author");
+        let summary_label = self.tr("blame.summary");
+        let content_label = self.tr("blame.content");
+        let close_label = self.tr("dialog.close");
+        let mut close_after = false;
+
+        compact_action_dialog(ctx, &title, 860.0, |ui| {
+            ui.label(
+                RichText::new(format!("{path_label}: {}", dialog.display_path))
+                    .small()
+                    .color(theme::muted()),
+            );
+            ui.add_space(8.0);
+
+            if let Some(lines) = dialog.lines.as_ref() {
+                if lines.is_empty() {
+                    ui.label(RichText::new(empty_label).color(theme::muted()));
+                } else {
+                    ScrollArea::both()
+                        .id_salt(("blame_lines_scroll", dialog.path.as_str()))
+                        .max_height(430.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new(("blame_lines_grid", dialog.path.as_str()))
+                                .num_columns(5)
+                                .spacing(Vec2::new(14.0, 4.0))
+                                .striped(false)
+                                .show(ui, |ui| {
+                                    for label in [
+                                        line_label,
+                                        commit_label,
+                                        author_label,
+                                        summary_label,
+                                        content_label,
+                                    ] {
+                                        ui.label(
+                                            RichText::new(label).small().color(theme::muted()),
+                                        );
+                                    }
+                                    ui.end_row();
+
+                                    for line in lines {
+                                        ui.label(
+                                            RichText::new(line.final_line.to_string())
+                                                .monospace()
+                                                .color(theme::muted()),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(line.short_commit.as_str())
+                                                    .monospace()
+                                                    .color(theme::accent()),
+                                            )
+                                            .selectable(true),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(line.author.as_str())
+                                                    .color(theme::text()),
+                                            )
+                                            .selectable(true),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(line.summary.as_str())
+                                                    .color(theme::muted()),
+                                            )
+                                            .selectable(true),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(line.content.as_str())
+                                                    .monospace()
+                                                    .color(theme::text()),
+                                            )
+                                            .selectable(true),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(loading_label).color(theme::muted()));
+                });
+            }
+
+            ui.add_space(12.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(close_label).clicked() {
+                    close_after = true;
+                }
+            });
+        });
+
+        if close_after {
+            self.blame_task = None;
+        } else {
+            self.pending_blame_action = Some(dialog);
         }
     }
 
@@ -12616,11 +13277,7 @@ impl GitAgentApp {
                     settings_tab_label(self.language, SettingsTab::Git),
                     self.language,
                 ),
-                SettingsTab::CustomActions => global_settings_empty_tab(
-                    ui,
-                    settings_tab_label(self.language, SettingsTab::CustomActions),
-                    self.language,
-                ),
+                SettingsTab::CustomActions => self.global_custom_actions_settings(ui),
                 SettingsTab::Verification => global_settings_empty_tab(
                     ui,
                     settings_tab_label(self.language, SettingsTab::Verification),
@@ -12699,6 +13356,85 @@ impl GitAgentApp {
         settings_section_title(ui, settings_tab_label(self.language, SettingsTab::Network));
         ui.add_space(12.0);
         self.global_remote_accounts_settings(ui);
+    }
+
+    fn global_custom_actions_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        settings_section_title(ui, settings_tab_label(language, SettingsTab::CustomActions));
+        ui.label(
+            RichText::new(menu_label(language, "custom_actions_hint"))
+                .small()
+                .color(theme::muted()),
+        );
+        ui.add_space(6.0);
+
+        let mut remove_action = None;
+        for index in 0..self.custom_actions.len() {
+            let action = self.custom_actions[index].clone();
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [160.0, 22.0],
+                    egui::Label::new(RichText::new(action.name).color(theme::text())),
+                );
+                ui.add_sized(
+                    [360.0, 22.0],
+                    egui::Label::new(RichText::new(action.command).color(theme::muted()))
+                        .truncate(),
+                );
+                if ui
+                    .button(i18n::t(language, "repo.settings.remove"))
+                    .clicked()
+                {
+                    remove_action = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_action {
+            self.custom_actions.remove(index);
+            self.save_app_settings();
+        }
+
+        ui.add_space(8.0);
+        settings_field(ui, menu_label(language, "custom_action_name"), |ui| {
+            let hint = placeholder_for_label(language, menu_label(language, "custom_action_name"));
+            themed_text_edit_selection(ui);
+            ui.add_sized(
+                [180.0, 24.0],
+                themed_singleline_text_edit(&mut self.custom_action_name_input, &hint),
+            );
+        });
+        settings_field(ui, menu_label(language, "custom_action_command"), |ui| {
+            let hint =
+                placeholder_for_label(language, menu_label(language, "custom_action_command"));
+            themed_text_edit_selection(ui);
+            ui.add_sized(
+                [ui.available_width().clamp(260.0, 520.0), 24.0],
+                themed_singleline_text_edit(&mut self.custom_action_command_input, &hint),
+            );
+        });
+        if ui.button(i18n::t(language, "repo.settings.add")).clicked() {
+            match validate_custom_git_action_settings(
+                &self.custom_action_name_input,
+                &self.custom_action_command_input,
+            ) {
+                Ok(()) => {
+                    self.custom_actions.push(CustomGitActionSettings {
+                        name: self.custom_action_name_input.trim().to_owned(),
+                        command: self.custom_action_command_input.trim().to_owned(),
+                    });
+                    self.custom_action_name_input.clear();
+                    self.custom_action_command_input.clear();
+                    self.custom_action_error = None;
+                    self.save_app_settings();
+                }
+                Err(error) => {
+                    self.custom_action_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = &self.custom_action_error {
+            ui.label(RichText::new(error).small().color(theme::warning()));
+        }
     }
 
     fn global_refresh_settings(&mut self, ui: &mut Ui) {
@@ -13278,6 +14014,8 @@ enum WorktreeMenuAction {
     Unstage { path: String },
     UnstageAll,
     Discard { path: String, untracked: bool },
+    Remove { path: String },
+    StopTracking { path: String },
     ResolveConflict { path: String },
     AddToGitIgnore { pattern: String },
 }
@@ -15556,6 +16294,47 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "repo_benchmark_performance") => {
             "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}"
         }
+        (Language::Chinese, "actions_open") => "\u{6253}\u{5f00}(O)...",
+        (Language::Chinese, "actions_show_in_file_manager") => {
+            "\u{5728}\u{8d44}\u{6e90}\u{7ba1}\u{7406}\u{5668}\u{91cc}\u{663e}\u{793a}"
+        }
+        (Language::Chinese, "actions_open_terminal") => {
+            "\u{5728}\u{7ec8}\u{7aef}\u{4e2d}\u{6253}\u{5f00}"
+        }
+        (Language::Chinese, "actions_external_diff") => {
+            "\u{5916}\u{90e8}\u{5dee}\u{5f02}\u{6bd4}\u{8f83}"
+        }
+        (Language::Chinese, "actions_create_patch") => "\u{521b}\u{5efa}\u{8865}\u{4e01}...",
+        (Language::Chinese, "actions_apply_patch") => "\u{5e94}\u{7528}\u{8865}\u{4e01}...",
+        (Language::Chinese, "actions_add") => "\u{6dfb}\u{52a0}",
+        (Language::Chinese, "actions_remove") => "\u{79fb}\u{9664}",
+        (Language::Chinese, "actions_unstage") => "\u{53d6}\u{6d88}\u{7d22}\u{5f15}",
+        (Language::Chinese, "actions_add_remove") => "\u{6dfb}\u{52a0}/\u{5220}\u{9664}",
+        (Language::Chinese, "actions_stop_tracking") => "\u{505c}\u{6b62}\u{8ddf}\u{8e2a}",
+        (Language::Chinese, "actions_ignore") => "\u{5ffd}\u{7565}...",
+        (Language::Chinese, "actions_commit_staged") => {
+            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}..."
+        }
+        (Language::Chinese, "actions_discard_selected") => "\u{4e22}\u{5f03}\u{9009}\u{4e2d}...",
+        (Language::Chinese, "actions_rebase_continue") => "\u{7ee7}\u{7eed}\u{53d8}\u{57fa}",
+        (Language::Chinese, "actions_rebase_abort") => "\u{4e2d}\u{6b62}\u{53d8}\u{57fa}",
+        (Language::Chinese, "actions_resolve_conflicts") => "\u{89e3}\u{51b3}\u{51b2}\u{7a81}",
+        (Language::Chinese, "actions_custom") => "\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}",
+        (Language::Chinese, "actions_configure_custom") => {
+            "\u{914d}\u{7f6e}\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}..."
+        }
+        (Language::Chinese, "actions_selected_history") => {
+            "\u{9009}\u{5b9a}\u{9879}\u{76ee}\u{7684}\u{53d8}\u{66f4}\u{5386}\u{53f2}..."
+        }
+        (Language::Chinese, "actions_line_review") => {
+            "\u{6309}\u{884c}\u{5ba1}\u{9605}\u{9009}\u{5b9a}\u{9879}\u{76ee}..."
+        }
+        (Language::Chinese, "actions_copy") => "\u{590d}\u{5236}",
+        (Language::Chinese, "custom_actions_hint") => {
+            "\u{914d}\u{7f6e}\u{540e}\u{4f1a}\u{51fa}\u{73b0}\u{5728}\u{64cd}\u{4f5c} > \u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}\u{3002}\u{547d}\u{4ee4}\u{4f1a}\u{5728}\u{5f53}\u{524d}\u{4ed3}\u{5e93}\u{6839}\u{76ee}\u{5f55}\u{6267}\u{884c}\u{3002}"
+        }
+        (Language::Chinese, "custom_action_name") => "\u{64cd}\u{4f5c}\u{540d}\u{79f0}",
+        (Language::Chinese, "custom_action_command") => "Git \u{547d}\u{4ee4}",
         (Language::Chinese, "undo") => "\u{64a4}\u{9500}",
         (Language::Chinese, "redo") => "\u{91cd}\u{505a}",
         (Language::Chinese, "ssh_agent") => "\u{542f}\u{52a8}SSH\u{52a9}\u{624b}...",
@@ -15620,6 +16399,33 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "repo_git_flow_finish_hotfix") => "Finish Hotfix",
         (_, "repo_create_pull_request") => "Create Pull Request...",
         (_, "repo_benchmark_performance") => "Benchmark Repo Performance",
+        (_, "actions_open") => "Open...",
+        (_, "actions_show_in_file_manager") => "Show in File Manager",
+        (_, "actions_open_terminal") => "Open in Terminal",
+        (_, "actions_external_diff") => "External Diff",
+        (_, "actions_create_patch") => "Create Patch...",
+        (_, "actions_apply_patch") => "Apply Patch...",
+        (_, "actions_add") => "Add",
+        (_, "actions_remove") => "Remove",
+        (_, "actions_unstage") => "Unstage",
+        (_, "actions_add_remove") => "Add/Remove",
+        (_, "actions_stop_tracking") => "Stop Tracking",
+        (_, "actions_ignore") => "Ignore...",
+        (_, "actions_commit_staged") => "Commit Staged Changes...",
+        (_, "actions_discard_selected") => "Discard Selected...",
+        (_, "actions_rebase_continue") => "Continue Rebase",
+        (_, "actions_rebase_abort") => "Abort Rebase",
+        (_, "actions_resolve_conflicts") => "Resolve Conflicts",
+        (_, "actions_custom") => "Custom Actions",
+        (_, "actions_configure_custom") => "Configure Custom Actions...",
+        (_, "actions_selected_history") => "Selected Item Log...",
+        (_, "actions_line_review") => "Blame Selected Item...",
+        (_, "actions_copy") => "Copy",
+        (_, "custom_actions_hint") => {
+            "Configured actions appear under Actions > Custom Actions and run from the current repository root."
+        }
+        (_, "custom_action_name") => "Action Name",
+        (_, "custom_action_command") => "Git Command",
         (_, "undo") => "Undo",
         (_, "redo") => "Redo",
         (_, "ssh_agent") => "Start SSH Agent...",
@@ -22028,6 +22834,38 @@ fn open_command_prompt(root: &Path) -> std::io::Result<()> {
     }
 }
 
+fn run_custom_git_action(root: &Path, command: &str) -> anyhow::Result<()> {
+    validate_custom_git_action_settings("custom", command).map_err(anyhow::Error::msg)?;
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .current_dir(root)
+            .output()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(root)
+            .output()
+    }?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim().to_owned()
+    } else {
+        stdout.trim().to_owned()
+    };
+    Err(anyhow::anyhow!(
+        "custom git action failed: {}\n{}",
+        command,
+        detail
+    ))
+}
+
 #[cfg(target_os = "windows")]
 fn git_bash_executable() -> PathBuf {
     for path in [
@@ -24605,6 +25443,7 @@ mod ui_tests {
             active_repo_refresh_seconds: 30,
             inactive_repo_refresh_seconds: 90,
             remote_accounts: vec![RemoteAccountSettings::default()],
+            custom_actions: Vec::new(),
         };
         let raw = serde_json::to_string(&settings).unwrap();
         assert!(raw.contains("\"theme\":\"Light\""));
@@ -27075,6 +27914,265 @@ mod ui_tests {
     }
 
     #[test]
+    fn actions_menu_exposes_sourcetree_style_actions_and_known_wirings() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let actions_start = menu_source
+            .find("menu_label(self.language, \"actions\")")
+            .unwrap();
+        let tools_start = menu_source[actions_start..]
+            .find("menu_label(self.language, \"tools\")")
+            .unwrap();
+        let actions_source = &menu_source[actions_start..actions_start + tools_start];
+
+        for required in [
+            "actions_open",
+            "actions_show_in_file_manager",
+            "actions_open_terminal",
+            "actions_external_diff",
+            "actions_create_patch",
+            "actions_apply_patch",
+            "actions_add",
+            "actions_remove",
+            "actions_unstage",
+            "actions_add_remove",
+            "actions_stop_tracking",
+            "actions_ignore",
+            "actions_commit_staged",
+            "actions_discard_selected",
+            "actions_rebase_continue",
+            "actions_rebase_abort",
+            "actions_resolve_conflicts",
+            "actions_custom",
+            "actions_configure_custom",
+            "actions_selected_history",
+            "actions_line_review",
+            "actions_copy",
+            "\"Shift+Ctrl+O\"",
+            "\"Shift+Alt+T\"",
+            "\"Ctrl+D\"",
+            "\"Ctrl+Shift+Plus\"",
+            "\"Ctrl+Del\"",
+            "\"Ctrl+Shift+Minus\"",
+            "\"Ctrl+Shift+Alt+Plus\"",
+            "\"Shift+Alt+C\"",
+            "\"Shift+Ctrl+R\"",
+            "\"Shift+Alt+L\"",
+            "\"Shift+Alt+B\"",
+            "self.open_resource_manager();",
+            "self.open_command_mode();",
+            "self.stage_toggle_current_repository();",
+            "self.open_selected_or_first_conflict_merge_tool();",
+            "self.open_custom_actions_settings();",
+            "self.handle_worktree_action(WorktreeMenuAction::Stage",
+            "self.handle_worktree_action(WorktreeMenuAction::Unstage",
+            "self.handle_worktree_action(WorktreeMenuAction::Discard",
+            "self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore",
+            "self.start_rebase_control_action(RebaseControlAction::Continue)",
+            "self.start_rebase_control_action(RebaseControlAction::Abort)",
+            "selected_worktree_action_state",
+            "selected_or_first_conflict_path",
+        ] {
+            assert!(actions_source.contains(required), "{required}");
+        }
+        assert!(!actions_source.contains("branch.local"));
+        assert!(!actions_source.contains("tag.title"));
+        assert!(!actions_source.contains("stash.title"));
+        assert!(!actions_source.contains("ResolveConflict"));
+        assert_eq!(
+            menu_label(Language::Chinese, "actions_resolve_conflicts"),
+            "\u{89e3}\u{51b3}\u{51b2}\u{7a81}"
+        );
+        assert_eq!(
+            menu_label(Language::English, "actions_resolve_conflicts"),
+            "Resolve Conflicts"
+        );
+    }
+
+    #[test]
+    fn actions_menu_wires_selected_worktree_file_actions() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let actions_start = menu_source
+            .find("menu_label(self.language, \"actions\")")
+            .unwrap();
+        let tools_start = menu_source[actions_start..]
+            .find("menu_label(self.language, \"tools\")")
+            .unwrap();
+        let actions_source = &menu_source[actions_start..actions_start + tools_start];
+
+        for required in [
+            "self.open_selected_worktree_file();",
+            "self.open_selected_worktree_external_diff();",
+            "self.open_selected_worktree_history();",
+            "self.open_selected_worktree_blame();",
+            "self.create_worktree_patch();",
+            "self.apply_patch_file();",
+            "self.copy_selected_worktree_file_path(ui.ctx());",
+            "WorktreeMenuAction::Remove",
+            "WorktreeMenuAction::StopTracking",
+            ".is_some_and(|file| !file.untracked)",
+        ] {
+            assert!(actions_source.contains(required), "{required}");
+        }
+
+        let handler_start = implementation_source
+            .find("fn handle_worktree_action(&mut self, action: WorktreeMenuAction)")
+            .unwrap();
+        let handler_end = implementation_source[handler_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let handler_source = &implementation_source[handler_start..handler_start + handler_end];
+
+        for required in [
+            "WorktreeMenuAction::Remove { path }",
+            "git::remove_path(root, &path)",
+            "WorktreeMenuAction::StopTracking { path }",
+            "git::stop_tracking_path(root, &path)",
+        ] {
+            assert!(handler_source.contains(required), "{required}");
+        }
+
+        let external_start = implementation_source
+            .find("fn open_selected_worktree_external_diff(")
+            .unwrap();
+        let external_end = implementation_source[external_start..]
+            .find("fn default_remote_web_url(")
+            .unwrap();
+        let external_source = &implementation_source[external_start..external_start + external_end];
+        for required in [
+            "git::load_worktree_diff(root, &path, staged, untracked)",
+            "\"git-agent-diff.exe\"",
+            "\"worktree\"",
+        ] {
+            assert!(external_source.contains(required), "{required}");
+        }
+
+        let history_start = implementation_source
+            .find("fn open_selected_worktree_history(")
+            .unwrap();
+        let history_end = implementation_source[history_start..]
+            .find("fn selected_or_first_conflict_path(")
+            .unwrap();
+        let history_source = &implementation_source[history_start..history_start + history_end];
+        for required in [
+            "self.active_view = MainView::Search",
+            "self.search_dimension = SearchDimension::Files",
+            "self.search_view_query = normalize_worktree_path(&selected.display_path)",
+            "self.start_file_change_search();",
+        ] {
+            assert!(history_source.contains(required), "{required}");
+        }
+
+        let patch_start = implementation_source
+            .find("fn create_worktree_patch(")
+            .unwrap();
+        let patch_end = implementation_source[patch_start..]
+            .find("fn apply_patch_file(")
+            .unwrap();
+        let patch_source = &implementation_source[patch_start..patch_start + patch_end];
+        for required in [
+            "rfd::FileDialog::new()",
+            "git::create_worktree_patch(root, &output_path)",
+        ] {
+            assert!(patch_source.contains(required), "{required}");
+        }
+
+        let apply_start = implementation_source.find("fn apply_patch_file(").unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn default_remote_web_url(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+        for required in [
+            "rfd::FileDialog::new()",
+            "git::apply_patch(root, &patch_path)",
+        ] {
+            assert!(apply_source.contains(required), "{required}");
+        }
+
+        for required in [
+            "blame_task: Option<Receiver<(String, anyhow::Result<Vec<git::BlameLine>>)>>",
+            "pending_blame_action: Option<BlameActionDialog>",
+            "fn open_selected_worktree_blame(",
+            "fn blame_action_modal(",
+            "self.blame_action_modal(ctx);",
+            "git::blame_file(root, &path)",
+            "BlameActionDialog",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn custom_actions_persist_in_global_settings_and_feed_actions_menu() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let actions_start = menu_source
+            .find("menu_label(self.language, \"actions\")")
+            .unwrap();
+        let tools_start = menu_source[actions_start..]
+            .find("menu_label(self.language, \"tools\")")
+            .unwrap();
+        let actions_source = &menu_source[actions_start..actions_start + tools_start];
+        let settings_start = implementation_source
+            .find("fn global_settings_page(&mut self")
+            .unwrap();
+        let settings_end = implementation_source[settings_start..]
+            .find("fn global_general_settings")
+            .unwrap();
+        let settings_source = &implementation_source[settings_start..settings_start + settings_end];
+
+        for required in [
+            "struct CustomGitActionSettings",
+            "custom_actions: Vec<CustomGitActionSettings>",
+            "custom_action_name_input: String",
+            "custom_action_command_input: String",
+            "custom_action_error: Option<String>",
+            "fn global_custom_actions_settings(",
+            "SettingsTab::CustomActions => self.global_custom_actions_settings(ui)",
+            "fn validate_custom_git_action_settings(",
+            "fn execute_custom_git_action(",
+            "fn run_custom_git_action(",
+            "for custom_action in self.custom_actions.clone()",
+            "self.execute_custom_git_action(custom_action);",
+        ] {
+            assert!(implementation_source.contains(required), "{required}");
+        }
+        assert!(actions_source.contains("for custom_action in self.custom_actions.clone()"));
+        assert!(settings_source.contains("self.global_custom_actions_settings(ui)"));
+
+        let settings = AppSettings {
+            custom_actions: vec![CustomGitActionSettings {
+                name: "Status".to_owned(),
+                command: "git status --short".to_owned(),
+            }],
+            ..AppSettings::default()
+        };
+        let raw = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(restored.custom_actions[0].name, "Status");
+        assert_eq!(restored.custom_actions[0].command, "git status --short");
+        assert!(validate_custom_git_action_settings("Status", "git status").is_ok());
+        assert!(validate_custom_git_action_settings("", "git status").is_err());
+        assert!(validate_custom_git_action_settings("Status", "").is_err());
+    }
+
+    #[test]
     fn top_level_menus_use_no_border_shadow_popup_style() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -29377,6 +30475,38 @@ mod ui_tests {
             .unwrap();
         let conflict_source = &implementation_source[conflict_start..conflict_start + conflict_end];
         assert!(!conflict_source.contains("dialog_default_submit_requested(ui)"));
+    }
+
+    #[test]
+    fn discard_selected_confirmation_is_localized() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let dialog_start = implementation_source
+            .find("WorktreeActionDialog::ConfirmDiscard { path, untracked } =>")
+            .unwrap();
+        let dialog_end = implementation_source[dialog_start..]
+            .find("WorktreeActionDialog::ConfirmDiscardAll")
+            .unwrap();
+        let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
+
+        for required in [
+            "self.tr(\"worktree.discard\")",
+            "self.tr(\"worktree.discard_untracked_warning\")",
+            "self.tr(\"worktree.discard_tracked_warning\")",
+            "self.tr(\"dialog.discard\")",
+            "self.tr(\"dialog.cancel\")",
+        ] {
+            assert!(dialog_source.contains(required), "{required}");
+        }
+        for forbidden in [
+            "Discard changes",
+            "This will delete the untracked file or directory.",
+            "This will restore the path from HEAD.",
+            "ui.button(\"Discard\")",
+            "ui.button(\"Cancel\")",
+        ] {
+            assert!(!dialog_source.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]

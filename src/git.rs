@@ -38,6 +38,18 @@ pub struct FileChange {
     pub diff_path: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlameLine {
+    pub commit: String,
+    pub short_commit: String,
+    pub author: String,
+    pub author_time: Option<i64>,
+    pub summary: String,
+    pub original_line: usize,
+    pub final_line: usize,
+    pub content: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Branch {
     pub name: String,
@@ -707,6 +719,83 @@ pub fn load_worktree_diff(
     };
     let key = worktree_diff_key(path, staged);
     Ok(FileDiff { key, text })
+}
+
+pub fn blame_file(root: impl AsRef<Path>, path: &str) -> Result<Vec<BlameLine>> {
+    let output = git_output(root.as_ref(), &["blame", "--line-porcelain", "--", path])?;
+    Ok(parse_blame_porcelain(&output))
+}
+
+fn parse_blame_porcelain(output: &str) -> Vec<BlameLine> {
+    let mut lines = Vec::new();
+    let mut commit = String::new();
+    let mut original_line = 0usize;
+    let mut final_line = 0usize;
+    let mut author = String::new();
+    let mut author_time = None;
+    let mut summary = String::new();
+
+    for line in output.lines() {
+        if let Some(content) = line.strip_prefix('\t') {
+            let short_commit = short_blame_commit(&commit);
+            lines.push(BlameLine {
+                commit: commit.clone(),
+                short_commit,
+                author: author.clone(),
+                author_time,
+                summary: summary.clone(),
+                original_line,
+                final_line,
+                content: content.to_owned(),
+            });
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("author ") {
+            author = value.to_owned();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("author-time ") {
+            author_time = value.parse::<i64>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("summary ") {
+            summary = value.to_owned();
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(candidate_commit) = parts.next() else {
+            continue;
+        };
+        let Some(candidate_original) = parts.next() else {
+            continue;
+        };
+        let Some(candidate_final) = parts.next() else {
+            continue;
+        };
+        if let (Ok(parsed_original), Ok(parsed_final)) = (
+            candidate_original.parse::<usize>(),
+            candidate_final.parse::<usize>(),
+        ) {
+            commit = candidate_commit.to_owned();
+            original_line = parsed_original;
+            final_line = parsed_final;
+            author.clear();
+            author_time = None;
+            summary.clear();
+        }
+    }
+
+    lines
+}
+
+fn short_blame_commit(commit: &str) -> String {
+    commit
+        .trim_start_matches('^')
+        .chars()
+        .take(8)
+        .collect::<String>()
 }
 
 pub fn diff_worktree_against_commit(root: impl AsRef<Path>, hash: &str) -> Result<String> {
@@ -1931,6 +2020,40 @@ pub fn discard_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
 
 pub fn clean_untracked_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
     git_output(root.as_ref(), &["clean", "-fd", "--", path]).map(|_| ())
+}
+
+pub fn remove_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
+    git_output(root.as_ref(), &["rm", "--", path]).map(|_| ())
+}
+
+pub fn stop_tracking_path(root: impl AsRef<Path>, path: &str) -> Result<()> {
+    git_output(root.as_ref(), &["rm", "--cached", "--", path]).map(|_| ())
+}
+
+pub fn create_worktree_patch(root: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
+    let mut patch = git_output(root, &["diff", "--binary", "HEAD", "--"])?;
+    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard"])?;
+    for path in untracked
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        if let Ok(content) = fs::read_to_string(root.join(path)) {
+            patch.push_str(&new_file_unified_diff(path, &content));
+        }
+    }
+    fs::write(output_path, patch)?;
+    Ok(())
+}
+
+pub fn apply_patch(root: impl AsRef<Path>, patch_path: impl AsRef<Path>) -> Result<()> {
+    let patch_path = patch_path.as_ref().to_string_lossy();
+    git_output(
+        root.as_ref(),
+        &["apply", "--whitespace=nowarn", patch_path.as_ref()],
+    )
+    .map(|_| ())
 }
 
 pub fn add_to_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<()> {
@@ -3446,6 +3569,97 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn remove_and_stop_tracking_paths_use_git_index_semantics() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-remove-stop-tracking-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("tracked.txt"), "tracked\n")?;
+        fs::write(root.join("cached.txt"), "cached\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+
+        remove_path(&root, "tracked.txt")?;
+        assert!(!root.join("tracked.txt").exists());
+        let removed_status = git_output(&root, &["status", "--short"])?;
+        assert!(removed_status.contains("D  tracked.txt"));
+
+        stop_tracking_path(&root, "cached.txt")?;
+        assert!(root.join("cached.txt").exists());
+        let cached_status = git_output(&root, &["status", "--short"])?;
+        assert!(cached_status.contains("D  cached.txt"));
+        assert!(cached_status.contains("?? cached.txt"));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn create_and_apply_worktree_patch_round_trip() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("git-agent-worktree-patch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("tracked.txt"), "before\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        fs::write(root.join("tracked.txt"), "after\n")?;
+        fs::write(root.join("new.txt"), "new file\n")?;
+
+        let patch_path = root.join("changes.patch");
+        create_worktree_patch(&root, &patch_path)?;
+        let patch = fs::read_to_string(&patch_path)?;
+        assert!(patch.contains("tracked.txt"));
+        assert!(patch.contains("new.txt"));
+
+        fs::write(root.join("tracked.txt"), "before\n")?;
+        fs::remove_file(root.join("new.txt"))?;
+        apply_patch(&root, &patch_path)?;
+
+        assert_eq!(fs::read_to_string(root.join("tracked.txt"))?, "after\n");
+        assert_eq!(fs::read_to_string(root.join("new.txt"))?, "new file\n");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_line_porcelain_blame_output() {
+        let output = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1
+author Ada Dev
+author-time 1710000000
+summary add first
+\tfirst line
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 2 2 1
+author Bob Dev
+author-time 1710000100
+summary add second
+\tsecond line
+";
+
+        let lines = parse_blame_porcelain(output);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].short_commit, "aaaaaaaa");
+        assert_eq!(lines[0].author, "Ada Dev");
+        assert_eq!(lines[0].final_line, 1);
+        assert_eq!(lines[0].summary, "add first");
+        assert_eq!(lines[0].content, "first line");
+        assert_eq!(lines[1].short_commit, "bbbbbbbb");
+        assert_eq!(lines[1].author_time, Some(1710000100));
     }
 
     #[test]

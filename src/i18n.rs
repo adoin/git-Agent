@@ -461,6 +461,14 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{8fd9}\u{4f1a}\u{91cd}\u{7f6e}\u{5df2}\u{8ddf}\u{8e2a}\u{66f4}\u{6539}\u{5e76}\u{5220}\u{9664}\u{672a}\u{8ddf}\u{8e2a}\u{6587}\u{4ef6}\u{3002}",
     ),
     (
+        "worktree.discard_untracked_warning",
+        "\u{8fd9}\u{4f1a}\u{5220}\u{9664}\u{672a}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}\u{6216}\u{76ee}\u{5f55}\u{3002}",
+    ),
+    (
+        "worktree.discard_tracked_warning",
+        "\u{8fd9}\u{4f1a}\u{4ece} HEAD \u{6062}\u{590d}\u{8be5}\u{8def}\u{5f84}\u{3002}",
+    ),
+    (
         "stash.staged_files",
         "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}",
     ),
@@ -1106,6 +1114,21 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "credentials.github_retry_failed",
         "\u{767b}\u{5f55}\u{540e}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{4ecd}\u{7136}\u{5931}\u{8d25}\u{3002}\u{8bf7}\u{68c0}\u{67e5}\u{5f53}\u{524d} HTTPS \u{51ed}\u{636e}\u{3001}GitHub \u{8d26}\u{53f7}\u{5199}\u{6743}\u{9650}\u{ff0c}\u{6216}\u{8005}\u{6539}\u{7528} SSH remote\u{3002}",
     ),
+    ("blame.title", "\u{6309}\u{884c}\u{5ba1}\u{9605}"),
+    (
+        "blame.loading",
+        "\u{6b63}\u{5728}\u{52a0}\u{8f7d}\u{6309}\u{884c}\u{5ba1}\u{9605}...",
+    ),
+    (
+        "blame.empty",
+        "\u{6ca1}\u{6709}\u{6309}\u{884c}\u{5ba1}\u{9605}\u{7ed3}\u{679c}",
+    ),
+    ("blame.path", "\u{6587}\u{4ef6}"),
+    ("blame.line", "\u{884c}"),
+    ("blame.commit", "\u{63d0}\u{4ea4}"),
+    ("blame.author", "\u{4f5c}\u{8005}"),
+    ("blame.summary", "\u{4fe1}\u{606f}"),
+    ("blame.content", "\u{5185}\u{5bb9}"),
 ];
 
 const EN: &[(&str, &str)] = &[
@@ -1705,6 +1728,14 @@ const EN: &[(&str, &str)] = &[
         "worktree.discard_all_warning",
         "This resets tracked changes and deletes untracked files.",
     ),
+    (
+        "worktree.discard_untracked_warning",
+        "This will delete the untracked file or directory.",
+    ),
+    (
+        "worktree.discard_tracked_warning",
+        "This will restore the path from HEAD.",
+    ),
     ("worktree.resolve_conflict", "Resolve conflict"),
     ("worktree.resolve_conflicts", "Resolve conflicts"),
     ("worktree.conflicts.title", "Conflicts"),
@@ -1797,6 +1828,15 @@ const EN: &[(&str, &str)] = &[
         "credentials.github_retry_failed",
         "Automatic retry after login still failed. Check the current HTTPS credential, GitHub account write permission, or switch this remote to SSH.",
     ),
+    ("blame.title", "Blame"),
+    ("blame.loading", "Loading blame..."),
+    ("blame.empty", "No blame rows"),
+    ("blame.path", "File"),
+    ("blame.line", "Line"),
+    ("blame.commit", "Commit"),
+    ("blame.author", "Author"),
+    ("blame.summary", "Summary"),
+    ("blame.content", "Content"),
     ("menu.copy_hash", "Copy commit hash"),
     ("menu.copy_short_hash", "Copy short hash"),
     ("menu.copy", "Copy"),
@@ -1992,6 +2032,23 @@ mod tests {
             "\u{63d0}\u{4ea4}\u{8be6}\u{60c5}"
         );
         assert_eq!(t(Language::Chinese, "dialog.ok"), "\u{786e}\u{5b9a}");
+        assert_eq!(
+            t(Language::Chinese, "blame.title"),
+            "\u{6309}\u{884c}\u{5ba1}\u{9605}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "worktree.discard_untracked_warning"),
+            "\u{8fd9}\u{4f1a}\u{5220}\u{9664}\u{672a}\u{8ddf}\u{8e2a}\u{7684}\u{6587}\u{4ef6}\u{6216}\u{76ee}\u{5f55}\u{3002}"
+        );
+        assert_eq!(
+            t(Language::Chinese, "worktree.discard_tracked_warning"),
+            "\u{8fd9}\u{4f1a}\u{4ece} HEAD \u{6062}\u{590d}\u{8be5}\u{8def}\u{5f84}\u{3002}"
+        );
+        assert_eq!(t(Language::English, "blame.title"), "Blame");
+        assert_eq!(
+            t(Language::English, "worktree.discard_untracked_warning"),
+            "This will delete the untracked file or directory."
+        );
         assert_eq!(
             t(Language::Chinese, "repo.source.clone"),
             "\u{514b}\u{9686}"
