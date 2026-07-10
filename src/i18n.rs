@@ -468,6 +468,57 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "worktree.discard_tracked_warning",
         "\u{8fd9}\u{4f1a}\u{4ece} HEAD \u{6062}\u{590d}\u{8be5}\u{8def}\u{5f84}\u{3002}",
     ),
+    ("patch.create.title", "\u{521b}\u{5efa}\u{8865}\u{4e01}"),
+    (
+        "patch.create.worktree_tab",
+        "\u{5de5}\u{4f5c}\u{526f}\u{672c}\u{7684}\u{53d8}\u{66f4}",
+    ),
+    (
+        "patch.create.history_tab",
+        "\u{65e5}\u{5fd7} / \u{5386}\u{53f2}",
+    ),
+    (
+        "patch.create.output_path",
+        "\u{8865}\u{4e01}\u{6587}\u{4ef6}",
+    ),
+    (
+        "patch.create.empty_worktree",
+        "\u{6ca1}\u{6709}\u{53ef}\u{521b}\u{5efa}\u{8865}\u{4e01}\u{7684}\u{5de5}\u{4f5c}\u{533a}\u{53d8}\u{66f4}\u{3002}",
+    ),
+    (
+        "patch.create.history_empty",
+        "\u{9009}\u{62e9}\u{63d0}\u{4ea4}\u{4ee5}\u{521b}\u{5efa}\u{8865}\u{4e01}\u{3002}",
+    ),
+    (
+        "patch.create.changed_files",
+        "\u{53d8}\u{66f4}\u{6587}\u{4ef6}",
+    ),
+    ("patch.create.browse", "\u{6d4f}\u{89c8}"),
+    (
+        "patch.create.separate_files",
+        "\u{4e3a}\u{6bcf}\u{4e2a}\u{63d0}\u{4ea4}\u{521b}\u{5efa}\u{5355}\u{72ec}\u{7684}\u{8865}\u{4e01}\u{6587}\u{4ef6}",
+    ),
+    ("patch.create.submit", "\u{521b}\u{5efa}\u{8865}\u{4e01}"),
+    (
+        "patch.create.no_selection",
+        "\u{8bf7}\u{81f3}\u{5c11}\u{9009}\u{62e9}\u{4e00}\u{9879}\u{3002}",
+    ),
+    (
+        "patch.create.invalid_output",
+        "\u{8bf7}\u{9009}\u{62e9}\u{6709}\u{6548}\u{7684}\u{8865}\u{4e01}\u{6587}\u{4ef6}\u{8def}\u{5f84}\u{3002}",
+    ),
+    (
+        "patch.create.running",
+        "\u{6b63}\u{5728}\u{521b}\u{5efa}\u{8865}\u{4e01}...",
+    ),
+    (
+        "patch.create.success",
+        "\u{5df2}\u{521b}\u{5efa}\u{8865}\u{4e01}\u{3002}",
+    ),
+    (
+        "patch.create.disconnected",
+        "\u{8865}\u{4e01}\u{4efb}\u{52a1}\u{610f}\u{5916}\u{505c}\u{6b62}\u{3002}",
+    ),
     (
         "stash.staged_files",
         "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}",
@@ -1736,6 +1787,36 @@ const EN: &[(&str, &str)] = &[
         "worktree.discard_tracked_warning",
         "This will restore the path from HEAD.",
     ),
+    ("patch.create.title", "Create Patch"),
+    ("patch.create.worktree_tab", "Working Copy Changes"),
+    ("patch.create.history_tab", "Log / History"),
+    ("patch.create.output_path", "Patch file"),
+    (
+        "patch.create.empty_worktree",
+        "There are no working-copy changes to include.",
+    ),
+    (
+        "patch.create.history_empty",
+        "Select commits to create a patch.",
+    ),
+    ("patch.create.changed_files", "Changed files"),
+    ("patch.create.browse", "Browse"),
+    (
+        "patch.create.separate_files",
+        "Create a separate patch file per commit",
+    ),
+    ("patch.create.submit", "Create Patch"),
+    ("patch.create.no_selection", "Select at least one item."),
+    (
+        "patch.create.invalid_output",
+        "Select a valid patch file path.",
+    ),
+    ("patch.create.running", "Creating patch..."),
+    ("patch.create.success", "Patch created."),
+    (
+        "patch.create.disconnected",
+        "The patch task stopped unexpectedly.",
+    ),
     ("worktree.resolve_conflict", "Resolve conflict"),
     ("worktree.resolve_conflicts", "Resolve conflicts"),
     ("worktree.conflicts.title", "Conflicts"),
@@ -2049,6 +2130,23 @@ mod tests {
             t(Language::English, "worktree.discard_untracked_warning"),
             "This will delete the untracked file or directory."
         );
+        for key in [
+            "patch.create.title",
+            "patch.create.worktree_tab",
+            "patch.create.history_tab",
+            "patch.create.output_path",
+            "patch.create.empty_worktree",
+            "patch.create.separate_files",
+            "patch.create.submit",
+            "patch.create.no_selection",
+            "patch.create.invalid_output",
+            "patch.create.running",
+            "patch.create.success",
+            "patch.create.disconnected",
+        ] {
+            assert_ne!(t(Language::Chinese, key), key, "missing Chinese {key}");
+            assert_ne!(t(Language::English, key), key, "missing English {key}");
+        }
         assert_eq!(
             t(Language::Chinese, "repo.source.clone"),
             "\u{514b}\u{9686}"

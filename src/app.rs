@@ -27,7 +27,10 @@ use crate::{
     },
     graph::{self, EdgeKind, GraphLayout},
     i18n::{self, Language},
-    patch::{PatchSelectionGesture, selection_gesture},
+    patch::{
+        CommitPatchSelection, CreatePatchTab, PatchPathError, PatchSelectionGesture,
+        selection_gesture, validate_patch_output_path,
+    },
     theme,
 };
 
@@ -414,6 +417,7 @@ pub struct GitAgentApp {
     pending_toolbar_single_click: Option<PendingToolbarClick>,
     pending_worktree_action: Option<WorktreeActionDialog>,
     pending_blame_action: Option<BlameActionDialog>,
+    pending_create_patch_action: Option<CreatePatchDialog>,
     pending_fetch_action: Option<FetchActionDialog>,
     pending_pull_action: Option<PullActionDialog>,
     pending_push_action: Option<PushActionDialog>,
@@ -699,6 +703,54 @@ struct BlameActionDialog {
     path: String,
     display_path: String,
     lines: Option<Vec<git::BlameLine>>,
+}
+
+#[derive(Clone, Debug)]
+struct CreatePatchDialog {
+    repo_root: PathBuf,
+    tab: CreatePatchTab,
+    output_path: String,
+    selected_worktree_paths: HashSet<String>,
+    commit_selection: CommitPatchSelection,
+    focused_commit_hash: String,
+    branch_scope: HistoryBranchScope,
+    sort_order: HistorySortOrder,
+    search: String,
+    show_remote_refs: bool,
+    separate_files: bool,
+    validation_error_key: Option<&'static str>,
+    history_cache: HistoryCommitBrowserCache,
+}
+
+impl CreatePatchDialog {
+    fn new(snapshot: &RepositorySnapshot) -> Self {
+        let selected_worktree_paths = snapshot
+            .staged
+            .iter()
+            .chain(&snapshot.unstaged)
+            .map(|file| file.path.clone())
+            .collect();
+        let focused_commit_hash = snapshot
+            .commits
+            .first()
+            .map(|commit| commit.hash.clone())
+            .unwrap_or_default();
+        Self {
+            repo_root: snapshot.root.clone(),
+            tab: CreatePatchTab::Worktree,
+            output_path: user_facing_path_string(&snapshot.root.join("patch.diff")),
+            selected_worktree_paths,
+            commit_selection: CommitPatchSelection::default(),
+            focused_commit_hash,
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            search: String::new(),
+            show_remote_refs: true,
+            separate_files: false,
+            validation_error_key: None,
+            history_cache: HistoryCommitBrowserCache::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2073,6 +2125,7 @@ impl GitAgentApp {
             pending_toolbar_single_click: None,
             pending_worktree_action: None,
             pending_blame_action: None,
+            pending_create_patch_action: None,
             pending_fetch_action: None,
             pending_pull_action: None,
             pending_push_action: None,
@@ -2282,6 +2335,7 @@ impl GitAgentApp {
 
     fn open_repository_source_tab(&mut self) {
         self.save_commit_message_draft_for_active_repo();
+        self.pending_create_patch_action = None;
         self.source_tab_open = true;
         self.active_repo_tab = None;
         self.active_view = MainView::Workspace;
@@ -2304,6 +2358,7 @@ impl GitAgentApp {
             return;
         }
         self.save_commit_message_draft_for_active_repo();
+        self.pending_create_patch_action = None;
         self.active_repo_tab = None;
         self.active_view = MainView::Workspace;
         self.commit_state = RepoCommitState::default();
@@ -2342,6 +2397,7 @@ impl GitAgentApp {
         }
         if let Some(tab) = self.repo_tabs.get(index).cloned() {
             self.save_commit_message_draft_for_active_repo();
+            self.pending_create_patch_action = None;
             self.active_repo_tab = Some(index);
             self.save_repo_tabs();
             self.load_repository(tab.root);
@@ -2383,6 +2439,7 @@ impl GitAgentApp {
         let was_active = self.active_repo_tab == Some(index);
         if was_active {
             self.save_commit_message_draft_for_active_repo();
+            self.pending_create_patch_action = None;
         }
         self.repo_tabs.remove(index);
         self.active_repo_tab = match self.active_repo_tab {
@@ -3014,19 +3071,11 @@ impl GitAgentApp {
         });
     }
 
-    fn create_worktree_patch(&mut self) {
-        let Some(root) = self.active_repo_root() else {
+    fn open_create_patch_dialog(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let Some(output_path) = rfd::FileDialog::new()
-            .set_directory(&root)
-            .set_file_name("changes.patch")
-            .add_filter("Patch", &["patch", "diff"])
-            .save_file()
-        else {
-            return;
-        };
-        self.start_remote_git_action(move |root| git::create_worktree_patch(root, &output_path));
+        self.pending_create_patch_action = Some(CreatePatchDialog::new(snapshot));
     }
 
     fn apply_patch_file(&mut self) {
@@ -5203,6 +5252,7 @@ impl App for GitAgentApp {
         self.commit_action_modal(ctx);
         self.worktree_action_modal(ctx);
         self.blame_action_modal(ctx);
+        self.create_patch_action_modal(ctx);
         self.fetch_action_modal(ctx);
         self.pull_action_modal(ctx);
         self.push_action_modal(ctx);
@@ -6021,16 +6071,12 @@ impl GitAgentApp {
                 }
                 if menu_text_button(
                     ui,
-                    git_dialog_enabled
-                        && self
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| !snapshot.status.is_empty()),
+                    git_dialog_enabled,
                     menu_label(self.language, "actions_create_patch"),
                 )
                 .clicked()
                 {
-                    self.create_worktree_patch();
+                    self.open_create_patch_dialog();
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -10662,6 +10708,218 @@ impl GitAgentApp {
             self.blame_task = None;
         } else {
             self.pending_blame_action = Some(dialog);
+        }
+    }
+
+    fn create_patch_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.pending_create_patch_action.take() else {
+            return;
+        };
+        if !self.active_repo_root_matches(&dialog.repo_root) {
+            return;
+        }
+
+        let worktree_files = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &dialog.repo_root))
+            .map(|snapshot| {
+                let mut files = BTreeMap::new();
+                for file in snapshot.staged.iter().chain(&snapshot.unstaged) {
+                    files
+                        .entry(file.path.clone())
+                        .or_insert_with(|| file.clone());
+                }
+                files.into_values().collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let actions_enabled = !self.branch_actions_busy();
+        let mut close_after = false;
+        let mut request = None;
+
+        compact_action_dialog(ctx, self.tr("patch.create.title"), 960.0, |ui| {
+            ui.horizontal(|ui| {
+                if AppButton::repo_tab(
+                    UiIcon::Workspace,
+                    self.tr("patch.create.worktree_tab"),
+                    dialog.tab == CreatePatchTab::Worktree,
+                )
+                .show(ui)
+                .clicked()
+                {
+                    dialog.tab = CreatePatchTab::Worktree;
+                    dialog.validation_error_key = None;
+                }
+                if AppButton::repo_tab(
+                    UiIcon::History,
+                    self.tr("patch.create.history_tab"),
+                    dialog.tab == CreatePatchTab::History,
+                )
+                .show(ui)
+                .clicked()
+                {
+                    dialog.tab = CreatePatchTab::History;
+                    dialog.validation_error_key = None;
+                }
+            });
+
+            ui.add_space(8.0);
+            match dialog.tab {
+                CreatePatchTab::Worktree => {
+                    if worktree_files.is_empty() {
+                        ui.allocate_ui(Vec2::new(ui.available_width(), 260.0), |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new(self.tr("patch.create.empty_worktree"))
+                                        .color(theme::muted()),
+                                );
+                            });
+                        });
+                    } else {
+                        let mut all_selected = worktree_files.iter().all(|file| {
+                            dialog.selected_worktree_paths.contains(file.path.as_str())
+                        });
+                        let selected_label = format!(
+                            "{} ({}/{})",
+                            self.tr("patch.create.changed_files"),
+                            dialog.selected_worktree_paths.len(),
+                            worktree_files.len()
+                        );
+                        if action_checkbox(ui, &mut all_selected, &selected_label).changed() {
+                            if all_selected {
+                                dialog
+                                    .selected_worktree_paths
+                                    .extend(worktree_files.iter().map(|file| file.path.clone()));
+                            } else {
+                                dialog.selected_worktree_paths.clear();
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .id_salt("create_patch_worktree_files")
+                            .max_height(330.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for file in &worktree_files {
+                                    let mut selected =
+                                        dialog.selected_worktree_paths.contains(file.path.as_str());
+                                    if action_checkbox(ui, &mut selected, &file.display_path)
+                                        .changed()
+                                    {
+                                        if selected {
+                                            dialog
+                                                .selected_worktree_paths
+                                                .insert(file.path.clone());
+                                        } else {
+                                            dialog.selected_worktree_paths.remove(&file.path);
+                                        }
+                                    }
+                                }
+                            });
+                    }
+                }
+                CreatePatchTab::History => {
+                    ui.allocate_ui(Vec2::new(ui.available_width(), 300.0), |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new(self.tr("patch.create.history_empty"))
+                                    .color(theme::muted()),
+                            );
+                        });
+                    });
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [96.0, 24.0],
+                    egui::Label::new(
+                        RichText::new(self.tr("patch.create.output_path")).color(theme::text()),
+                    ),
+                );
+                let hint =
+                    placeholder_for_label(self.language, self.tr("patch.create.output_path"));
+                themed_text_edit_selection(ui);
+                ui.add_sized(
+                    [(ui.available_width() - 42.0).max(120.0), 24.0],
+                    themed_singleline_text_edit(&mut dialog.output_path, &hint),
+                );
+                if ui
+                    .add_enabled(actions_enabled, egui::Button::new("..."))
+                    .on_hover_text(self.tr("patch.create.browse"))
+                    .clicked()
+                {
+                    let picker = rfd::FileDialog::new()
+                        .set_directory(&dialog.repo_root)
+                        .set_file_name("patch.diff")
+                        .add_filter("Patch", &["patch", "diff"]);
+                    if let Some(path) = picker.save_file() {
+                        dialog.output_path = user_facing_path_string(&path);
+                        dialog.validation_error_key = None;
+                    }
+                }
+            });
+
+            if dialog.tab == CreatePatchTab::History {
+                action_checkbox(
+                    ui,
+                    &mut dialog.separate_files,
+                    self.tr("patch.create.separate_files"),
+                );
+            }
+
+            if let Some(error_key) = dialog.validation_error_key {
+                ui.add_space(4.0);
+                ui.label(RichText::new(self.tr(error_key)).color(theme::warning()));
+            }
+
+            let no_selection = match dialog.tab {
+                CreatePatchTab::Worktree => dialog.selected_worktree_paths.is_empty(),
+                CreatePatchTab::History => dialog.commit_selection.is_empty(),
+            };
+            let output_path = PathBuf::from(dialog.output_path.trim());
+            let path_valid = validate_patch_output_path(&output_path).is_ok();
+            let can_submit = actions_enabled && !no_selection && path_valid;
+
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                    close_after = true;
+                }
+                if dialog_primary_button(ui, self.tr("patch.create.submit"), can_submit).clicked() {
+                    if no_selection {
+                        dialog.validation_error_key = Some("patch.create.no_selection");
+                    } else if let Err(error) = validate_patch_output_path(&output_path) {
+                        dialog.validation_error_key = Some(match error {
+                            PatchPathError::Empty
+                            | PatchPathError::Directory
+                            | PatchPathError::MissingParent => "patch.create.invalid_output",
+                        });
+                    } else {
+                        request = Some(match dialog.tab {
+                            CreatePatchTab::Worktree => git::CreatePatchRequest::Worktree {
+                                output_path,
+                                paths: dialog.selected_worktree_paths.iter().cloned().collect(),
+                            },
+                            CreatePatchTab::History => git::CreatePatchRequest::Commits {
+                                output_path,
+                                hashes: dialog.commit_selection.ordered(),
+                                separate: dialog.separate_files,
+                            },
+                        });
+                        close_after = true;
+                    }
+                }
+            });
+        });
+
+        if let Some(request) = request {
+            self.start_remote_git_action(move |root| git::create_patch(root, &request).map(|_| ()));
+        }
+        if !close_after {
+            self.pending_create_patch_action = Some(dialog);
         }
     }
 
@@ -25225,6 +25483,35 @@ mod ui_tests {
     }
 
     #[test]
+    fn create_patch_menu_is_enabled_for_clean_repository() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation
+            .find("menu_label(self.language, \"actions_create_patch\")")
+            .unwrap();
+        let menu =
+            &implementation[start.saturating_sub(320)..(start + 520).min(implementation.len())];
+        assert!(!menu.contains("snapshot.status.is_empty"));
+        assert!(implementation.contains("self.pending_create_patch_action = Some("));
+    }
+
+    #[test]
+    fn create_patch_dialog_has_two_localized_tabs_and_selected_worktree_paths() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        for required in [
+            "CreatePatchTab::Worktree",
+            "CreatePatchTab::History",
+            "patch.create.worktree_tab",
+            "patch.create.history_tab",
+            "selected_worktree_paths",
+            "create_patch_action_modal(ctx)",
+        ] {
+            assert!(implementation.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
     fn layout_uses_custom_titlebar_and_no_side_panel_splitters() {
         let source = include_str!("app.rs");
         assert!(source.contains("ViewportCommand::StartDrag"));
@@ -28086,7 +28373,7 @@ mod ui_tests {
             "self.open_selected_worktree_external_diff();",
             "self.open_selected_worktree_history();",
             "self.open_selected_worktree_blame();",
-            "self.create_worktree_patch();",
+            "self.open_create_patch_dialog();",
             "self.apply_patch_file();",
             "self.copy_selected_worktree_file_path(ui.ctx());",
             "WorktreeMenuAction::Remove",
@@ -28145,16 +28432,15 @@ mod ui_tests {
         }
 
         let patch_start = implementation_source
-            .find("fn create_worktree_patch(")
+            .find("fn open_create_patch_dialog(")
             .unwrap();
         let patch_end = implementation_source[patch_start..]
             .find("fn apply_patch_file(")
             .unwrap();
         let patch_source = &implementation_source[patch_start..patch_start + patch_end];
-        for required in [
-            "rfd::FileDialog::new()",
-            "git::create_worktree_patch(root, &output_path)",
-        ] {
+        for required in
+            ["self.pending_create_patch_action = Some(CreatePatchDialog::new(snapshot))"]
+        {
             assert!(patch_source.contains(required), "{required}");
         }
 
