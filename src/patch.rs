@@ -243,4 +243,24 @@ mod tests {
             Err(PatchPathError::Directory)
         );
     }
+
+    #[test]
+    fn modifier_mapping_matches_windows_multi_selection() {
+        assert_eq!(
+            selection_gesture(false, false),
+            PatchSelectionGesture::Plain
+        );
+        assert_eq!(
+            selection_gesture(true, false),
+            PatchSelectionGesture::Toggle
+        );
+        assert_eq!(
+            selection_gesture(false, true),
+            PatchSelectionGesture::ReplaceRange
+        );
+        assert_eq!(
+            selection_gesture(true, true),
+            PatchSelectionGesture::AddRange
+        );
+    }
 }

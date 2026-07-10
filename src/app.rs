@@ -27,6 +27,7 @@ use crate::{
     },
     graph::{self, EdgeKind, GraphLayout},
     i18n::{self, Language},
+    patch::{PatchSelectionGesture, selection_gesture},
     theme,
 };
 
@@ -7910,13 +7911,15 @@ impl GitAgentApp {
         }
 
         ui.add_space(4.0);
-        if history_table_header(
+        let (prefs_changed, _) = history_table_header(
             ui,
             self.language,
             graph_width,
             &mut self.layout_prefs,
             self.history_cherry_pick_mode,
-        ) {
+            None,
+        );
+        if prefs_changed {
             self.layout_prefs.save();
         }
 
@@ -10926,6 +10929,7 @@ impl GitAgentApp {
                         show_jump: false,
                         show_context_menu: false,
                         select_rows: true,
+                        multi_select: false,
                         max_height: Some(300.0),
                     },
                 );
@@ -12118,6 +12122,7 @@ impl GitAgentApp {
                     show_jump: false,
                     show_context_menu: false,
                     select_rows: false,
+                    multi_select: false,
                     max_height: Some(300.0),
                 },
             );
@@ -12764,6 +12769,7 @@ impl GitAgentApp {
                                         show_jump: false,
                                         show_context_menu: false,
                                         select_rows: false,
+                                        multi_select: false,
                                         max_height: Some(300.0),
                                     },
                                 );
@@ -17081,7 +17087,8 @@ fn history_table_header(
     graph_width: f32,
     prefs: &mut LayoutPrefs,
     select_for_cherry_pick: bool,
-) -> bool {
+    selection_header_checked: Option<bool>,
+) -> (bool, bool) {
     let width = ui.available_width();
     let selection_width = if select_for_cherry_pick { 30.0 } else { 0.0 };
     let cols = history_column_widths(width - selection_width, graph_width, prefs);
@@ -17109,7 +17116,16 @@ fn history_table_header(
 
     let mut x = rect.left() + 8.0;
     let y = rect.center().y;
+    let mut toggle_all_visible = false;
     if select_for_cherry_pick {
+        if let Some(checked) = selection_header_checked {
+            let checkbox_rect = Rect::from_center_size(
+                Pos2::new(rect.left() + selection_width / 2.0, y),
+                Vec2::splat(16.0),
+            );
+            toggle_all_visible =
+                history_cherry_pick_checkbox_at(ui, checkbox_rect, checked).clicked();
+        }
         x += selection_width;
     }
     for (label, col_w) in [
@@ -17183,7 +17199,7 @@ fn history_table_header(
             }
         }
     }
-    changed
+    (changed, toggle_all_visible)
 }
 
 fn adjust_history_graph_width(
@@ -17248,6 +17264,7 @@ struct HistoryCommitBrowserConfig {
     show_jump: bool,
     show_context_menu: bool,
     select_rows: bool,
+    multi_select: bool,
     max_height: Option<f32>,
 }
 
@@ -17261,9 +17278,16 @@ impl Default for HistoryCommitBrowserConfig {
             show_jump: true,
             show_context_menu: true,
             select_rows: false,
+            multi_select: false,
             max_height: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct HistorySelectionIntent {
+    hash: String,
+    gesture: PatchSelectionGesture,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -17274,6 +17298,9 @@ struct HistoryCommitBrowserOutcome {
     context_menu_action: Option<CommitMenuAction>,
     search_changed: bool,
     prefs_changed: bool,
+    selection_intent: Option<HistorySelectionIntent>,
+    toggle_all_visible: bool,
+    visible_hashes: Vec<String>,
 }
 
 fn history_commit_browser(
@@ -17396,9 +17423,28 @@ fn history_commit_browser(
     let lane_count = layout.lanes.max(1);
     let graph_width = history_graph_width(ui.available_width(), lane_count, prefs);
     let visible_indexes = &cache.visible_indexes;
-    if history_table_header(ui, language, graph_width, prefs, config.select_rows) {
+    outcome.visible_hashes = visible_indexes
+        .iter()
+        .filter_map(|index| commits.get(*index).map(|commit| commit.hash.clone()))
+        .collect();
+    let selectable_rows = config.select_rows || config.multi_select;
+    let all_visible_selected = !outcome.visible_hashes.is_empty()
+        && outcome
+            .visible_hashes
+            .iter()
+            .all(|hash| selected_cherry_pick_hashes.contains(hash));
+    let (prefs_changed, toggle_all_visible) = history_table_header(
+        ui,
+        language,
+        graph_width,
+        prefs,
+        selectable_rows,
+        config.multi_select.then_some(all_visible_selected),
+    );
+    if prefs_changed {
         outcome.prefs_changed = true;
     }
+    outcome.toggle_all_visible = toggle_all_visible;
 
     if visible_indexes.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -17451,15 +17497,29 @@ fn history_commit_browser(
                         *show_remote_refs,
                         show_branch_refs,
                         show_tag_refs,
-                        config.select_rows,
+                        selectable_rows,
                         cherry_pick_selected,
                         disabled,
                     );
                     outcome.hash_copied |= copied_hash;
                     if select_for_cherry_pick {
-                        outcome.toggled_cherry_pick_hash = Some(commit.hash.clone());
+                        if config.multi_select {
+                            outcome.selection_intent = Some(HistorySelectionIntent {
+                                hash: commit.hash.clone(),
+                                gesture: PatchSelectionGesture::Toggle,
+                            });
+                        } else {
+                            outcome.toggled_cherry_pick_hash = Some(commit.hash.clone());
+                        }
                     } else if !disabled && response.clicked() {
                         outcome.picked_commit = Some(commit.clone());
+                        if config.multi_select {
+                            let modifiers = ui.input(|input| input.modifiers);
+                            outcome.selection_intent = Some(HistorySelectionIntent {
+                                hash: commit.hash.clone(),
+                                gesture: selection_gesture(modifiers.ctrl, modifiers.shift),
+                            });
+                        }
                     }
                     if config.show_context_menu {
                         response.context_menu(|ui| {
@@ -25152,6 +25212,16 @@ mod ui_tests {
             menu_label(Language::Chinese, "options"),
             "\u{9009}\u{9879}(O)"
         );
+    }
+
+    #[test]
+    fn history_browser_exposes_multi_select_without_duplicating_table() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation.contains("selection_intent: Option<HistorySelectionIntent>"));
+        assert!(implementation.contains("history_commit_browser("));
+        assert!(implementation.contains("config.multi_select"));
+        assert!(!implementation.contains("fn create_patch_history_table("));
     }
 
     #[test]
