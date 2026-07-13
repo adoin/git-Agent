@@ -2867,13 +2867,6 @@ impl GitAgentApp {
                         .and_then(shortcut_stage_toggle_action)
                         .is_some()
             }
-            ActionsMenuCommand::CommitStaged => {
-                git_dialog_enabled
-                    && self
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| !snapshot.staged.is_empty())
-            }
         }
     }
 
@@ -2903,10 +2896,6 @@ impl GitAgentApp {
             }
             ActionsMenuCommand::ToggleStageRepository => {
                 self.stage_toggle_current_repository();
-            }
-            ActionsMenuCommand::CommitStaged => {
-                self.active_view = MainView::Workspace;
-                self.focus_commit_message = true;
             }
             ActionsMenuCommand::DiscardSelected => {
                 if let Some(file) = self.selected_worktree_action_state() {
@@ -6340,13 +6329,13 @@ impl GitAgentApp {
                 }
                 if menu_shortcut_button(
                     ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::CommitStaged),
-                    menu_label(self.language, "actions_commit_staged"),
-                    "Shift+Alt+C",
+                    self.actions_menu_command_enabled(ActionsMenuCommand::ToggleStageRepository),
+                    stage_toggle_menu_label(self.language, self.snapshot.as_ref()),
+                    "Ctrl+Shift+C",
                 )
                 .clicked()
                 {
-                    self.execute_actions_menu_command(ActionsMenuCommand::CommitStaged);
+                    self.execute_actions_menu_command(ActionsMenuCommand::ToggleStageRepository);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
@@ -14730,7 +14719,6 @@ enum ActionsMenuCommand {
     RemoveSelected,
     UnstageSelected,
     ToggleStageRepository,
-    CommitStaged,
     DiscardSelected,
     SelectedHistory,
     LineReview,
@@ -17028,8 +17016,9 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "actions_add_remove") => "\u{6dfb}\u{52a0}/\u{5220}\u{9664}",
         (Language::Chinese, "actions_stop_tracking") => "\u{505c}\u{6b62}\u{8ddf}\u{8e2a}",
         (Language::Chinese, "actions_ignore") => "\u{5ffd}\u{7565}",
-        (Language::Chinese, "actions_commit_staged") => {
-            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}"
+        (Language::Chinese, "actions_stage_all") => "\u{6682}\u{5b58}\u{5168}\u{90e8}",
+        (Language::Chinese, "actions_unstage_all") => {
+            "\u{53d6}\u{6d88}\u{5168}\u{90e8}\u{6682}\u{5b58}"
         }
         (Language::Chinese, "actions_discard_selected") => "\u{4e22}\u{5f03}\u{9009}\u{4e2d}",
         (Language::Chinese, "actions_rebase_continue") => "\u{7ee7}\u{7eed}\u{53d8}\u{57fa}",
@@ -17127,7 +17116,8 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "actions_add_remove") => "Add/Remove",
         (_, "actions_stop_tracking") => "Stop Tracking",
         (_, "actions_ignore") => "Ignore",
-        (_, "actions_commit_staged") => "Commit Staged Changes",
+        (_, "actions_stage_all") => "Stage All",
+        (_, "actions_unstage_all") => "Unstage All",
         (_, "actions_discard_selected") => "Discard Selected",
         (_, "actions_rebase_continue") => "Continue Rebase",
         (_, "actions_rebase_abort") => "Abort Rebase",
@@ -23506,7 +23496,7 @@ fn actions_menu_command_for_shortcut(
         (true, true, true, egui::Key::Plus | egui::Key::Equals) => {
             Some(ActionsMenuCommand::ToggleStageRepository)
         }
-        (false, true, true, egui::Key::C) => Some(ActionsMenuCommand::CommitStaged),
+        (true, true, false, egui::Key::C) => Some(ActionsMenuCommand::ToggleStageRepository),
         (true, true, false, egui::Key::R) => Some(ActionsMenuCommand::DiscardSelected),
         (false, true, true, egui::Key::L) => Some(ActionsMenuCommand::SelectedHistory),
         (false, true, true, egui::Key::B) => Some(ActionsMenuCommand::LineReview),
@@ -23536,6 +23526,16 @@ fn shortcut_stage_toggle_action(snapshot: &RepositorySnapshot) -> Option<Worktre
         Some(WorktreeMenuAction::UnstageAll)
     } else {
         None
+    }
+}
+
+fn stage_toggle_menu_label(
+    language: Language,
+    snapshot: Option<&RepositorySnapshot>,
+) -> &'static str {
+    match snapshot.and_then(shortcut_stage_toggle_action) {
+        Some(WorktreeMenuAction::UnstageAll) => menu_label(language, "actions_unstage_all"),
+        _ => menu_label(language, "actions_stage_all"),
     }
 }
 
@@ -28929,7 +28929,7 @@ mod ui_tests {
             "actions_add_remove",
             "actions_stop_tracking",
             "actions_ignore",
-            "actions_commit_staged",
+            "stage_toggle_menu_label",
             "actions_discard_selected",
             "actions_rebase_continue",
             "actions_rebase_abort",
@@ -28946,7 +28946,7 @@ mod ui_tests {
             "\"Ctrl+Del\"",
             "\"Ctrl+Shift+Minus\"",
             "\"Ctrl+Shift+Alt+Plus\"",
-            "\"Shift+Alt+C\"",
+            "\"Ctrl+Shift+C\"",
             "\"Shift+Ctrl+R\"",
             "\"Shift+Alt+L\"",
             "\"Shift+Alt+B\"",
@@ -28960,7 +28960,6 @@ mod ui_tests {
             "ActionsMenuCommand::RemoveSelected",
             "ActionsMenuCommand::UnstageSelected",
             "ActionsMenuCommand::ToggleStageRepository",
-            "ActionsMenuCommand::CommitStaged",
             "ActionsMenuCommand::DiscardSelected",
             "ActionsMenuCommand::SelectedHistory",
             "ActionsMenuCommand::LineReview",
@@ -28973,6 +28972,13 @@ mod ui_tests {
             "selected_or_first_conflict_path",
         ] {
             assert!(actions_source.contains(required), "{required}");
+        }
+        for removed in [
+            "actions_commit_staged",
+            "\"Shift+Alt+C\"",
+            "ActionsMenuCommand::CommitStaged",
+        ] {
+            assert!(!actions_source.contains(removed), "{removed}");
         }
         assert!(!actions_source.contains("branch.local"));
         assert!(!actions_source.contains("tag.title"));
@@ -29014,7 +29020,8 @@ mod ui_tests {
             "actions_create_patch",
             "actions_apply_patch",
             "actions_ignore",
-            "actions_commit_staged",
+            "actions_stage_all",
+            "actions_unstage_all",
             "actions_discard_selected",
             "actions_configure_custom",
             "actions_selected_history",
@@ -29086,9 +29093,9 @@ mod ui_tests {
                 ActionsMenuCommand::ToggleStageRepository,
             ),
             (
-                modifiers(false, true, true),
+                modifiers(true, true, false),
                 egui::Key::C,
-                ActionsMenuCommand::CommitStaged,
+                ActionsMenuCommand::ToggleStageRepository,
             ),
             (
                 modifiers(true, true, false),
@@ -31171,6 +31178,14 @@ mod ui_tests {
             shortcut_stage_toggle_action(&snapshot),
             Some(WorktreeMenuAction::StageAll)
         ));
+        assert_eq!(
+            stage_toggle_menu_label(Language::Chinese, Some(&snapshot)),
+            "\u{6682}\u{5b58}\u{5168}\u{90e8}"
+        );
+        assert_eq!(
+            stage_toggle_menu_label(Language::English, Some(&snapshot)),
+            "Stage All"
+        );
 
         snapshot.staged = vec![staged_file.clone()];
         snapshot.unstaged = Vec::new();
@@ -31178,6 +31193,14 @@ mod ui_tests {
             shortcut_stage_toggle_action(&snapshot),
             Some(WorktreeMenuAction::UnstageAll)
         ));
+        assert_eq!(
+            stage_toggle_menu_label(Language::Chinese, Some(&snapshot)),
+            "\u{53d6}\u{6d88}\u{5168}\u{90e8}\u{6682}\u{5b58}"
+        );
+        assert_eq!(
+            stage_toggle_menu_label(Language::English, Some(&snapshot)),
+            "Unstage All"
+        );
 
         snapshot.unstaged = vec![unstaged_file];
         assert!(matches!(
@@ -31188,6 +31211,10 @@ mod ui_tests {
         snapshot.staged = Vec::new();
         snapshot.unstaged = Vec::new();
         assert!(shortcut_stage_toggle_action(&snapshot).is_none());
+        assert_eq!(
+            stage_toggle_menu_label(Language::Chinese, Some(&snapshot)),
+            "\u{6682}\u{5b58}\u{5168}\u{90e8}"
+        );
     }
 
     #[test]
