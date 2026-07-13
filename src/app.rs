@@ -16942,8 +16942,8 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         }
         (Language::Chinese, "show_tag_labels") => "\u{663e}\u{793a} Tag \u{6807}\u{7b7e}",
         (Language::Chinese, "repo_status_unloaded") => "\u{672a}\u{52a0}\u{8f7d}\u{72b6}\u{6001}",
-        (Language::Chinese, "repo_settings") => "\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}...",
-        (Language::Chinese, "repo_details") => "\u{4ed3}\u{5e93}\u{8be6}\u{60c5}...",
+        (Language::Chinese, "repo_settings") => "\u{4ed3}\u{5e93}\u{8bbe}\u{7f6e}",
+        (Language::Chinese, "repo_details") => "\u{4ed3}\u{5e93}\u{8be6}\u{60c5}",
         (Language::Chinese, "repo_refresh_remote_status") => {
             "\u{5237}\u{65b0}\u{8fdc}\u{7a0b}\u{4ed3}\u{5e93}\u{72b6}\u{6001}"
         }
@@ -16953,27 +16953,27 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "repo_stage_toggle") => {
             "\u{6682}\u{5b58}\u{6240}\u{6709}/\u{53d6}\u{6d88}\u{6682}\u{5b58}\u{6240}\u{6709}"
         }
-        (Language::Chinese, "repo_commit_all") => "\u{63d0}\u{4ea4}\u{6240}\u{6709}...",
+        (Language::Chinese, "repo_commit_all") => "\u{63d0}\u{4ea4}\u{6240}\u{6709}",
         (Language::Chinese, "repo_commit_staged") => {
-            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}..."
+            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}"
         }
-        (Language::Chinese, "repo_discard") => "\u{4e22}\u{5f03}...",
-        (Language::Chinese, "repo_stash_changes") => "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}...",
-        (Language::Chinese, "repo_push") => "\u{63a8}\u{9001}...",
-        (Language::Chinese, "repo_pull") => "\u{62c9}\u{53d6}...",
-        (Language::Chinese, "repo_fetch") => "\u{83b7}\u{53d6}...",
-        (Language::Chinese, "repo_checkout") => "\u{68c0}\u{51fa}...",
-        (Language::Chinese, "repo_branch") => "\u{5206}\u{652f}...",
-        (Language::Chinese, "repo_merge") => "\u{5408}\u{5e76}...",
-        (Language::Chinese, "repo_tag") => "\u{6807}\u{7b7e}...",
-        (Language::Chinese, "repo_archive") => "\u{5b58}\u{6863}...",
+        (Language::Chinese, "repo_discard") => "\u{4e22}\u{5f03}",
+        (Language::Chinese, "repo_stash_changes") => "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}",
+        (Language::Chinese, "repo_push") => "\u{63a8}\u{9001}",
+        (Language::Chinese, "repo_pull") => "\u{62c9}\u{53d6}",
+        (Language::Chinese, "repo_fetch") => "\u{83b7}\u{53d6}",
+        (Language::Chinese, "repo_checkout") => "\u{68c0}\u{51fa}",
+        (Language::Chinese, "repo_branch") => "\u{5206}\u{652f}",
+        (Language::Chinese, "repo_merge") => "\u{5408}\u{5e76}",
+        (Language::Chinese, "repo_tag") => "\u{6807}\u{7b7e}",
+        (Language::Chinese, "repo_archive") => "\u{5b58}\u{6863}",
         (Language::Chinese, "repo_interactive_rebase") => {
-            "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}..."
+            "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}"
         }
-        (Language::Chinese, "repo_add_remote") => "\u{6dfb}\u{52a0}\u{8fdc}\u{7aef}...",
-        (Language::Chinese, "repo_add_submodule") => "\u{6dfb}\u{52a0}\u{5b50}\u{6a21}\u{5757}...",
+        (Language::Chinese, "repo_add_remote") => "\u{6dfb}\u{52a0}\u{8fdc}\u{7aef}",
+        (Language::Chinese, "repo_add_submodule") => "\u{6dfb}\u{52a0}\u{5b50}\u{6a21}\u{5757}",
         (Language::Chinese, "repo_add_link_subtree") => {
-            "\u{6dfb}\u{52a0}/\u{94fe}\u{63a5}\u{5b50}\u{6811}..."
+            "\u{6dfb}\u{52a0}/\u{94fe}\u{63a5}\u{5b50}\u{6811}"
         }
         (Language::Chinese, "repo_git_lfs") => "Git LFS",
         (Language::Chinese, "repo_lfs_initialize") => "\u{521d}\u{59cb}\u{5316}\u{4ed3}\u{5e93}",
@@ -17005,12 +17005,12 @@ fn menu_label(language: Language, key: &str) -> &'static str {
             "\u{5b8c}\u{6210}\u{4fee}\u{590d}\u{8865}\u{4e01}"
         }
         (Language::Chinese, "repo_create_pull_request") => {
-            "\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}..."
+            "\u{521b}\u{5efa}\u{62c9}\u{53d6}\u{8bf7}\u{6c42}"
         }
         (Language::Chinese, "repo_benchmark_performance") => {
             "\u{4ed3}\u{5e93}\u{6027}\u{80fd}\u{57fa}\u{51c6}\u{6d4b}\u{8bd5}"
         }
-        (Language::Chinese, "actions_open") => "\u{6253}\u{5f00}(O)...",
+        (Language::Chinese, "actions_open") => "\u{6253}\u{5f00}(O)",
         (Language::Chinese, "actions_show_in_file_manager") => {
             "\u{5728}\u{8d44}\u{6e90}\u{7ba1}\u{7406}\u{5668}\u{91cc}\u{663e}\u{793a}"
         }
@@ -17020,30 +17020,30 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "actions_external_diff") => {
             "\u{5916}\u{90e8}\u{5dee}\u{5f02}\u{6bd4}\u{8f83}"
         }
-        (Language::Chinese, "actions_create_patch") => "\u{521b}\u{5efa}\u{8865}\u{4e01}...",
-        (Language::Chinese, "actions_apply_patch") => "\u{5e94}\u{7528}\u{8865}\u{4e01}...",
+        (Language::Chinese, "actions_create_patch") => "\u{521b}\u{5efa}\u{8865}\u{4e01}",
+        (Language::Chinese, "actions_apply_patch") => "\u{5e94}\u{7528}\u{8865}\u{4e01}",
         (Language::Chinese, "actions_add") => "\u{6dfb}\u{52a0}",
         (Language::Chinese, "actions_remove") => "\u{79fb}\u{9664}",
         (Language::Chinese, "actions_unstage") => "\u{53d6}\u{6d88}\u{7d22}\u{5f15}",
         (Language::Chinese, "actions_add_remove") => "\u{6dfb}\u{52a0}/\u{5220}\u{9664}",
         (Language::Chinese, "actions_stop_tracking") => "\u{505c}\u{6b62}\u{8ddf}\u{8e2a}",
-        (Language::Chinese, "actions_ignore") => "\u{5ffd}\u{7565}...",
+        (Language::Chinese, "actions_ignore") => "\u{5ffd}\u{7565}",
         (Language::Chinese, "actions_commit_staged") => {
-            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}..."
+            "\u{63d0}\u{4ea4}\u{5df2}\u{6682}\u{5b58}\u{7684}\u{6539}\u{53d8}"
         }
-        (Language::Chinese, "actions_discard_selected") => "\u{4e22}\u{5f03}\u{9009}\u{4e2d}...",
+        (Language::Chinese, "actions_discard_selected") => "\u{4e22}\u{5f03}\u{9009}\u{4e2d}",
         (Language::Chinese, "actions_rebase_continue") => "\u{7ee7}\u{7eed}\u{53d8}\u{57fa}",
         (Language::Chinese, "actions_rebase_abort") => "\u{4e2d}\u{6b62}\u{53d8}\u{57fa}",
         (Language::Chinese, "actions_resolve_conflicts") => "\u{89e3}\u{51b3}\u{51b2}\u{7a81}",
         (Language::Chinese, "actions_custom") => "\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}",
         (Language::Chinese, "actions_configure_custom") => {
-            "\u{914d}\u{7f6e}\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}..."
+            "\u{914d}\u{7f6e}\u{81ea}\u{5b9a}\u{4e49}\u{64cd}\u{4f5c}"
         }
         (Language::Chinese, "actions_selected_history") => {
-            "\u{9009}\u{5b9a}\u{9879}\u{76ee}\u{7684}\u{53d8}\u{66f4}\u{5386}\u{53f2}..."
+            "\u{9009}\u{5b9a}\u{9879}\u{76ee}\u{7684}\u{53d8}\u{66f4}\u{5386}\u{53f2}"
         }
         (Language::Chinese, "actions_line_review") => {
-            "\u{6309}\u{884c}\u{5ba1}\u{9605}\u{9009}\u{5b9a}\u{9879}\u{76ee}..."
+            "\u{6309}\u{884c}\u{5ba1}\u{9605}\u{9009}\u{5b9a}\u{9879}\u{76ee}"
         }
         (Language::Chinese, "actions_copy") => "\u{590d}\u{5236}",
         (Language::Chinese, "custom_actions_hint") => {
@@ -17077,27 +17077,27 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "show_branch_labels") => "Show Branch Labels",
         (_, "show_tag_labels") => "Show Tag Labels",
         (_, "repo_status_unloaded") => "Status not loaded",
-        (_, "repo_settings") => "Repository Settings...",
-        (_, "repo_details") => "Repository Details...",
+        (_, "repo_settings") => "Repository Settings",
+        (_, "repo_details") => "Repository Details",
         (_, "repo_refresh_remote_status") => "Refresh Remote Status",
         (_, "repo_view_online") => "View repository online",
         (_, "repo_stage_toggle") => "Stage/Unstage All",
-        (_, "repo_commit_all") => "Commit All...",
-        (_, "repo_commit_staged") => "Commit Staged Changes...",
-        (_, "repo_discard") => "Discard...",
-        (_, "repo_stash_changes") => "Stash Changes...",
-        (_, "repo_push") => "Push...",
-        (_, "repo_pull") => "Pull...",
-        (_, "repo_fetch") => "Fetch...",
-        (_, "repo_checkout") => "Checkout...",
-        (_, "repo_branch") => "Branch...",
-        (_, "repo_merge") => "Merge...",
-        (_, "repo_tag") => "Tag...",
-        (_, "repo_archive") => "Archive...",
-        (_, "repo_interactive_rebase") => "Interactive Rebase...",
-        (_, "repo_add_remote") => "Add Remote...",
-        (_, "repo_add_submodule") => "Add Submodule...",
-        (_, "repo_add_link_subtree") => "Add/Link Subtree...",
+        (_, "repo_commit_all") => "Commit All",
+        (_, "repo_commit_staged") => "Commit Staged Changes",
+        (_, "repo_discard") => "Discard",
+        (_, "repo_stash_changes") => "Stash Changes",
+        (_, "repo_push") => "Push",
+        (_, "repo_pull") => "Pull",
+        (_, "repo_fetch") => "Fetch",
+        (_, "repo_checkout") => "Checkout",
+        (_, "repo_branch") => "Branch",
+        (_, "repo_merge") => "Merge",
+        (_, "repo_tag") => "Tag",
+        (_, "repo_archive") => "Archive",
+        (_, "repo_interactive_rebase") => "Interactive Rebase",
+        (_, "repo_add_remote") => "Add Remote",
+        (_, "repo_add_submodule") => "Add Submodule",
+        (_, "repo_add_link_subtree") => "Add/Link Subtree",
         (_, "repo_git_lfs") => "Git LFS",
         (_, "repo_lfs_initialize") => "Initialize Repository",
         (_, "repo_lfs_track_untrack") => "Track/Untrack Files",
@@ -17113,29 +17113,29 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "repo_git_flow_finish_release") => "Finish Release",
         (_, "repo_git_flow_start_hotfix") => "Start New Hotfix",
         (_, "repo_git_flow_finish_hotfix") => "Finish Hotfix",
-        (_, "repo_create_pull_request") => "Create Pull Request...",
+        (_, "repo_create_pull_request") => "Create Pull Request",
         (_, "repo_benchmark_performance") => "Benchmark Repo Performance",
-        (_, "actions_open") => "Open...",
+        (_, "actions_open") => "Open",
         (_, "actions_show_in_file_manager") => "Show in File Manager",
         (_, "actions_open_terminal") => "Open in Terminal",
         (_, "actions_external_diff") => "External Diff",
-        (_, "actions_create_patch") => "Create Patch...",
-        (_, "actions_apply_patch") => "Apply Patch...",
+        (_, "actions_create_patch") => "Create Patch",
+        (_, "actions_apply_patch") => "Apply Patch",
         (_, "actions_add") => "Add",
         (_, "actions_remove") => "Remove",
         (_, "actions_unstage") => "Unstage",
         (_, "actions_add_remove") => "Add/Remove",
         (_, "actions_stop_tracking") => "Stop Tracking",
-        (_, "actions_ignore") => "Ignore...",
-        (_, "actions_commit_staged") => "Commit Staged Changes...",
-        (_, "actions_discard_selected") => "Discard Selected...",
+        (_, "actions_ignore") => "Ignore",
+        (_, "actions_commit_staged") => "Commit Staged Changes",
+        (_, "actions_discard_selected") => "Discard Selected",
         (_, "actions_rebase_continue") => "Continue Rebase",
         (_, "actions_rebase_abort") => "Abort Rebase",
         (_, "actions_resolve_conflicts") => "Resolve Conflicts",
         (_, "actions_custom") => "Custom Actions",
-        (_, "actions_configure_custom") => "Configure Custom Actions...",
-        (_, "actions_selected_history") => "Selected Item Log...",
-        (_, "actions_line_review") => "Blame Selected Item...",
+        (_, "actions_configure_custom") => "Configure Custom Actions",
+        (_, "actions_selected_history") => "Selected Item Log",
+        (_, "actions_line_review") => "Blame Selected Item",
         (_, "actions_copy") => "Copy",
         (_, "custom_actions_hint") => {
             "Configured actions appear under Actions > Custom Actions and run from the current repository root."
@@ -28883,7 +28883,7 @@ mod ui_tests {
 
         assert_eq!(
             menu_label(Language::Chinese, "repo_stash_changes"),
-            "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}..."
+            "\u{8d2e}\u{85cf}\u{53d8}\u{66f4}"
         );
         assert_eq!(
             menu_label(Language::Chinese, "repo_stage_toggle"),
@@ -28986,6 +28986,48 @@ mod ui_tests {
             menu_label(Language::English, "actions_resolve_conflicts"),
             "Resolve Conflicts"
         );
+    }
+
+    #[test]
+    fn repository_and_actions_menu_labels_have_no_ellipsis() {
+        let labels = [
+            "repo_settings",
+            "repo_details",
+            "repo_commit_all",
+            "repo_commit_staged",
+            "repo_discard",
+            "repo_stash_changes",
+            "repo_push",
+            "repo_pull",
+            "repo_fetch",
+            "repo_checkout",
+            "repo_branch",
+            "repo_merge",
+            "repo_tag",
+            "repo_archive",
+            "repo_interactive_rebase",
+            "repo_add_remote",
+            "repo_add_submodule",
+            "repo_add_link_subtree",
+            "repo_create_pull_request",
+            "actions_open",
+            "actions_create_patch",
+            "actions_apply_patch",
+            "actions_ignore",
+            "actions_commit_staged",
+            "actions_discard_selected",
+            "actions_configure_custom",
+            "actions_selected_history",
+            "actions_line_review",
+        ];
+
+        for language in [Language::Chinese, Language::English] {
+            for key in labels {
+                let label = menu_label(language, key);
+                assert!(!label.contains("..."), "{key}: {label}");
+                assert!(!label.contains('\u{2026}'), "{key}: {label}");
+            }
+        }
     }
 
     #[test]
