@@ -2839,6 +2839,88 @@ impl GitAgentApp {
         self.repo_settings_open = true;
     }
 
+    fn actions_menu_command_enabled(&self, command: ActionsMenuCommand) -> bool {
+        let has_repo = self.active_repo_tab.is_some() && self.snapshot.is_some();
+        let git_dialog_enabled = has_repo && !self.branch_actions_busy();
+        let selected = self.selected_worktree_action_state();
+
+        match command {
+            ActionsMenuCommand::OpenSelected
+            | ActionsMenuCommand::ExternalDiff
+            | ActionsMenuCommand::DiscardSelected
+            | ActionsMenuCommand::SelectedHistory => git_dialog_enabled && selected.is_some(),
+            ActionsMenuCommand::OpenTerminal => git_dialog_enabled,
+            ActionsMenuCommand::StageSelected => {
+                git_dialog_enabled && selected.as_ref().is_some_and(|file| !file.staged)
+            }
+            ActionsMenuCommand::RemoveSelected | ActionsMenuCommand::LineReview => {
+                git_dialog_enabled && selected.as_ref().is_some_and(|file| !file.untracked)
+            }
+            ActionsMenuCommand::UnstageSelected => {
+                git_dialog_enabled && selected.as_ref().is_some_and(|file| file.staged)
+            }
+            ActionsMenuCommand::ToggleStageRepository => {
+                git_dialog_enabled
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .and_then(shortcut_stage_toggle_action)
+                        .is_some()
+            }
+            ActionsMenuCommand::CommitStaged => {
+                git_dialog_enabled
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.staged.is_empty())
+            }
+        }
+    }
+
+    fn execute_actions_menu_command(&mut self, command: ActionsMenuCommand) {
+        if !self.actions_menu_command_enabled(command) {
+            return;
+        }
+
+        match command {
+            ActionsMenuCommand::OpenSelected => self.open_selected_worktree_file(),
+            ActionsMenuCommand::OpenTerminal => self.open_command_mode(),
+            ActionsMenuCommand::ExternalDiff => self.open_selected_worktree_external_diff(),
+            ActionsMenuCommand::StageSelected => {
+                if let Some(file) = self.selected_worktree_action_state() {
+                    self.handle_worktree_action(WorktreeMenuAction::Stage { path: file.path });
+                }
+            }
+            ActionsMenuCommand::RemoveSelected => {
+                if let Some(file) = self.selected_worktree_action_state() {
+                    self.handle_worktree_action(WorktreeMenuAction::Remove { path: file.path });
+                }
+            }
+            ActionsMenuCommand::UnstageSelected => {
+                if let Some(file) = self.selected_worktree_action_state() {
+                    self.handle_worktree_action(WorktreeMenuAction::Unstage { path: file.path });
+                }
+            }
+            ActionsMenuCommand::ToggleStageRepository => {
+                self.stage_toggle_current_repository();
+            }
+            ActionsMenuCommand::CommitStaged => {
+                self.active_view = MainView::Workspace;
+                self.focus_commit_message = true;
+            }
+            ActionsMenuCommand::DiscardSelected => {
+                if let Some(file) = self.selected_worktree_action_state() {
+                    self.handle_worktree_action(WorktreeMenuAction::Discard {
+                        path: file.path,
+                        untracked: file.untracked,
+                    });
+                }
+            }
+            ActionsMenuCommand::SelectedHistory => self.open_selected_worktree_history(),
+            ActionsMenuCommand::LineReview => self.open_selected_worktree_blame(),
+        }
+    }
+
     fn stage_toggle_current_repository(&mut self) {
         self.pending_toolbar_single_click = None;
         self.active_view = MainView::Workspace;
@@ -4247,6 +4329,11 @@ impl GitAgentApp {
         }
 
         if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        if let Some(command) = actions_menu_shortcut_pressed(ctx) {
+            self.execute_actions_menu_command(command);
             return;
         }
 
@@ -6108,16 +6195,6 @@ impl GitAgentApp {
             top_menu_button(ui, menu_label(self.language, "actions"), |ui| {
                 let selected_worktree_action_state = self.selected_worktree_action_state();
                 let selected_conflict_path = self.selected_or_first_conflict_path();
-                let stage_toggle_enabled = git_dialog_enabled
-                    && self
-                        .snapshot
-                        .as_ref()
-                        .and_then(shortcut_stage_toggle_action)
-                        .is_some();
-                let has_staged_changes = self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| !snapshot.staged.is_empty());
                 let rebase_in_progress = self
                     .snapshot
                     .as_ref()
@@ -6125,13 +6202,13 @@ impl GitAgentApp {
 
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::OpenSelected),
                     menu_label(self.language, "actions_open"),
                     "Shift+Ctrl+O",
                 )
                 .clicked()
                 {
-                    self.open_selected_worktree_file();
+                    self.execute_actions_menu_command(ActionsMenuCommand::OpenSelected);
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -6146,24 +6223,24 @@ impl GitAgentApp {
                 }
                 if menu_shortcut_button(
                     ui,
-                    has_repo,
+                    self.actions_menu_command_enabled(ActionsMenuCommand::OpenTerminal),
                     menu_label(self.language, "actions_open_terminal"),
                     "Shift+Alt+T",
                 )
                 .clicked()
                 {
-                    self.open_command_mode();
+                    self.execute_actions_menu_command(ActionsMenuCommand::OpenTerminal);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::ExternalDiff),
                     menu_label(self.language, "actions_external_diff"),
                     "Ctrl+D",
                 )
                 .clicked()
                 {
-                    self.open_selected_worktree_external_diff();
+                    self.execute_actions_menu_command(ActionsMenuCommand::ExternalDiff);
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -6188,63 +6265,46 @@ impl GitAgentApp {
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled
-                        && selected_worktree_action_state
-                            .as_ref()
-                            .is_some_and(|file| !file.staged),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::StageSelected),
                     menu_label(self.language, "actions_add"),
                     "Ctrl+Shift+Plus",
                 )
                 .clicked()
                 {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::Stage { path: file.path });
-                    }
+                    self.execute_actions_menu_command(ActionsMenuCommand::StageSelected);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled
-                        && selected_worktree_action_state
-                            .as_ref()
-                            .is_some_and(|file| !file.untracked),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::RemoveSelected),
                     menu_label(self.language, "actions_remove"),
                     "Ctrl+Del",
                 )
                 .clicked()
                 {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::Remove { path: file.path });
-                    }
+                    self.execute_actions_menu_command(ActionsMenuCommand::RemoveSelected);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled
-                        && selected_worktree_action_state
-                            .as_ref()
-                            .is_some_and(|file| file.staged),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::UnstageSelected),
                     menu_label(self.language, "actions_unstage"),
                     "Ctrl+Shift+Minus",
                 )
                 .clicked()
                 {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::Unstage {
-                            path: file.path,
-                        });
-                    }
+                    self.execute_actions_menu_command(ActionsMenuCommand::UnstageSelected);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    stage_toggle_enabled,
+                    self.actions_menu_command_enabled(ActionsMenuCommand::ToggleStageRepository),
                     menu_label(self.language, "actions_add_remove"),
                     "Ctrl+Shift+Alt+Plus",
                 )
                 .clicked()
                 {
-                    self.stage_toggle_current_repository();
+                    self.execute_actions_menu_command(ActionsMenuCommand::ToggleStageRepository);
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -6280,30 +6340,24 @@ impl GitAgentApp {
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled && has_staged_changes,
+                    self.actions_menu_command_enabled(ActionsMenuCommand::CommitStaged),
                     menu_label(self.language, "actions_commit_staged"),
                     "Shift+Alt+C",
                 )
                 .clicked()
                 {
-                    self.active_view = MainView::Workspace;
-                    self.focus_commit_message = true;
+                    self.execute_actions_menu_command(ActionsMenuCommand::CommitStaged);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::DiscardSelected),
                     menu_label(self.language, "actions_discard_selected"),
                     "Shift+Ctrl+R",
                 )
                 .clicked()
                 {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::Discard {
-                            path: file.path,
-                            untracked: file.untracked,
-                        });
-                    }
+                    self.execute_actions_menu_command(ActionsMenuCommand::DiscardSelected);
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -6370,27 +6424,24 @@ impl GitAgentApp {
                 );
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled && selected_worktree_action_state.is_some(),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::SelectedHistory),
                     menu_label(self.language, "actions_selected_history"),
                     "Shift+Alt+L",
                 )
                 .clicked()
                 {
-                    self.open_selected_worktree_history();
+                    self.execute_actions_menu_command(ActionsMenuCommand::SelectedHistory);
                     ui.close_menu();
                 }
                 if menu_shortcut_button(
                     ui,
-                    git_dialog_enabled
-                        && selected_worktree_action_state
-                            .as_ref()
-                            .is_some_and(|file| !file.untracked),
+                    self.actions_menu_command_enabled(ActionsMenuCommand::LineReview),
                     menu_label(self.language, "actions_line_review"),
                     "Shift+Alt+B",
                 )
                 .clicked()
                 {
-                    self.open_selected_worktree_blame();
+                    self.execute_actions_menu_command(ActionsMenuCommand::LineReview);
                     ui.close_menu();
                 }
                 if menu_text_button(
@@ -14668,6 +14719,21 @@ enum WorktreeMenuAction {
     StopTracking { path: String },
     ResolveConflict { path: String },
     AddToGitIgnore { pattern: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionsMenuCommand {
+    OpenSelected,
+    OpenTerminal,
+    ExternalDiff,
+    StageSelected,
+    RemoveSelected,
+    UnstageSelected,
+    ToggleStageRepository,
+    CommitStaged,
+    DiscardSelected,
+    SelectedHistory,
+    LineReview,
 }
 
 #[derive(Clone, Debug)]
@@ -23399,6 +23465,55 @@ fn shortcut_pressed(ctx: &egui::Context, key: egui::Key, shift: bool) -> bool {
     })
 }
 
+fn actions_menu_shortcut_pressed(ctx: &egui::Context) -> Option<ActionsMenuCommand> {
+    ctx.input(|input| {
+        [
+            egui::Key::O,
+            egui::Key::T,
+            egui::Key::D,
+            egui::Key::Plus,
+            egui::Key::Equals,
+            egui::Key::Delete,
+            egui::Key::Minus,
+            egui::Key::C,
+            egui::Key::R,
+            egui::Key::L,
+            egui::Key::B,
+        ]
+        .into_iter()
+        .find_map(|key| {
+            input
+                .key_pressed(key)
+                .then(|| actions_menu_command_for_shortcut(input.modifiers, key))
+                .flatten()
+        })
+    })
+}
+
+fn actions_menu_command_for_shortcut(
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Option<ActionsMenuCommand> {
+    match (modifiers.ctrl, modifiers.shift, modifiers.alt, key) {
+        (true, true, false, egui::Key::O) => Some(ActionsMenuCommand::OpenSelected),
+        (false, true, true, egui::Key::T) => Some(ActionsMenuCommand::OpenTerminal),
+        (true, false, false, egui::Key::D) => Some(ActionsMenuCommand::ExternalDiff),
+        (true, true, false, egui::Key::Plus | egui::Key::Equals) => {
+            Some(ActionsMenuCommand::StageSelected)
+        }
+        (true, false, false, egui::Key::Delete) => Some(ActionsMenuCommand::RemoveSelected),
+        (true, true, false, egui::Key::Minus) => Some(ActionsMenuCommand::UnstageSelected),
+        (true, true, true, egui::Key::Plus | egui::Key::Equals) => {
+            Some(ActionsMenuCommand::ToggleStageRepository)
+        }
+        (false, true, true, egui::Key::C) => Some(ActionsMenuCommand::CommitStaged),
+        (true, true, false, egui::Key::R) => Some(ActionsMenuCommand::DiscardSelected),
+        (false, true, true, egui::Key::L) => Some(ActionsMenuCommand::SelectedHistory),
+        (false, true, true, egui::Key::B) => Some(ActionsMenuCommand::LineReview),
+        _ => None,
+    }
+}
+
 fn stage_toggle_shortcut_pressed(ctx: &egui::Context) -> bool {
     ctx.input(|input| {
         let stage_toggle_modifiers = input.modifiers.shift
@@ -28836,13 +28951,21 @@ mod ui_tests {
             "\"Shift+Alt+L\"",
             "\"Shift+Alt+B\"",
             "self.open_resource_manager();",
-            "self.open_command_mode();",
-            "self.stage_toggle_current_repository();",
+            "self.actions_menu_command_enabled(",
+            "self.execute_actions_menu_command(",
+            "ActionsMenuCommand::OpenSelected",
+            "ActionsMenuCommand::OpenTerminal",
+            "ActionsMenuCommand::ExternalDiff",
+            "ActionsMenuCommand::StageSelected",
+            "ActionsMenuCommand::RemoveSelected",
+            "ActionsMenuCommand::UnstageSelected",
+            "ActionsMenuCommand::ToggleStageRepository",
+            "ActionsMenuCommand::CommitStaged",
+            "ActionsMenuCommand::DiscardSelected",
+            "ActionsMenuCommand::SelectedHistory",
+            "ActionsMenuCommand::LineReview",
             "self.open_selected_or_first_conflict_merge_tool();",
             "self.open_custom_actions_settings();",
-            "self.handle_worktree_action(WorktreeMenuAction::Stage",
-            "self.handle_worktree_action(WorktreeMenuAction::Unstage",
-            "self.handle_worktree_action(WorktreeMenuAction::Discard",
             "self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore",
             "self.start_rebase_control_action(RebaseControlAction::Continue)",
             "self.start_rebase_control_action(RebaseControlAction::Abort)",
@@ -28866,6 +28989,146 @@ mod ui_tests {
     }
 
     #[test]
+    fn actions_menu_shortcuts_map_every_displayed_binding() {
+        let modifiers = |ctrl, shift, alt| egui::Modifiers {
+            ctrl,
+            command: ctrl,
+            shift,
+            alt,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                modifiers(true, true, false),
+                egui::Key::O,
+                ActionsMenuCommand::OpenSelected,
+            ),
+            (
+                modifiers(false, true, true),
+                egui::Key::T,
+                ActionsMenuCommand::OpenTerminal,
+            ),
+            (
+                modifiers(true, false, false),
+                egui::Key::D,
+                ActionsMenuCommand::ExternalDiff,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::Plus,
+                ActionsMenuCommand::StageSelected,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::Equals,
+                ActionsMenuCommand::StageSelected,
+            ),
+            (
+                modifiers(true, false, false),
+                egui::Key::Delete,
+                ActionsMenuCommand::RemoveSelected,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::Minus,
+                ActionsMenuCommand::UnstageSelected,
+            ),
+            (
+                modifiers(true, true, true),
+                egui::Key::Plus,
+                ActionsMenuCommand::ToggleStageRepository,
+            ),
+            (
+                modifiers(true, true, true),
+                egui::Key::Equals,
+                ActionsMenuCommand::ToggleStageRepository,
+            ),
+            (
+                modifiers(false, true, true),
+                egui::Key::C,
+                ActionsMenuCommand::CommitStaged,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::R,
+                ActionsMenuCommand::DiscardSelected,
+            ),
+            (
+                modifiers(false, true, true),
+                egui::Key::L,
+                ActionsMenuCommand::SelectedHistory,
+            ),
+            (
+                modifiers(false, true, true),
+                egui::Key::B,
+                ActionsMenuCommand::LineReview,
+            ),
+        ];
+
+        for (modifiers, key, expected) in cases {
+            assert_eq!(
+                actions_menu_command_for_shortcut(modifiers, key),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            actions_menu_command_for_shortcut(modifiers(true, false, false), egui::Key::O),
+            None
+        );
+    }
+
+    #[test]
+    fn actions_menu_shortcut_reads_egui_key_event() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Equals,
+                physical_key: Some(egui::Key::Equals),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            actions_menu_shortcut_pressed(&ctx),
+            Some(ActionsMenuCommand::StageSelected)
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn actions_menu_shortcuts_dispatch_after_text_input_guard() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let shortcut_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcut_end = implementation_source[shortcut_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcut_source = &implementation_source[shortcut_start..shortcut_start + shortcut_end];
+        let text_guard = shortcut_source.find("ctx.wants_keyboard_input()").unwrap();
+        let action_dispatch = shortcut_source
+            .find("actions_menu_shortcut_pressed(ctx)")
+            .unwrap();
+
+        assert!(text_guard < action_dispatch);
+        assert!(
+            shortcut_source[action_dispatch..]
+                .contains("self.execute_actions_menu_command(command);")
+        );
+    }
+
+    #[test]
     fn actions_menu_wires_selected_worktree_file_actions() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -28883,18 +29146,40 @@ mod ui_tests {
         let actions_source = &menu_source[actions_start..actions_start + tools_start];
 
         for required in [
-            "self.open_selected_worktree_file();",
-            "self.open_selected_worktree_external_diff();",
-            "self.open_selected_worktree_history();",
-            "self.open_selected_worktree_blame();",
+            "ActionsMenuCommand::OpenSelected",
+            "ActionsMenuCommand::ExternalDiff",
+            "ActionsMenuCommand::RemoveSelected",
+            "ActionsMenuCommand::SelectedHistory",
+            "ActionsMenuCommand::LineReview",
             "self.open_create_patch_dialog();",
             "self.apply_patch_file();",
             "self.copy_selected_worktree_file_path(ui.ctx());",
-            "WorktreeMenuAction::Remove",
             "WorktreeMenuAction::StopTracking",
             ".is_some_and(|file| !file.untracked)",
         ] {
             assert!(actions_source.contains(required), "{required}");
+        }
+
+        let command_start = implementation_source
+            .find("fn actions_menu_command_enabled(")
+            .unwrap();
+        let command_end = implementation_source[command_start..]
+            .find("fn stage_toggle_current_repository(")
+            .unwrap();
+        let command_source = &implementation_source[command_start..command_start + command_end];
+        for required in [
+            "self.branch_actions_busy()",
+            "self.open_selected_worktree_file()",
+            "self.open_selected_worktree_external_diff()",
+            "self.open_selected_worktree_history()",
+            "self.open_selected_worktree_blame()",
+            "WorktreeMenuAction::Stage",
+            "WorktreeMenuAction::Remove",
+            "WorktreeMenuAction::Unstage",
+            "WorktreeMenuAction::Discard",
+            "self.stage_toggle_current_repository()",
+        ] {
+            assert!(command_source.contains(required), "{required}");
         }
 
         let handler_start = implementation_source
