@@ -777,6 +777,15 @@ fn create_patch_output_paths(request: &git::CreatePatchRequest) -> Vec<PathBuf> 
     }
 }
 
+fn create_patch_worktree_list_height(file_count: usize) -> f32 {
+    if file_count == 0 {
+        return 0.0;
+    }
+    let row_height = 24.0;
+    let row_gap = 2.0;
+    (file_count as f32 * row_height + file_count.saturating_sub(1) as f32 * row_gap).min(260.0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepoToolbarAction {
     Pull,
@@ -10906,8 +10915,12 @@ impl GitAgentApp {
         let mut close_after = false;
         let mut request = None;
         let mut hash_copied = false;
+        let dialog_width = match dialog.tab {
+            CreatePatchTab::Worktree => 640.0,
+            CreatePatchTab::History => 960.0,
+        };
 
-        compact_action_dialog(ctx, self.tr("patch.create.title"), 960.0, |ui| {
+        compact_action_dialog(ctx, self.tr("patch.create.title"), dialog_width, |ui| {
             ui.horizontal(|ui| {
                 if AppButton::repo_tab(
                     UiIcon::Workspace,
@@ -10944,7 +10957,7 @@ impl GitAgentApp {
             match dialog.tab {
                 CreatePatchTab::Worktree => {
                     if worktree_files.is_empty() {
-                        ui.allocate_ui(Vec2::new(ui.available_width(), 260.0), |ui| {
+                        ui.allocate_ui(Vec2::new(ui.available_width(), 72.0), |ui| {
                             ui.centered_and_justified(|ui| {
                                 ui.label(
                                     RichText::new(self.tr("patch.create.empty_worktree"))
@@ -10974,8 +10987,8 @@ impl GitAgentApp {
                         ui.add_space(4.0);
                         ScrollArea::vertical()
                             .id_salt("create_patch_worktree_files")
-                            .max_height(330.0)
-                            .auto_shrink([false, false])
+                            .max_height(create_patch_worktree_list_height(worktree_files.len()))
+                            .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 for file in &worktree_files {
@@ -11054,45 +11067,49 @@ impl GitAgentApp {
             let can_submit = actions_enabled && !no_selection && path_valid;
 
             ui.add_space(10.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!patch_running, |ui| {
-                    if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
-                        close_after = true;
-                    }
-                });
-                if dialog_primary_button(ui, self.tr("patch.create.submit"), can_submit).clicked() {
-                    if no_selection {
-                        dialog.validation_error_key = Some("patch.create.no_selection");
-                    } else if let Err(error) = validate_patch_output_path(&output_path) {
-                        dialog.validation_error_key = Some(match error {
-                            PatchPathError::Empty
-                            | PatchPathError::Directory
-                            | PatchPathError::MissingParent => "patch.create.invalid_output",
-                        });
-                    } else {
-                        let candidate = match dialog.tab {
-                            CreatePatchTab::Worktree => git::CreatePatchRequest::Worktree {
-                                output_path,
-                                paths: dialog.selected_worktree_paths.iter().cloned().collect(),
-                            },
-                            CreatePatchTab::History => git::CreatePatchRequest::Commits {
-                                output_path,
-                                hashes: dialog.commit_selection.ordered(),
-                                separate: dialog.separate_files,
-                            },
-                        };
-                        let existing_paths = create_patch_output_paths(&candidate)
-                            .into_iter()
-                            .filter(|path| path.exists())
-                            .collect::<Vec<_>>();
-                        if existing_paths.is_empty() {
-                            request = Some(candidate);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_enabled_ui(!patch_running, |ui| {
+                        if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                            close_after = true;
+                        }
+                    });
+                    if dialog_primary_button(ui, self.tr("patch.create.submit"), can_submit)
+                        .clicked()
+                    {
+                        if no_selection {
+                            dialog.validation_error_key = Some("patch.create.no_selection");
+                        } else if let Err(error) = validate_patch_output_path(&output_path) {
+                            dialog.validation_error_key = Some(match error {
+                                PatchPathError::Empty
+                                | PatchPathError::Directory
+                                | PatchPathError::MissingParent => "patch.create.invalid_output",
+                            });
                         } else {
-                            dialog.overwrite_request = Some(candidate);
-                            dialog.overwrite_paths = existing_paths;
+                            let candidate = match dialog.tab {
+                                CreatePatchTab::Worktree => git::CreatePatchRequest::Worktree {
+                                    output_path,
+                                    paths: dialog.selected_worktree_paths.iter().cloned().collect(),
+                                },
+                                CreatePatchTab::History => git::CreatePatchRequest::Commits {
+                                    output_path,
+                                    hashes: dialog.commit_selection.ordered(),
+                                    separate: dialog.separate_files,
+                                },
+                            };
+                            let existing_paths = create_patch_output_paths(&candidate)
+                                .into_iter()
+                                .filter(|path| path.exists())
+                                .collect::<Vec<_>>();
+                            if existing_paths.is_empty() {
+                                request = Some(candidate);
+                            } else {
+                                dialog.overwrite_request = Some(candidate);
+                                dialog.overwrite_paths = existing_paths;
+                            }
                         }
                     }
-                }
+                });
             });
         });
 
@@ -25922,6 +25939,35 @@ mod ui_tests {
             .map(PathBuf::from)
             .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn create_patch_worktree_list_height_is_content_driven_and_capped() {
+        assert_eq!(create_patch_worktree_list_height(3), 76.0);
+        assert_eq!(create_patch_worktree_list_height(100), 260.0);
+    }
+
+    #[test]
+    fn create_patch_worktree_tab_uses_compact_width_and_footer() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation
+            .find("fn create_patch_action_modal(")
+            .unwrap();
+        let end = implementation[start..]
+            .find("fn create_patch_history_tab(")
+            .unwrap();
+        let modal = &implementation[start..start + end];
+        for required in [
+            "CreatePatchTab::Worktree => 640.0",
+            "CreatePatchTab::History => 960.0",
+            "create_patch_worktree_list_height(worktree_files.len())",
+            ".auto_shrink([false, true])",
+            "ui.horizontal(|ui| {\n                ui.with_layout(Layout::right_to_left(Align::Center)",
+        ] {
+            assert!(modal.contains(required), "missing {required}");
+        }
+        assert!(!modal.contains(".max_height(330.0)"));
     }
 
     #[test]
