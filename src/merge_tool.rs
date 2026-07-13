@@ -543,7 +543,7 @@ fn diff_changes(base: &[String], side: &[String]) -> Vec<MergeChange> {
             side_index += 1;
         } else {
             pending_start.get_or_insert((base_index, side_index));
-            if lcs[base_index + 1][side_index] >= lcs[base_index][side_index + 1] {
+            if lcs[base_index + 1][side_index] > lcs[base_index][side_index + 1] {
                 base_index += 1;
             } else {
                 side_index += 1;
@@ -715,11 +715,26 @@ impl MergeDocument {
         self.set_base_only_group(line_index, side, MergeLineAction::Drop);
     }
 
-    pub fn unresolved_conflict_count(&self, side: MergeSide) -> usize {
+    pub fn unresolved_conflict_count(&self) -> usize {
+        self.conflicts
+            .iter()
+            .filter(|conflict| {
+                self.conflict_side_unresolved(conflict.index, MergeSide::Local)
+                    || self.conflict_side_unresolved(conflict.index, MergeSide::Remote)
+            })
+            .count()
+    }
+
+    pub fn unresolved_conflict_count_for_side(&self, side: MergeSide) -> usize {
         self.conflicts
             .iter()
             .filter(|conflict| self.conflict_side_unresolved(conflict.index, side))
             .count()
+    }
+
+    fn conflict_fully_resolved(&self, index: usize) -> bool {
+        !self.conflict_side_unresolved(index, MergeSide::Local)
+            && !self.conflict_side_unresolved(index, MergeSide::Remote)
     }
 
     pub fn conflict_side_resolved(&self, index: usize, side: MergeSide) -> bool {
@@ -982,6 +997,10 @@ impl MergeToolApp {
         !self.redo_stack.is_empty()
     }
 
+    fn can_apply_result(&self) -> bool {
+        self.write_task.is_none() && self.document.unresolved_conflict_count() == 0
+    }
+
     fn undo(&mut self) -> bool {
         let Some(previous) = self.undo_stack.pop() else {
             return false;
@@ -1102,6 +1121,10 @@ impl MergeToolApp {
         if self.write_task.is_some() {
             return;
         }
+        if self.document.unresolved_conflict_count() > 0 {
+            self.status = Some(mt(self.language, "resolve_all_conflicts").to_owned());
+            return;
+        }
         let args = self.args.clone();
         let result_text = self.result_text.clone();
         let (sender, receiver) = mpsc::channel();
@@ -1219,6 +1242,7 @@ fn parse_language(value: &str) -> anyhow::Result<MergeLanguage> {
 const MERGE_COLUMN_GAP: f32 = 12.0;
 
 fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
+    let unresolved_conflicts = app.document.unresolved_conflict_count();
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(
@@ -1230,11 +1254,15 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
         ui.label(
             RichText::new(format!(
                 "{} {}",
-                app.document.conflicts().len(),
+                unresolved_conflicts,
                 mt(app.language, "conflicts")
             ))
             .monospace()
-            .color(palette.conflict_text),
+            .color(if unresolved_conflicts > 0 {
+                palette.conflict_text
+            } else {
+                palette.muted
+            }),
         );
         ui.add_space(10.0);
         ui.label(RichText::new(mt(app.language, "auto_applied")).color(palette.muted));
@@ -1259,7 +1287,7 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
                 RichText::new(format!(
                     "{} {} {}",
                     mt(app.language, "no_changes"),
-                    app.document.conflicts().len(),
+                    unresolved_conflicts,
                     mt(app.language, "conflict_count")
                 ))
                 .color(palette.muted),
@@ -1273,6 +1301,7 @@ fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
 
 fn merge_footer(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
     let writing = app.write_task.is_some();
+    let can_apply = app.can_apply_result();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
@@ -1301,7 +1330,7 @@ fn merge_footer(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
             };
             if ui
                 .add_enabled(
-                    !writing,
+                    can_apply,
                     egui::Button::new(RichText::new(apply_label).strong().color(Color32::WHITE))
                         .min_size(Vec2::new(88.0, 30.0))
                         .fill(palette.accent),
@@ -1581,7 +1610,7 @@ fn side_header(ui: &mut Ui, title: &str, path: &Path, palette: MergePalette) {
 
 fn side_conflict_nav(ui: &mut Ui, app: &mut MergeToolApp, side: MergeSide, palette: MergePalette) {
     ui.horizontal(|ui| {
-        let conflict_count = app.document.unresolved_conflict_count(side);
+        let conflict_count = app.document.unresolved_conflict_count_for_side(side);
         let mut cursor = match side {
             MergeSide::Local => app.local_conflict_cursor,
             MergeSide::Remote => app.remote_conflict_cursor,
@@ -2242,6 +2271,10 @@ fn push_conflict_result_display_rows<'a>(
                 tone: MergeSideLineTone::Unchanged,
             });
         }
+        return;
+    }
+
+    if document.conflict_fully_resolved(conflict.index) {
         return;
     }
 
@@ -3166,6 +3199,9 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (MergeLanguage::Chinese, "applying") => "应用中...",
         (MergeLanguage::Chinese, "write_failed") => "写入失败",
         (MergeLanguage::Chinese, "write_stopped") => "写入已停止",
+        (MergeLanguage::Chinese, "resolve_all_conflicts") => {
+            "\u{8bf7}\u{5148}\u{89e3}\u{51b3}\u{6240}\u{6709}\u{51b2}\u{7a81}"
+        }
         (MergeLanguage::Chinese, "result_placeholder") => {
             "\u{8bf7}\u{8f93}\u{5165}\u{5408}\u{5e76}\u{7ed3}\u{679c}"
         }
@@ -3194,6 +3230,7 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         (_, "applying") => "Applying...",
         (_, "write_failed") => "Failed to write",
         (_, "write_stopped") => "Write stopped",
+        (_, "resolve_all_conflicts") => "Resolve all conflicts before applying",
         (_, "result_placeholder") => "Enter merge result",
         (_, "cancel_merge_title") => "Cancel Merge",
         (_, "cancel_merge_message") => {
@@ -3295,6 +3332,80 @@ mod tests {
 
         assert_eq!(app.result_text, "keep\nremote\nend\n");
         assert!(!app.can_redo());
+    }
+
+    #[test]
+    fn conflict_is_resolved_only_after_both_side_decisions() {
+        let mut document = three_way_merge(
+            "keep\nbase\nend\n",
+            "keep\nlocal\nend\n",
+            "keep\nremote\nend\n",
+        );
+
+        assert_eq!(document.unresolved_conflict_count(), 1);
+        document.drop_conflict_side(0, MergeSide::Local);
+        assert_eq!(document.unresolved_conflict_count(), 1);
+        document.take_conflict_side(0, MergeSide::Remote);
+
+        assert_eq!(document.unresolved_conflict_count(), 0);
+        assert_eq!(document.result_text(), "keep\nremote\nend\n");
+    }
+
+    #[test]
+    fn resolved_empty_conflict_does_not_fall_back_to_base_preview() {
+        let mut document =
+            three_way_merge("keep\nbase\nend\n", "keep\nlocal\nend\n", "keep\nend\n");
+
+        document.drop_conflict_side(0, MergeSide::Local);
+        document.take_conflict_side(0, MergeSide::Remote);
+
+        assert_eq!(document.unresolved_conflict_count(), 0);
+        assert_eq!(document.result_text(), "keep\nend\n");
+        assert!(!merge_result_display_lines(&document).contains(&"base"));
+        assert!(!merge_result_display_lines(&document).contains(&"local"));
+    }
+
+    #[test]
+    fn apply_stays_disabled_until_every_conflict_is_resolved() {
+        let document = three_way_merge(
+            "keep\nbase\nend\n",
+            "keep\nlocal\nend\n",
+            "keep\nremote\nend\n",
+        );
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+
+        assert!(!app.can_apply_result());
+        app.apply_line_action(
+            MergeLineActionTarget::Conflict(0),
+            MergeSide::Local,
+            MergeLineAction::Drop,
+        );
+        assert!(!app.can_apply_result());
+        app.apply_line_action(
+            MergeLineActionTarget::Conflict(0),
+            MergeSide::Remote,
+            MergeLineAction::Take,
+        );
+        assert!(app.can_apply_result());
+    }
+
+    #[test]
+    fn taking_remote_after_dropping_local_handles_moved_remote_block() {
+        let base = "shell\ntrust\nminimum\nmicro\nversioned-ant\n";
+        let local = "shell\ntrust\nminimum\nmicro\n";
+        let remote = "minimum\nmicro\nunversioned-ant\nshell\ntrust\n";
+        let mut document = three_way_merge(base, local, remote);
+
+        assert_eq!(document.conflicts().len(), 1);
+        document.drop_conflict_side(0, MergeSide::Local);
+        document.take_conflict_side(0, MergeSide::Remote);
+
+        assert_eq!(document.unresolved_conflict_count(), 0);
+        assert_eq!(document.result_text(), remote);
+        assert_eq!(
+            merge_result_display_lines(&document).join("\n") + "\n",
+            remote
+        );
     }
 
     #[test]
