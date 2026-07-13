@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dialog;
 pub mod diff_tool;
 mod git;
 mod graph;

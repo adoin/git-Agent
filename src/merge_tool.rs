@@ -19,6 +19,8 @@ use eframe::{
     },
 };
 
+use crate::dialog;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MergeTheme {
     Dark,
@@ -1354,7 +1356,7 @@ fn merge_cancel_confirm_dialog(ctx: &egui::Context, app: &mut MergeToolApp, pale
     egui::Window::new(mt(app.language, "cancel_merge_title"))
         .collapsible(false)
         .resizable(false)
-        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
         .open(&mut open)
         .show(ctx, |ui| {
             ui.set_min_width(420.0);

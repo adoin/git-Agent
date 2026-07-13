@@ -21,6 +21,7 @@ use eframe::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    dialog,
     git::{
         self, Commit, CommitDetails, FileDiff, RepositorySnapshot, ResetMode, StashEntry, Tag,
         WorktreeFile,
@@ -13817,7 +13818,7 @@ impl GitAgentApp {
 
         let mut close_requested = false;
         let screen = ctx.screen_rect();
-        let size = Vec2::new(
+        let requested_size = Vec2::new(
             global_settings_dialog_width(self.settings_tab).min(screen.width() * 0.92),
             global_settings_dialog_height(
                 self.settings_tab,
@@ -13827,13 +13828,8 @@ impl GitAgentApp {
             )
             .min(screen.height() * 0.9),
         );
-        let rect = Rect::from_min_size(
-            Pos2::new(
-                screen.center().x - size.x / 2.0,
-                screen.center().y - size.y / 2.0,
-            ),
-            size,
-        );
+        let rect = dialog::top_anchored_rect(screen, requested_size);
+        let size = rect.size();
 
         egui::Window::new(self.tr("settings.title"))
             .title_bar(false)
@@ -13880,17 +13876,12 @@ impl GitAgentApp {
 
         let mut close_requested = false;
         let screen = ctx.screen_rect();
-        let size = Vec2::new(
+        let requested_size = Vec2::new(
             (screen.width() * 0.52).clamp(520.0, REPO_SETTINGS_DIALOG_WIDTH),
             repo_settings_dialog_height(self.repo_settings_tab).min(screen.height() * 0.9),
         );
-        let rect = Rect::from_min_size(
-            Pos2::new(
-                screen.center().x - size.x / 2.0,
-                screen.center().y - size.y / 2.0,
-            ),
-            size,
-        );
+        let rect = dialog::top_anchored_rect(screen, requested_size);
+        let size = rect.size();
 
         egui::Window::new(self.tr("repo.settings.title"))
             .title_bar(false)
@@ -15336,7 +15327,7 @@ fn compact_action_dialog(
         .collapsible(false)
         .resizable(false)
         .auto_sized()
-        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
         .frame(dialog_window_frame())
         .show(ctx, |ui| {
             egui::Frame::new()
@@ -20840,13 +20831,7 @@ fn conflict_resolution_dialog_background() -> Color32 {
 }
 
 fn conflict_resolution_modal_rect(ctx: &egui::Context) -> Rect {
-    let screen = ctx.screen_rect();
-    let center = screen.center();
-    let min = Pos2::new(
-        center.x - CONFLICT_MODAL_SIZE.x / 2.0,
-        center.y - CONFLICT_MODAL_SIZE.y / 2.0,
-    );
-    Rect::from_min_size(min, CONFLICT_MODAL_SIZE)
+    dialog::top_anchored_rect(ctx.screen_rect(), CONFLICT_MODAL_SIZE)
 }
 
 fn conflict_resolution_list_panel(
@@ -31698,6 +31683,41 @@ mod ui_tests {
             assert!(modal_source.contains("compact_action_dialog("));
             assert!(!modal_source.contains(".anchor(Align2::CENTER_CENTER"));
         }
+    }
+
+    #[test]
+    fn all_in_app_dialogs_share_the_global_top_anchor() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let compact_start = implementation.find("fn compact_action_dialog(").unwrap();
+        let compact_end = implementation[compact_start..]
+            .find("fn compact_dialog_title_bar(")
+            .unwrap();
+        let compact_source = &implementation[compact_start..compact_start + compact_end];
+
+        assert!(
+            compact_source.contains(".anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())")
+        );
+        assert_eq!(
+            implementation
+                .matches("dialog::top_anchored_rect(screen, requested_size)")
+                .count(),
+            2
+        );
+        assert!(
+            implementation
+                .contains("dialog::top_anchored_rect(ctx.screen_rect(), CONFLICT_MODAL_SIZE)")
+        );
+        assert!(!implementation.contains(".anchor(Align2::CENTER_CENTER"));
+        assert!(!implementation.contains("screen.center().y - size.y / 2.0"));
+
+        let merge_source = include_str!("merge_tool.rs");
+        let merge_implementation = &merge_source[..merge_source.find("#[cfg(test)]").unwrap()];
+        assert!(
+            merge_implementation
+                .contains(".anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())")
+        );
+        assert!(!merge_implementation.contains(".anchor(Align2::CENTER_CENTER"));
     }
 
     #[test]
