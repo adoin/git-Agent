@@ -2360,12 +2360,51 @@ fn restore_patch_backups(outputs: &[(PathBuf, Vec<u8>)], backups: &[Option<PathB
 }
 
 pub fn apply_patch(root: impl AsRef<Path>, patch_path: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
     let patch_path = patch_path.as_ref().to_string_lossy();
-    git_output(
-        root.as_ref(),
-        &["apply", "--whitespace=nowarn", patch_path.as_ref()],
-    )
-    .map(|_| ())
+    let direct_check = git_output(
+        root,
+        &[
+            "apply",
+            "--check",
+            "--whitespace=nowarn",
+            patch_path.as_ref(),
+        ],
+    );
+
+    if direct_check.is_ok() {
+        return git_output(root, &["apply", "--whitespace=nowarn", patch_path.as_ref()])
+            .map(|_| ());
+    }
+
+    let direct_error = direct_check.unwrap_err();
+    let three_way_check = git_output(
+        root,
+        &[
+            "apply",
+            "--3way",
+            "--check",
+            "--whitespace=nowarn",
+            patch_path.as_ref(),
+        ],
+    );
+    if three_way_check.is_ok() {
+        return git_output(
+            root,
+            &[
+                "apply",
+                "--3way",
+                "--whitespace=nowarn",
+                patch_path.as_ref(),
+            ],
+        )
+        .map(|_| ());
+    }
+
+    Err(anyhow!(
+        "direct patch application failed:\n{direct_error:#}\n\nthree-way patch application failed:\n{:#}",
+        three_way_check.unwrap_err()
+    ))
 }
 
 pub fn add_to_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<()> {
@@ -3946,6 +3985,53 @@ mod tests {
 
         assert_eq!(fs::read_to_string(root.join("tracked.txt"))?, "after\n");
         assert_eq!(fs::read_to_string(root.join("new.txt"))?, "new file\n");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_patch_falls_back_to_three_way_when_direct_context_changed() -> Result<()> {
+        let root = init_patch_test_repo("three-way-apply")?;
+        fs::write(
+            root.join("selected.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        )?;
+        git_output(&root, &["add", "selected.txt"])?;
+        git_output(&root, &["commit", "-m", "three way base"])?;
+
+        fs::write(
+            root.join("selected.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\npatch change\nten\n",
+        )?;
+        let patch_path = root.join("three-way.diff");
+        create_worktree_patch_for_paths(&root, &patch_path, &["selected.txt".to_owned()])?;
+        git_output(&root, &["checkout", "--", "selected.txt"])?;
+
+        fs::write(
+            root.join("selected.txt"),
+            "one\ntwo\nthree\nfour\nfive\nlocal change\nseven\neight\nnine\nten\n",
+        )?;
+        git_output(&root, &["add", "selected.txt"])?;
+        git_output(&root, &["commit", "-m", "local context change"])?;
+        assert!(
+            git_output(
+                &root,
+                &[
+                    "apply",
+                    "--check",
+                    "--whitespace=nowarn",
+                    patch_path.to_string_lossy().as_ref(),
+                ],
+            )
+            .is_err()
+        );
+
+        apply_patch(&root, &patch_path)?;
+        assert_eq!(
+            fs::read_to_string(root.join("selected.txt"))?,
+            "one\ntwo\nthree\nfour\nfive\nlocal change\nseven\neight\npatch change\nten\n"
+        );
 
         let _ = fs::remove_dir_all(&root);
         Ok(())

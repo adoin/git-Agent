@@ -3123,7 +3123,11 @@ impl GitAgentApp {
         else {
             return;
         };
-        self.start_remote_git_action(move |root| git::apply_patch(root, &patch_path));
+        let failure_hint = self.tr("patch.apply.failed_hint").to_owned();
+        self.start_remote_git_action(move |root| {
+            git::apply_patch(root, &patch_path)
+                .map_err(|error| anyhow::anyhow!("{failure_hint}\n\n{error:#}"))
+        });
     }
 
     fn default_remote_web_url(&self) -> Option<String> {
@@ -5432,7 +5436,7 @@ impl GitAgentApp {
             );
             ui.add_space(8.0);
             ScrollArea::vertical()
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
                 .max_height(layout.message_height)
                 .show(ui, |ui| {
                     ui.add(
@@ -5443,8 +5447,7 @@ impl GitAgentApp {
                             .desired_rows(layout.desired_rows),
                     );
                 });
-            ui.add_space(10.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            dialog_footer_row(ui, |ui| {
                 if ui.button(self.tr("dialog.close")).clicked() {
                     close_requested = true;
                 }
@@ -28962,7 +28965,9 @@ mod ui_tests {
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
         for required in [
             "rfd::FileDialog::new()",
+            "self.tr(\"patch.apply.failed_hint\")",
             "git::apply_patch(root, &patch_path)",
+            "map_err(|error| anyhow::anyhow!",
         ] {
             assert!(apply_source.contains(required), "{required}");
         }
@@ -31100,6 +31105,18 @@ mod ui_tests {
         assert!(long.message_height > short.message_height);
         assert!(long.message_height <= 360.0);
         assert!(long.desired_rows > short.desired_rows);
+    }
+
+    #[test]
+    fn git_error_dialog_uses_shrinking_body_and_fixed_footer_row() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation.find("fn error_modal(").unwrap();
+        let end = implementation[start..].find("fn main_layout(").unwrap();
+        let modal = &implementation[start..start + end];
+        assert!(modal.contains(".auto_shrink([false, true])"));
+        assert!(modal.contains("dialog_footer_row(ui, |ui|"));
+        assert!(!modal.contains("ui.with_layout(Layout::right_to_left(Align::Center)"));
     }
 
     #[test]

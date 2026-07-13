@@ -532,6 +532,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{8986}\u{76d6}\u{5e76}\u{521b}\u{5efa}",
     ),
     (
+        "patch.apply.failed_hint",
+        "\u{65e0}\u{6cd5}\u{5c06}\u{8865}\u{4e01}\u{5e94}\u{7528}\u{5230}\u{5f53}\u{524d}\u{5206}\u{652f}\u{3002}\u{5f53}\u{524d}\u{5206}\u{652f}\u{53ef}\u{80fd}\u{4e0d}\u{5305}\u{542b}\u{521b}\u{5efa}\u{8865}\u{4e01}\u{65f6}\u{7684}\u{57fa}\u{7ebf}\u{6587}\u{4ef6}\u{6216}\u{5185}\u{5bb9}\u{3002}",
+    ),
+    (
         "stash.staged_files",
         "\u{5df2}\u{6682}\u{5b58}\u{6587}\u{4ef6} / \u{9009}\u{4e2d}\u{7684}\u{6587}\u{4ef6}",
     ),
@@ -1838,6 +1842,10 @@ const EN: &[(&str, &str)] = &[
         "The following files already exist. Continuing will overwrite them.",
     ),
     ("patch.create.overwrite_confirm", "Overwrite and Create"),
+    (
+        "patch.apply.failed_hint",
+        "Could not apply the patch to the current branch. The branch may not contain the files or baseline content used to create the patch.",
+    ),
     ("worktree.resolve_conflict", "Resolve conflict"),
     ("worktree.resolve_conflicts", "Resolve conflicts"),
     ("worktree.conflicts.title", "Conflicts"),
@@ -2167,6 +2175,7 @@ mod tests {
             "patch.create.overwrite_title",
             "patch.create.overwrite_message",
             "patch.create.overwrite_confirm",
+            "patch.apply.failed_hint",
         ] {
             assert_ne!(t(Language::Chinese, key), key, "missing Chinese {key}");
             assert_ne!(t(Language::English, key), key, "missing English {key}");
