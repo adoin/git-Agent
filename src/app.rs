@@ -106,8 +106,8 @@ const CONTENT_PANEL_INSET_X: i8 = 14;
 const CONTENT_PANEL_INSET_Y: i8 = 12;
 const RESOURCE_ROW_HEIGHT: f32 = 30.0;
 const RESOURCE_TABLE_HEADER_HEIGHT: f32 = 24.0;
-const SETTINGS_DIALOG_WIDTH: f32 = 960.0;
-const SETTINGS_DIALOG_HEIGHT: f32 = 680.0;
+const SETTINGS_DIALOG_WIDTH: f32 = 780.0;
+const SETTINGS_DIALOG_HEIGHT: f32 = 600.0;
 const REPO_SETTINGS_DIALOG_WIDTH: f32 = 700.0;
 const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 460.0;
 const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
@@ -141,7 +141,6 @@ const GIT_FLOW_DIALOG_WIDTH: f32 = 520.0;
 const REPO_SETTINGS_TABS_HEIGHT: f32 = 34.0;
 const REPO_SETTINGS_TAB_WIDTH: f32 = 104.0;
 const REPO_SETTINGS_TAB_HEIGHT: f32 = 28.0;
-const SETTINGS_NAV_WIDTH: f32 = 190.0;
 const SETTINGS_FOOTER_HEIGHT: f32 = 44.0;
 const SETTINGS_REMOTE_ACCOUNT_INPUT_WIDTH: f32 = 172.0;
 const LAYOUT_GAP: i8 = 8;
@@ -13819,8 +13818,14 @@ impl GitAgentApp {
         let mut close_requested = false;
         let screen = ctx.screen_rect();
         let size = Vec2::new(
-            (screen.width() * 0.68).clamp(760.0, SETTINGS_DIALOG_WIDTH),
-            (screen.height() * 0.82).clamp(540.0, SETTINGS_DIALOG_HEIGHT),
+            global_settings_dialog_width(self.settings_tab).min(screen.width() * 0.92),
+            global_settings_dialog_height(
+                self.settings_tab,
+                self.repository_workspaces.len(),
+                self.remote_accounts.len(),
+                self.custom_actions.len(),
+            )
+            .min(screen.height() * 0.9),
         );
         let rect = Rect::from_min_size(
             Pos2::new(
@@ -13846,16 +13851,7 @@ impl GitAgentApp {
                     });
                     settings_dialog_body_frame().show(ui, |ui| {
                         ui.set_width(size.x - 28.0);
-                        let content_height = safe_ui_length(
-                            size.y - SETTINGS_DIALOG_TITLE_HEIGHT - SETTINGS_FOOTER_HEIGHT - 64.0,
-                        );
-                        soft_panel_frame(theme::panel(), 16, 12).show(ui, |ui| {
-                            safe_set_min_size(
-                                ui,
-                                frame_inner_size(size.x - 28.0, content_height, 16, 12),
-                            );
-                            self.global_settings_page(ui);
-                        });
+                        self.global_settings_page(ui, global_settings_content_max_height(size.y));
                         ui.add_space(10.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button(self.tr("dialog.ok")).clicked() {
@@ -13954,11 +13950,12 @@ impl GitAgentApp {
         self.repo_settings_open = self.repo_settings_open && !close_requested;
     }
 
-    fn global_settings_page(&mut self, ui: &mut Ui) {
+    fn global_settings_page(&mut self, ui: &mut Ui, content_max_height: f32) {
         global_settings_tab_strip(ui, &mut self.settings_tab, self.language);
         ui.add_space(12.0);
         ScrollArea::vertical()
             .id_salt("global_settings_content_scroll")
+            .max_height(content_max_height)
             .auto_shrink([false, true])
             .show(ui, |ui| match self.settings_tab {
                 SettingsTab::General => self.global_general_settings(ui),
@@ -20139,6 +20136,43 @@ fn settings_dialog_title_row(
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(trailing_rect), |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), add_trailing);
     });
+}
+
+fn global_settings_dialog_width(tab: SettingsTab) -> f32 {
+    match tab {
+        SettingsTab::General | SettingsTab::CustomActions => SETTINGS_DIALOG_WIDTH,
+        SettingsTab::Git | SettingsTab::Verification | SettingsTab::Network => 640.0,
+        _ => 640.0,
+    }
+}
+
+fn global_settings_dialog_height(
+    tab: SettingsTab,
+    workspace_count: usize,
+    remote_account_count: usize,
+    custom_action_count: usize,
+) -> f32 {
+    match tab {
+        SettingsTab::General => {
+            (512.0 + workspace_count.min(4) as f32 * 26.0).min(SETTINGS_DIALOG_HEIGHT)
+        }
+        SettingsTab::CustomActions => (330.0 + custom_action_count.min(6) as f32 * 24.0).min(500.0),
+        SettingsTab::Network => {
+            (280.0 + remote_account_count.saturating_sub(1).min(5) as f32 * 24.0).min(420.0)
+        }
+        SettingsTab::Git | SettingsTab::Verification => 240.0,
+        _ => 300.0,
+    }
+}
+
+fn global_settings_content_max_height(dialog_height: f32) -> f32 {
+    safe_ui_length(
+        dialog_height
+            - SETTINGS_DIALOG_TITLE_HEIGHT
+            - SETTINGS_FOOTER_HEIGHT
+            - REPO_SETTINGS_TABS_HEIGHT
+            - 24.0,
+    )
 }
 
 fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
@@ -34172,9 +34206,22 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn settings_and_repo_settings_are_separate_flows() {
-        assert!(SETTINGS_DIALOG_WIDTH >= 940.0);
-        assert!(SETTINGS_DIALOG_HEIGHT >= 660.0);
-        assert!(SETTINGS_NAV_WIDTH >= 180.0);
+        assert!(SETTINGS_DIALOG_WIDTH <= 780.0);
+        assert!(SETTINGS_DIALOG_HEIGHT <= 600.0);
+        assert_eq!(global_settings_dialog_width(SettingsTab::Network), 640.0);
+        assert_eq!(
+            global_settings_dialog_height(SettingsTab::Network, 0, 1, 0),
+            280.0
+        );
+        assert_eq!(
+            global_settings_dialog_height(SettingsTab::Verification, 0, 0, 0),
+            240.0
+        );
+        assert!(
+            global_settings_dialog_height(SettingsTab::General, 12, 0, 0) <= SETTINGS_DIALOG_HEIGHT
+        );
+        let general_height = global_settings_dialog_height(SettingsTab::General, 2, 0, 0);
+        assert_eq!(global_settings_content_max_height(general_height), 430.0);
         let source = include_str!("app.rs");
         assert!(source.contains("fn settings_modal"));
         assert!(source.contains("fn repo_settings_modal"));
@@ -34191,6 +34238,21 @@ diff --git a/file.txt b/file.txt
         assert!(!source[global_start..global_end].contains("\"Global Options\""));
         assert!(!source[global_start..global_end].contains("settings_field(ui, \"Theme\""));
         assert!(!source[global_start..global_end].contains("settings_field(ui, \"Language\""));
+        let modal_start = source.find("fn settings_modal(&mut self").unwrap();
+        let modal_end = source[modal_start..]
+            .find("fn repo_settings_modal(&mut self")
+            .unwrap();
+        let modal_source = &source[modal_start..modal_start + modal_end];
+        assert!(modal_source.contains("global_settings_dialog_width(self.settings_tab)"));
+        assert!(modal_source.contains("global_settings_dialog_height("));
+        assert!(modal_source.contains("global_settings_content_max_height(size.y)"));
+        assert!(!modal_source.contains("soft_panel_frame(theme::panel(), 16, 12)"));
+        let page_start = source.find("fn global_settings_page(&mut self").unwrap();
+        let page_end = source[page_start..]
+            .find("fn global_general_settings(&mut self")
+            .unwrap();
+        let page_source = &source[page_start..page_start + page_end];
+        assert!(page_source.contains(".max_height(content_max_height)"));
         let choice_start = source.find("fn settings_choice_button(").unwrap();
         let choice_end = source[choice_start..]
             .find("fn settings_accent_button(")
