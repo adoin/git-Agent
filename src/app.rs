@@ -20,6 +20,9 @@ use eframe::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 use crate::{
     dialog,
     git::{
@@ -33,6 +36,7 @@ use crate::{
         numbered_patch_paths, selection_gesture, validate_patch_output_path,
     },
     theme,
+    updater::{self, InstallOutcome, UpdateRelease},
 };
 
 const TITLE_BAR_HEIGHT: f32 = 32.0;
@@ -48,6 +52,9 @@ const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
 const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
 const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn sanitize_repo_refresh_seconds(seconds: u64) -> u64 {
     seconds.clamp(MIN_REPO_REFRESH_SECONDS, MAX_REPO_REFRESH_SECONDS)
@@ -107,7 +114,7 @@ const CONTENT_PANEL_INSET_X: i8 = 14;
 const CONTENT_PANEL_INSET_Y: i8 = 12;
 const RESOURCE_ROW_HEIGHT: f32 = 30.0;
 const RESOURCE_TABLE_HEADER_HEIGHT: f32 = 24.0;
-const SETTINGS_DIALOG_WIDTH: f32 = 780.0;
+const SETTINGS_DIALOG_WIDTH: f32 = 640.0;
 const SETTINGS_DIALOG_HEIGHT: f32 = 600.0;
 const REPO_SETTINGS_DIALOG_WIDTH: f32 = 700.0;
 const REPO_SETTINGS_DIALOG_HEIGHT: f32 = 460.0;
@@ -142,6 +149,7 @@ const GIT_FLOW_DIALOG_WIDTH: f32 = 520.0;
 const REPO_SETTINGS_TABS_HEIGHT: f32 = 34.0;
 const REPO_SETTINGS_TAB_WIDTH: f32 = 104.0;
 const REPO_SETTINGS_TAB_HEIGHT: f32 = 28.0;
+const SETTINGS_TAB_TEXT_CHROME_WIDTH: f32 = 34.0;
 const SETTINGS_FOOTER_HEIGHT: f32 = 44.0;
 const SETTINGS_REMOTE_ACCOUNT_INPUT_WIDTH: f32 = 172.0;
 const LAYOUT_GAP: i8 = 8;
@@ -343,8 +351,10 @@ fn log_layout_debug_once(flag: &AtomicBool, label: &str, rects: &[(&str, Rect)])
 
 pub struct GitAgentApp {
     repo_tabs: Vec<RepoTab>,
+    repo_tab_aliases: HashMap<String, String>,
     active_repo_tab: Option<usize>,
     repo_tab_drag: RepoTabDragState,
+    repo_tab_rename: Option<RepoTabRenameState>,
     source_tab_open: bool,
     repo_source_tab: RepoSourceTab,
     snapshot: Option<RepositorySnapshot>,
@@ -382,6 +392,13 @@ pub struct GitAgentApp {
     create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
     repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
     repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
+    ssh_tool_task: Option<Receiver<SshToolTaskResult>>,
+    ssh_tool_action: Option<SshToolAction>,
+    update_task: Option<Receiver<UpdateTaskResult>>,
+    update_task_action: Option<UpdateTaskAction>,
+    ssh_agent_status_open: bool,
+    ssh_load_key_prompt_open: bool,
+    ssh_agent_status: Option<SshAgentStatus>,
     credential_login_task: Option<Receiver<anyhow::Result<()>>>,
     credential_retry_in_progress: bool,
     branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
@@ -454,6 +471,14 @@ pub struct GitAgentApp {
     sidebar_tree_states: HashMap<String, SidebarTreeState>,
     settings_open: bool,
     settings_tab: SettingsTab,
+    about_open: bool,
+    update_dialog_open: bool,
+    update_release: Option<UpdateRelease>,
+    update_error: Option<String>,
+    update_installed: bool,
+    exit_after_update_launch: bool,
+    pending_ssh_install_prompt: Option<SshClientKind>,
+    requested_top_menu: Option<TopMenu>,
     repo_settings_open: bool,
     repo_settings_tab: SettingsTab,
     pending_repo_remote_action: Option<RepoRemoteActionDialog>,
@@ -465,6 +490,9 @@ pub struct GitAgentApp {
     custom_action_name_input: String,
     custom_action_command_input: String,
     custom_action_error: Option<String>,
+    ssh_client: SshClientKind,
+    ssh_key_path: String,
+    ssh_executable_path: String,
     theme_mode: theme::ThemeMode,
     theme_accent: theme::ThemeAccent,
     layout_prefs: LayoutPrefs,
@@ -485,6 +513,13 @@ struct RepoTabDragState {
 }
 
 #[derive(Clone, Debug)]
+struct RepoTabRenameState {
+    index: usize,
+    value: String,
+    request_focus: bool,
+}
+
+#[derive(Clone, Debug)]
 struct KnownRepository {
     root: PathBuf,
     name: String,
@@ -497,6 +532,34 @@ type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
+type SshToolTaskResult = (SshToolAction, anyhow::Result<SshToolTaskOutput>);
+type UpdateTaskResult = (UpdateTaskAction, anyhow::Result<UpdateTaskOutput>);
+
+#[derive(Debug)]
+enum SshToolTaskOutput {
+    AgentStatus(SshAgentStatus),
+    Message(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SshAgentStatus {
+    client: SshClientKind,
+    backend: String,
+    identities: Vec<String>,
+    can_list_identities: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateTaskAction {
+    Check,
+    Install,
+}
+
+#[derive(Debug)]
+enum UpdateTaskOutput {
+    Checked(UpdateRelease),
+    Installed(InstallOutcome),
+}
 
 #[derive(Debug)]
 enum RepositoryBenchmarkTaskMessage {
@@ -542,6 +605,7 @@ struct RepoCommitState {
 #[serde(default)]
 struct RepoTabsState {
     tabs: Vec<String>,
+    tab_aliases: HashMap<String, String>,
     active_repo_tab: Option<usize>,
     source_tab_open: bool,
     source_tab_active: bool,
@@ -633,6 +697,24 @@ enum SettingsTab {
     Network,
     RepoRemotes,
     RepoAdvanced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopMenu {
+    File,
+    View,
+    Repository,
+    Actions,
+    Tools,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshToolAction {
+    StartAgent,
+    RefreshAgentStatus,
+    AddKey,
+    InstallOpenSsh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1486,6 +1568,34 @@ struct AppSettings {
     inactive_repo_refresh_seconds: u64,
     remote_accounts: Vec<RemoteAccountSettings>,
     custom_actions: Vec<CustomGitActionSettings>,
+    ssh_client: SshClientKind,
+    ssh_key_path: String,
+    ssh_executable_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum SshClientKind {
+    PuttyPlink,
+    OpenSsh,
+}
+
+impl Default for SshClientKind {
+    fn default() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::PuttyPlink
+        } else {
+            Self::OpenSsh
+        }
+    }
+}
+
+impl SshClientKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PuttyPlink => "PuTTY / Plink",
+            Self::OpenSsh => "OpenSSH",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1538,6 +1648,9 @@ impl Default for AppSettings {
             inactive_repo_refresh_seconds: DEFAULT_INACTIVE_REPO_REFRESH_SECONDS,
             remote_accounts: vec![RemoteAccountSettings::default()],
             custom_actions: Vec::new(),
+            ssh_client: SshClientKind::default(),
+            ssh_key_path: String::new(),
+            ssh_executable_path: String::new(),
         }
     }
 }
@@ -1813,6 +1926,50 @@ fn repo_state_key(path: &Path) -> String {
     path.display().to_string()
 }
 
+fn default_repo_tab_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Repository")
+        .to_owned()
+}
+
+fn repo_tab_name_from_alias(root: &Path, alias: Option<&str>) -> String {
+    alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_repo_tab_name(root))
+}
+
+fn repository_snapshots_equal_for_refresh(
+    left: &RepositorySnapshot,
+    right: &RepositorySnapshot,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    normalize_repository_snapshot_refresh_labels(&mut left);
+    normalize_repository_snapshot_refresh_labels(&mut right);
+    left == right
+}
+
+fn normalize_repository_snapshot_refresh_labels(snapshot: &mut RepositorySnapshot) {
+    for commits in [
+        &mut snapshot.commits,
+        &mut snapshot.date_commits,
+        &mut snapshot.topology_commits,
+        &mut snapshot.all_date_commits,
+        &mut snapshot.all_topology_commits,
+    ] {
+        for commit in commits {
+            commit.relative_time.clear();
+        }
+    }
+    for stash in &mut snapshot.stashes {
+        stash.relative_time.clear();
+    }
+}
+
 impl RepoCommitStateStore {
     fn state_for(path: &Path) -> RepoCommitState {
         let Some(state_path) = repo_commit_state_path_for(path) else {
@@ -1857,12 +2014,22 @@ impl RepoTabsState {
     }
 
     fn from_app(app: &GitAgentApp) -> Self {
+        let mut tab_aliases = app.repo_tab_aliases.clone();
+        for tab in &app.repo_tabs {
+            let key = repo_state_key(&tab.root);
+            if tab.name == default_repo_tab_name(&tab.root) {
+                tab_aliases.remove(&key);
+            } else {
+                tab_aliases.insert(key, tab.name.clone());
+            }
+        }
         Self {
             tabs: app
                 .repo_tabs
                 .iter()
                 .map(|tab| tab.root.display().to_string())
                 .collect(),
+            tab_aliases,
             active_repo_tab: app.active_repo_tab,
             source_tab_open: app.source_tab_open,
             source_tab_active: app.repository_source_active(),
@@ -1895,12 +2062,12 @@ impl RepoTabsState {
             {
                 continue;
             }
-            let name = root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("Repository")
-                .to_owned();
+            let name = repo_tab_name_from_alias(
+                &root,
+                self.tab_aliases
+                    .get(&repo_state_key(&root))
+                    .map(String::as_str),
+            );
             tabs.push(RepoTab { root, name });
         }
         tabs
@@ -2082,8 +2249,10 @@ impl GitAgentApp {
 
         let mut app = Self {
             repo_tabs,
+            repo_tab_aliases: tabs_state.tab_aliases.clone(),
             active_repo_tab,
             repo_tab_drag: RepoTabDragState::default(),
+            repo_tab_rename: None,
             source_tab_open: tabs_state.source_tab_open,
             repo_source_tab: RepoSourceTab::Local,
             snapshot: None,
@@ -2123,6 +2292,13 @@ impl GitAgentApp {
             create_patch_task: None,
             repository_benchmark_task: None,
             repository_benchmark_progress: None,
+            ssh_tool_task: None,
+            ssh_tool_action: None,
+            update_task: None,
+            update_task_action: None,
+            ssh_agent_status_open: false,
+            ssh_load_key_prompt_open: false,
+            ssh_agent_status: None,
             credential_login_task: None,
             credential_retry_in_progress: false,
             branch_checkout_task: None,
@@ -2196,6 +2372,14 @@ impl GitAgentApp {
             settings_open: env::var("GIT_AGENT_OPEN_SETTINGS_ON_START").ok().as_deref()
                 == Some("1"),
             settings_tab: SettingsTab::General,
+            about_open: false,
+            update_dialog_open: false,
+            update_release: None,
+            update_error: None,
+            update_installed: false,
+            exit_after_update_launch: false,
+            pending_ssh_install_prompt: None,
+            requested_top_menu: None,
             repo_settings_open: env::var("GIT_AGENT_OPEN_REPO_SETTINGS_ON_START")
                 .ok()
                 .as_deref()
@@ -2210,6 +2394,9 @@ impl GitAgentApp {
             custom_action_name_input: String::new(),
             custom_action_command_input: String::new(),
             custom_action_error: None,
+            ssh_client: app_settings.ssh_client,
+            ssh_key_path: app_settings.ssh_key_path.clone(),
+            ssh_executable_path: app_settings.ssh_executable_path.clone(),
             theme_mode: if env::var("GIT_AGENT_THEME").ok().as_deref() == Some("light") {
                 theme::ThemeMode::Light
             } else if env::var("GIT_AGENT_THEME").ok().as_deref() == Some("dark") {
@@ -2224,6 +2411,8 @@ impl GitAgentApp {
             history_show_tag_refs: true,
         };
 
+        app.configure_git_ssh_client();
+        app.refresh_ssh_install_prompt();
         app.refresh_known_repositories();
         if let Some(index) = app.active_repo_tab {
             if let Some(path) = app.repo_tabs.get(index).map(|tab| tab.root.clone()) {
@@ -2402,12 +2591,12 @@ impl GitAgentApp {
     }
 
     fn ensure_repo_tab(&mut self, path: PathBuf) {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("Repository")
-            .to_owned();
+        let name = repo_tab_name_from_alias(
+            &path,
+            self.repo_tab_aliases
+                .get(&repo_state_key(&path))
+                .map(String::as_str),
+        );
 
         if let Some(index) = self
             .repo_tabs
@@ -2422,6 +2611,34 @@ impl GitAgentApp {
         self.repo_tabs.push(RepoTab { root: path, name });
         self.active_repo_tab = Some(self.repo_tabs.len() - 1);
         self.refresh_known_repositories();
+        self.save_repo_tabs();
+    }
+
+    fn begin_repo_tab_rename(&mut self, index: usize) {
+        let Some(tab) = self.repo_tabs.get(index) else {
+            return;
+        };
+        self.repo_tab_drag.dragging_index = None;
+        self.repo_tab_rename = Some(RepoTabRenameState {
+            index,
+            value: tab.name.clone(),
+            request_focus: true,
+        });
+    }
+
+    fn apply_repo_tab_alias(&mut self, index: usize, alias: &str) {
+        let Some(tab) = self.repo_tabs.get_mut(index) else {
+            return;
+        };
+        let key = repo_state_key(&tab.root);
+        let default_name = default_repo_tab_name(&tab.root);
+        let name = repo_tab_name_from_alias(&tab.root, Some(alias));
+        tab.name = name.clone();
+        if name == default_name {
+            self.repo_tab_aliases.remove(&key);
+        } else {
+            self.repo_tab_aliases.insert(key, name);
+        }
         self.save_repo_tabs();
     }
 
@@ -2470,6 +2687,17 @@ impl GitAgentApp {
             return;
         }
 
+        self.repo_tab_rename = self.repo_tab_rename.take().and_then(|mut rename| {
+            if rename.index == index {
+                None
+            } else {
+                if rename.index > index {
+                    rename.index -= 1;
+                }
+                Some(rename)
+            }
+        });
+
         let was_active = self.active_repo_tab == Some(index);
         if was_active {
             self.save_commit_message_draft_for_active_repo();
@@ -2505,14 +2733,6 @@ impl GitAgentApp {
     }
 
     fn sync_active_tab_with_snapshot(&mut self, snapshot: &RepositorySnapshot) {
-        let name = snapshot
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("Repository")
-            .to_owned();
-
         if let Some(index) = self
             .repo_tabs
             .iter()
@@ -2521,9 +2741,14 @@ impl GitAgentApp {
             self.active_repo_tab = Some(index);
             if let Some(tab) = self.repo_tabs.get_mut(index) {
                 tab.root = snapshot.root.clone();
-                tab.name = name;
             }
         } else {
+            let name = repo_tab_name_from_alias(
+                &snapshot.root,
+                self.repo_tab_aliases
+                    .get(&repo_state_key(&snapshot.root))
+                    .map(String::as_str),
+            );
             self.repo_tabs.push(RepoTab {
                 root: snapshot.root.clone(),
                 name,
@@ -2628,6 +2853,15 @@ impl GitAgentApp {
         self.selected_worktree_file = None;
         self.worktree_selection = WorktreeSelectionState::default();
         self.request_selected_details();
+    }
+
+    fn active_snapshot_matches_background_refresh(&self, snapshot: &RepositorySnapshot) -> bool {
+        let Some(current) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let mut comparable = snapshot.clone();
+        self.apply_history_sort_order_to_snapshot(&mut comparable);
+        repository_snapshots_equal_for_refresh(current, &comparable)
     }
 
     fn maybe_prepare_rewritten_history_prompt(&mut self, snapshot: &RepositorySnapshot) {
@@ -2837,6 +3071,66 @@ impl GitAgentApp {
     fn open_repo_settings_from_menu(&mut self) {
         self.repo_settings_tab = SettingsTab::RepoRemotes;
         self.repo_settings_open = true;
+    }
+
+    fn menu_shortcut_command_enabled(&self, command: MenuShortcutCommand) -> bool {
+        let has_repo = self.active_repo_tab.is_some() && self.snapshot.is_some();
+        let git_dialog_enabled = has_repo && !self.branch_actions_busy();
+
+        match command {
+            MenuShortcutCommand::OpenRepository | MenuShortcutCommand::OpenSettings => true,
+            MenuShortcutCommand::OpenRepositorySettings => has_repo,
+            MenuShortcutCommand::StashChanges
+            | MenuShortcutCommand::Checkout
+            | MenuShortcutCommand::CreateBranch
+            | MenuShortcutCommand::CreateTag => git_dialog_enabled,
+            MenuShortcutCommand::Merge => {
+                git_dialog_enabled
+                    && self.snapshot.as_ref().is_some_and(|snapshot| {
+                        !snapshot.all_date_commits.is_empty() || !snapshot.commits.is_empty()
+                    })
+            }
+            MenuShortcutCommand::CreatePullRequest => {
+                has_repo
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !snapshot.remotes.is_empty())
+            }
+        }
+    }
+
+    fn execute_menu_shortcut_command(&mut self, command: MenuShortcutCommand) {
+        if !self.menu_shortcut_command_enabled(command) {
+            return;
+        }
+
+        match command {
+            MenuShortcutCommand::OpenRepository => {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.load_repository(path);
+                }
+            }
+            MenuShortcutCommand::OpenSettings => {
+                self.settings_tab = SettingsTab::General;
+                self.settings_open = true;
+            }
+            MenuShortcutCommand::OpenRepositorySettings => self.open_repo_settings_from_menu(),
+            MenuShortcutCommand::StashChanges => {
+                self.handle_stash_action(StashMenuAction::Create);
+            }
+            MenuShortcutCommand::Checkout => self.open_checkout_dialog(),
+            MenuShortcutCommand::CreateBranch => {
+                self.handle_branch_action(BranchMenuAction::Create);
+            }
+            MenuShortcutCommand::Merge => self.open_merge_dialog(),
+            MenuShortcutCommand::CreateTag => {
+                self.handle_tag_action(TagMenuAction::Create);
+            }
+            MenuShortcutCommand::CreatePullRequest => {
+                self.create_pull_request_current_branch();
+            }
+        }
     }
 
     fn actions_menu_command_enabled(&self, command: ActionsMenuCommand) -> bool {
@@ -3231,6 +3525,176 @@ impl GitAgentApp {
                 self.tr("repo.resource_manager.failed")
             ));
         }
+    }
+
+    fn configure_git_ssh_client(&self) {
+        let executable = self.resolved_ssh_client_executable();
+        let variant = executable.as_ref().map(|_| match self.ssh_client {
+            SshClientKind::PuttyPlink => "plink".to_owned(),
+            SshClientKind::OpenSsh => "ssh".to_owned(),
+        });
+        git::configure_ssh_command(executable, variant);
+    }
+
+    fn resolved_ssh_client_executable(&self) -> Option<PathBuf> {
+        resolve_ssh_client_executable(self.ssh_client, &self.ssh_executable_path)
+    }
+
+    fn putty_tools_available(&self) -> bool {
+        resolve_ssh_client_executable(SshClientKind::PuttyPlink, &self.ssh_executable_path)
+            .is_some()
+            && putty_agent_executable(&self.ssh_executable_path).is_some()
+    }
+
+    fn ssh_client_available(&self, client: SshClientKind) -> bool {
+        match client {
+            SshClientKind::PuttyPlink => self.putty_tools_available(),
+            SshClientKind::OpenSsh => {
+                resolve_ssh_client_executable(client, &self.ssh_executable_path).is_some()
+            }
+        }
+    }
+
+    fn refresh_ssh_install_prompt(&mut self) {
+        self.pending_ssh_install_prompt =
+            (!self.ssh_client_available(self.ssh_client)).then_some(self.ssh_client);
+    }
+
+    fn set_ssh_client(&mut self, client: SshClientKind) {
+        let changed = self.ssh_client != client;
+        if changed {
+            self.ssh_client = client;
+            self.configure_git_ssh_client();
+            self.save_app_settings();
+        }
+        self.refresh_ssh_install_prompt();
+    }
+
+    fn start_ssh_agent(&mut self) {
+        if !self.ssh_client_available(self.ssh_client) {
+            self.pending_ssh_install_prompt = Some(self.ssh_client);
+            return;
+        }
+        self.ssh_agent_status_open = true;
+        self.ssh_load_key_prompt_open = false;
+        self.ssh_agent_status = None;
+        self.start_ssh_tool_task(SshToolAction::StartAgent, None);
+    }
+
+    fn refresh_ssh_agent_status(&mut self) {
+        if self.ssh_tool_task.is_some() {
+            return;
+        }
+        if !self.ssh_client_available(self.ssh_client) {
+            self.pending_ssh_install_prompt = Some(self.ssh_client);
+            return;
+        }
+        self.ssh_agent_status_open = true;
+        self.start_ssh_tool_task(SshToolAction::RefreshAgentStatus, None);
+    }
+
+    fn choose_and_add_ssh_key(&mut self) {
+        if self.ssh_tool_task.is_some() {
+            return;
+        }
+        if !self.ssh_client_available(self.ssh_client) {
+            self.pending_ssh_install_prompt = Some(self.ssh_client);
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new();
+        let configured = PathBuf::from(self.ssh_key_path.trim());
+        if let Some(parent) = configured.parent().filter(|parent| parent.is_dir()) {
+            dialog = dialog.set_directory(parent);
+        } else if let Some(directory) = default_ssh_key_directory() {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(name) = configured.file_name().and_then(|name| name.to_str()) {
+            dialog = dialog.set_file_name(name);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        self.ssh_key_path = user_facing_path_string(&path);
+        self.save_app_settings();
+        self.start_ssh_tool_task(SshToolAction::AddKey, Some(path));
+    }
+
+    fn start_ssh_tool_task(&mut self, action: SshToolAction, key: Option<PathBuf>) {
+        if self.ssh_tool_task.is_some() {
+            return;
+        }
+        let client = self.ssh_client;
+        let language = self.language;
+        let configured_executable = self.ssh_executable_path.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.ssh_tool_action = Some(action);
+        self.ssh_tool_task = Some(receiver);
+        self.error = None;
+        thread::spawn(move || {
+            let result = match action {
+                SshToolAction::StartAgent => {
+                    launch_ssh_agent(client, &configured_executable, key.as_deref(), language)
+                        .map(SshToolTaskOutput::AgentStatus)
+                }
+                SshToolAction::RefreshAgentStatus => {
+                    read_ssh_agent_status(client, &configured_executable, language)
+                        .map(SshToolTaskOutput::AgentStatus)
+                }
+                SshToolAction::AddKey => key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("SSH key path is missing"))
+                    .and_then(|key| {
+                        add_ssh_key_to_agent(client, &configured_executable, key, language)
+                    })
+                    .map(SshToolTaskOutput::Message),
+                SshToolAction::InstallOpenSsh => {
+                    install_openssh_client(language).map(SshToolTaskOutput::Message)
+                }
+            };
+            let _ = sender.send((action, result));
+        });
+    }
+
+    fn start_update_check(&mut self) {
+        if self.update_task.is_some() {
+            return;
+        }
+        self.about_open = false;
+        self.update_dialog_open = true;
+        self.update_release = None;
+        self.update_error = None;
+        self.update_installed = false;
+        let (sender, receiver) = mpsc::channel();
+        self.update_task_action = Some(UpdateTaskAction::Check);
+        self.update_task = Some(receiver);
+        thread::spawn(move || {
+            let result = updater::check_latest_release(env!("CARGO_PKG_VERSION"))
+                .map(UpdateTaskOutput::Checked);
+            let _ = sender.send((UpdateTaskAction::Check, result));
+        });
+    }
+
+    fn start_update_install(&mut self) {
+        if self.update_task.is_some() {
+            return;
+        }
+        let Some(asset) = self
+            .update_release
+            .as_ref()
+            .and_then(|release| release.asset.clone())
+        else {
+            self.update_error = Some(self.tr("update.no_asset").to_owned());
+            return;
+        };
+        self.update_error = None;
+        self.update_installed = false;
+        let (sender, receiver) = mpsc::channel();
+        self.update_task_action = Some(UpdateTaskAction::Install);
+        self.update_task = Some(receiver);
+        thread::spawn(move || {
+            let result = updater::download_and_install(&asset).map(UpdateTaskOutput::Installed);
+            let _ = sender.send((UpdateTaskAction::Install, result));
+        });
     }
 
     fn open_repo_config_file(&mut self) {
@@ -4312,6 +4776,11 @@ impl GitAgentApp {
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        if let Some(menu) = top_menu_accelerator_pressed(ctx) {
+            self.requested_top_menu = Some(menu);
+            return;
+        }
+
         if stage_toggle_shortcut_pressed(ctx) {
             self.stage_toggle_current_repository();
             return;
@@ -4326,7 +4795,14 @@ impl GitAgentApp {
             return;
         }
 
-        if ctx.input(|input| input.key_pressed(egui::Key::F5)) {
+        if let Some(command) = menu_shortcut_pressed(ctx) {
+            self.execute_menu_shortcut_command(command);
+            return;
+        }
+
+        if shortcut_pressed(ctx, egui::Key::N, false) {
+            self.open_repository_source_tab();
+        } else if ctx.input(|input| input.key_pressed(egui::Key::F5)) {
             self.refresh();
         } else if shortcut_pressed(ctx, egui::Key::Tab, true) {
             self.switch_to_previous_tab();
@@ -4382,9 +4858,15 @@ impl GitAgentApp {
                     .remove(&repo_state_key(&requested_root));
                 match result {
                     Ok(snapshot) => {
+                        let active_repo = self.active_repo_root_matches(&requested_root);
+                        let unchanged_background_snapshot = active_repo
+                            && !was_foreground
+                            && self.active_snapshot_matches_background_refresh(&snapshot);
                         self.cache_repository_snapshot(&snapshot);
-                        if self.active_repo_root_matches(&requested_root) {
-                            self.apply_repository_snapshot(snapshot);
+                        if active_repo {
+                            if !unchanged_background_snapshot {
+                                self.apply_repository_snapshot(snapshot);
+                            }
                             self.pending_branch_checkout = None;
                         }
                     }
@@ -4485,6 +4967,107 @@ impl GitAgentApp {
             }
             if keep_receiver {
                 self.repository_benchmark_task = Some(receiver);
+            }
+        }
+
+        if let Some(receiver) = self.ssh_tool_task.take() {
+            match receiver.try_recv() {
+                Ok((action, Ok(output))) => {
+                    self.ssh_tool_action = None;
+                    self.error = None;
+                    if action == SshToolAction::InstallOpenSsh {
+                        if !self.ssh_executable_path.trim().is_empty()
+                            && resolve_ssh_client_executable(
+                                SshClientKind::OpenSsh,
+                                &self.ssh_executable_path,
+                            )
+                            .is_none()
+                        {
+                            self.ssh_executable_path.clear();
+                            self.save_app_settings();
+                        }
+                        self.configure_git_ssh_client();
+                        self.refresh_ssh_install_prompt();
+                    }
+                    match output {
+                        SshToolTaskOutput::AgentStatus(status) => {
+                            self.ssh_load_key_prompt_open = action == SshToolAction::StartAgent
+                                && ssh_agent_should_prompt_for_key(&status);
+                            self.ssh_agent_status = Some(status);
+                            self.ssh_agent_status_open = true;
+                        }
+                        SshToolTaskOutput::Message(message) => {
+                            let prefix = match action {
+                                SshToolAction::AddKey => self.tr("ssh.key_added"),
+                                SshToolAction::InstallOpenSsh => self.tr("ssh.openssh_installed"),
+                                SshToolAction::StartAgent | SshToolAction::RefreshAgentStatus => {
+                                    self.tr("ssh.agent_started")
+                                }
+                            };
+                            self.show_toast(format!("{prefix}: {message}"));
+                            if action == SshToolAction::AddKey
+                                && self.ssh_client == SshClientKind::OpenSsh
+                            {
+                                self.refresh_ssh_agent_status();
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((_, Err(error))) => {
+                    self.ssh_tool_action = None;
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.ssh_tool_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.ssh_tool_action = None;
+                    self.error = Some(self.tr("ssh.task_stopped").to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.update_task.take() {
+            match receiver.try_recv() {
+                Ok((_, Ok(UpdateTaskOutput::Checked(release)))) => {
+                    self.update_task_action = None;
+                    self.update_release = Some(release);
+                    self.update_error = None;
+                    ctx.request_repaint();
+                }
+                Ok((_, Ok(UpdateTaskOutput::Installed(outcome)))) => {
+                    self.update_task_action = None;
+                    self.update_error = None;
+                    match outcome {
+                        InstallOutcome::InstallerLaunched => {
+                            self.exit_after_update_launch = true;
+                        }
+                        InstallOutcome::Installed => {
+                            self.update_installed = true;
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((_, Err(error))) => {
+                    self.update_task_action = None;
+                    self.update_error = Some(error.to_string());
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.update_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.update_task_action = None;
+                    self.update_error = Some(self.tr("update.stopped").to_owned());
+                    ctx.request_repaint();
+                }
             }
         }
 
@@ -5167,6 +5750,9 @@ impl GitAgentApp {
             inactive_repo_refresh_seconds: self.inactive_repo_refresh_seconds,
             remote_accounts: self.remote_accounts.clone(),
             custom_actions: self.custom_actions.clone(),
+            ssh_client: self.ssh_client,
+            ssh_key_path: self.ssh_key_path.clone(),
+            ssh_executable_path: self.ssh_executable_path.clone(),
         }
         .save();
     }
@@ -5400,14 +5986,15 @@ impl App for GitAgentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
+        if self.exit_after_update_launch {
+            self.exit_after_update_launch = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         self.maybe_refresh_repositories(ctx);
         self.maybe_start_clone_url_validation(ctx);
         self.handle_global_shortcuts(ctx);
         self.flush_pending_toolbar_single_click(ctx);
-        if ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Comma)) {
-            self.settings_tab = SettingsTab::General;
-            self.settings_open = true;
-        }
 
         egui::TopBottomPanel::top("top_bar")
             .exact_height(self.top_bar_height())
@@ -5444,6 +6031,10 @@ impl App for GitAgentApp {
         self.stash_action_modal(ctx);
         self.branch_action_modal(ctx);
         self.tag_action_modal(ctx);
+        self.about_modal(ctx);
+        self.update_modal(ctx);
+        self.ssh_agent_status_modal(ctx);
+        self.ssh_install_prompt_modal(ctx);
         self.settings_modal(ctx);
         self.repo_settings_modal(ctx);
         self.repo_remote_action_modal(ctx);
@@ -5454,6 +6045,564 @@ impl App for GitAgentApp {
 }
 
 impl GitAgentApp {
+    fn about_modal(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.about_open = false;
+            return;
+        }
+
+        let mut close_requested = false;
+        compact_action_dialog(ctx, self.tr("about.title"), 560.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Git Agent")
+                        .size(18.0)
+                        .strong()
+                        .color(theme::text()),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}",
+                        self.tr("about.version"),
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                    .color(theme::muted()),
+                );
+            });
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .id_salt("about_markdown")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    render_about_markdown(ui, about_markdown(self.language))
+                });
+            ui.add_space(6.0);
+            if ui
+                .link(format!(
+                    "{}: github.com/adoin/git-Agent",
+                    self.tr("about.repository")
+                ))
+                .clicked()
+            {
+                if let Err(error) = open_url(updater::REPOSITORY_URL) {
+                    self.error = Some(error.to_string());
+                }
+            }
+            dialog_footer_row(ui, |ui| {
+                if dialog_action_button(ui, self.tr("dialog.close"), true, false).clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+        if close_requested {
+            self.about_open = false;
+        }
+    }
+
+    fn update_modal(&mut self, ctx: &egui::Context) {
+        if !self.update_dialog_open {
+            return;
+        }
+
+        let task_action = self.update_task_action;
+        let task_busy = self.update_task.is_some();
+        if !task_busy && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.update_dialog_open = false;
+            return;
+        }
+
+        let release = self.update_release.clone();
+        let update_error = self.update_error.clone();
+        let update_installed = self.update_installed;
+        let mut close_requested = false;
+        let mut retry_requested = false;
+        let mut install_requested = false;
+        let mut open_release_requested = false;
+        compact_action_dialog(ctx, self.tr("update.title"), 560.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(self.tr("update.current_version")).color(theme::muted()));
+                ui.label(
+                    RichText::new(env!("CARGO_PKG_VERSION"))
+                        .strong()
+                        .color(theme::text()),
+                );
+            });
+
+            if task_busy {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let key = match task_action {
+                        Some(UpdateTaskAction::Install) => "update.installing",
+                        Some(UpdateTaskAction::Check) | None => "update.checking",
+                    };
+                    ui.label(self.tr(key));
+                });
+                ctx.request_repaint_after(Duration::from_millis(80));
+            } else if update_installed {
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(self.tr("update.installed"))
+                        .strong()
+                        .color(theme::accent_deep()),
+                );
+                ui.label(RichText::new(self.tr("update.restart_required")).color(theme::muted()));
+            } else if let Some(error) = &update_error {
+                ui.add_space(10.0);
+                ui.label(RichText::new(self.tr("update.failed")).color(theme::warning()));
+                egui::ScrollArea::vertical()
+                    .id_salt("update_error")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(error).monospace().color(theme::text()))
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    });
+            } else if let Some(release) = &release {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if release.is_newer {
+                            self.tr("update.available")
+                        } else {
+                            self.tr("update.up_to_date")
+                        })
+                        .strong()
+                        .color(if release.is_newer {
+                            theme::warning()
+                        } else {
+                            theme::accent_deep()
+                        }),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {}",
+                            self.tr("update.latest_version"),
+                            release.tag
+                        ))
+                        .color(theme::text()),
+                    );
+                });
+                if !release.notes.is_empty() {
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("update_release_notes")
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&release.notes).color(theme::text()),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                        });
+                }
+                if release.is_newer {
+                    ui.add_space(6.0);
+                    if let Some(asset) = &release.asset {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {} ({})",
+                                self.tr("update.package"),
+                                asset.name,
+                                format_byte_size(asset.size)
+                            ))
+                            .color(theme::muted()),
+                        );
+                    } else {
+                        ui.label(RichText::new(self.tr("update.no_asset")).color(theme::warning()));
+                    }
+                }
+            }
+
+            dialog_footer_row(ui, |ui| {
+                if dialog_action_button(ui, self.tr("dialog.close"), !task_busy, false).clicked() {
+                    close_requested = true;
+                }
+                if !task_busy && update_error.is_some() {
+                    if dialog_action_button(ui, self.tr("update.retry"), true, true).clicked() {
+                        retry_requested = true;
+                    }
+                } else if !task_busy {
+                    if let Some(release) = &release {
+                        if release.is_newer && release.asset.is_some() {
+                            if dialog_action_button(
+                                ui,
+                                self.tr("update.download_install"),
+                                true,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                install_requested = true;
+                            }
+                        } else if release.is_newer
+                            && dialog_action_button(ui, self.tr("update.open_release"), true, true)
+                                .clicked()
+                        {
+                            open_release_requested = true;
+                        }
+                    }
+                }
+            });
+        });
+
+        if close_requested {
+            self.update_dialog_open = false;
+        }
+        if retry_requested {
+            self.start_update_check();
+        }
+        if install_requested {
+            self.start_update_install();
+        }
+        if open_release_requested {
+            let url = release
+                .as_ref()
+                .map(|release| release.page_url.as_str())
+                .unwrap_or(updater::RELEASE_PAGE_URL);
+            if let Err(error) = open_url(url) {
+                self.update_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn ssh_agent_status_modal(&mut self, ctx: &egui::Context) {
+        if !self.ssh_agent_status_open {
+            return;
+        }
+
+        let tool_busy = self.ssh_tool_task.is_some();
+        if !tool_busy && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.ssh_agent_status_open = false;
+            return;
+        }
+
+        let status = self.ssh_agent_status.clone();
+        let client = self.ssh_client;
+        let load_key_prompt = self.ssh_load_key_prompt_open && !tool_busy;
+        let mut close_requested = false;
+        let mut refresh_requested = false;
+        let mut add_key_requested = false;
+        let title = if load_key_prompt {
+            self.tr("ssh.load_key.title")
+        } else {
+            self.tr("ssh.status.title")
+        };
+        let width = if load_key_prompt { 450.0 } else { 520.0 };
+        compact_action_dialog(ctx, title, width, |ui| {
+            if load_key_prompt {
+                ui.label(RichText::new(self.tr("ssh.load_key.message")).color(theme::text()));
+                dialog_footer_row(ui, |ui| {
+                    let yes = self.tr("ssh.load_key.yes");
+                    let no = self.tr("ssh.load_key.no");
+                    let action_width = inline_button_width(ui, yes, 12.0, 64.0, 144.0, 24.0)
+                        .max(inline_button_width(ui, no, 12.0, 64.0, 144.0, 24.0));
+                    let action_size = Vec2::new(action_width, 28.0);
+                    if dialog_sized_action_button(ui, no, true, false, action_size).clicked() {
+                        close_requested = true;
+                    }
+                    if dialog_sized_action_button(ui, yes, true, true, action_size).clicked() {
+                        add_key_requested = true;
+                    }
+                });
+                return;
+            }
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(self.tr("ssh.status.client")).color(theme::muted()));
+                ui.label(RichText::new(client.label()).strong().color(theme::text()));
+            });
+            ui.add_space(6.0);
+
+            if tool_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let key = match self.ssh_tool_action {
+                        Some(SshToolAction::StartAgent) => "ssh.status.starting",
+                        Some(SshToolAction::RefreshAgentStatus) => "ssh.status.refreshing",
+                        Some(SshToolAction::AddKey) => "ssh.status.adding_key",
+                        Some(SshToolAction::InstallOpenSsh) | None => "ssh.status.refreshing",
+                    };
+                    ui.label(self.tr(key));
+                });
+                ctx.request_repaint_after(Duration::from_millis(80));
+            } else if let Some(status) = &status {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.tr("ssh.status.state")).color(theme::muted()));
+                    ui.label(
+                        RichText::new(self.tr("ssh.status.running"))
+                            .strong()
+                            .color(theme::accent_deep()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(self.tr("ssh.status.backend")).color(theme::muted()));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(status.backend.clone())
+                                .monospace()
+                                .color(theme::text()),
+                        )
+                        .selectable(true),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(self.tr("ssh.status.loaded_keys"))
+                        .strong()
+                        .color(theme::text()),
+                );
+                ui.add_space(3.0);
+                if status.can_list_identities {
+                    if status.identities.is_empty() {
+                        ui.label(
+                            RichText::new(self.tr("ssh.status.no_keys")).color(theme::muted()),
+                        );
+                    } else {
+                        egui::Frame::new()
+                            .fill(theme::panel_soft())
+                            .corner_radius(CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                for identity in &status.identities {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(identity)
+                                                .monospace()
+                                                .color(theme::text()),
+                                        )
+                                        .selectable(true)
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(self.tr("ssh.status.external_key_list"))
+                            .color(theme::muted()),
+                    );
+                }
+                ui.add_space(8.0);
+                let hint = match status.client {
+                    SshClientKind::OpenSsh => self.tr("ssh.status.openssh_background"),
+                    SshClientKind::PuttyPlink => self.tr("ssh.status.putty_tray"),
+                };
+                ui.label(RichText::new(hint).small().color(theme::muted()));
+            }
+
+            dialog_footer_row(ui, |ui| {
+                let add_key = self.tr("ssh.status.add_key");
+                let refresh = self.tr("ssh.status.refresh");
+                let close = self.tr("dialog.close");
+                let action_width = [add_key, refresh, close]
+                    .into_iter()
+                    .map(|label| inline_button_width(ui, label, 12.0, 64.0, 144.0, 24.0))
+                    .fold(64.0, f32::max);
+                let action_size = Vec2::new(action_width, 28.0);
+                if dialog_sized_action_button(ui, close, !tool_busy, false, action_size).clicked() {
+                    close_requested = true;
+                }
+                if dialog_sized_action_button(
+                    ui,
+                    refresh,
+                    !tool_busy && client == SshClientKind::OpenSsh,
+                    false,
+                    action_size,
+                )
+                .clicked()
+                {
+                    refresh_requested = true;
+                }
+                if dialog_sized_action_button(ui, add_key, !tool_busy, true, action_size).clicked()
+                {
+                    add_key_requested = true;
+                }
+            });
+        });
+
+        if close_requested {
+            self.ssh_agent_status_open = false;
+            self.ssh_load_key_prompt_open = false;
+        }
+        if refresh_requested {
+            self.refresh_ssh_agent_status();
+        }
+        if add_key_requested {
+            self.ssh_load_key_prompt_open = false;
+            self.choose_and_add_ssh_key();
+        }
+    }
+
+    fn ssh_install_prompt_modal(&mut self, ctx: &egui::Context) {
+        let Some(missing_client) = self.pending_ssh_install_prompt else {
+            return;
+        };
+        if self.settings_open {
+            return;
+        }
+
+        let install_running = self.ssh_tool_task.is_some()
+            && self.ssh_tool_action == Some(SshToolAction::InstallOpenSsh);
+        let mut dismiss_requested = false;
+        let mut install_requested = false;
+        let mut guide_requested = false;
+        let mut recheck_requested = false;
+        let mut switch_client = None;
+        let mut open_settings = false;
+        let title = match missing_client {
+            SshClientKind::PuttyPlink => self.tr("ssh.install.title"),
+            SshClientKind::OpenSsh => self.tr("ssh.openssh_install.title"),
+        };
+        compact_action_dialog(ctx, title, 560.0, |ui| {
+            let message = match missing_client {
+                SshClientKind::PuttyPlink => self.tr("ssh.install.message"),
+                SshClientKind::OpenSsh => self.tr("ssh.openssh_install.message"),
+            };
+            ui.label(
+                RichText::new(message)
+                    .color(theme::text())
+                    .line_height(Some(20.0)),
+            );
+            ui.add_space(6.0);
+            let hint = match missing_client {
+                SshClientKind::PuttyPlink => self.tr("ssh.install.auto_detect_hint"),
+                SshClientKind::OpenSsh if cfg!(target_os = "windows") => {
+                    self.tr("ssh.openssh_install.windows_hint")
+                }
+                SshClientKind::OpenSsh => self.tr("ssh.openssh_install.unix_hint"),
+            };
+            ui.label(RichText::new(hint).small().color(theme::muted()));
+            if install_running {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(self.tr("ssh.openssh_install.installing"));
+                });
+            }
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                match missing_client {
+                    SshClientKind::PuttyPlink => {
+                        if dialog_primary_button(ui, self.tr("ssh.install.download"), true)
+                            .clicked()
+                        {
+                            if let Err(error) = open_url(PUTTY_DOWNLOAD_URL) {
+                                self.error = Some(error.to_string());
+                            }
+                            dismiss_requested = true;
+                        }
+                        if ui.button(self.tr("ssh.install.use_openssh")).clicked() {
+                            switch_client = Some(SshClientKind::OpenSsh);
+                        }
+                    }
+                    SshClientKind::OpenSsh => {
+                        #[cfg(target_os = "windows")]
+                        if dialog_primary_button(
+                            ui,
+                            self.tr("ssh.openssh_install.install"),
+                            !install_running,
+                        )
+                        .clicked()
+                        {
+                            install_requested = true;
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        if dialog_primary_button(
+                            ui,
+                            self.tr("ssh.openssh_install.guide"),
+                            !install_running,
+                        )
+                        .clicked()
+                        {
+                            guide_requested = true;
+                        }
+                        #[cfg(target_os = "windows")]
+                        if ui
+                            .add_enabled(
+                                !install_running,
+                                egui::Button::new(self.tr("ssh.openssh_install.guide")),
+                            )
+                            .clicked()
+                        {
+                            guide_requested = true;
+                        }
+                        if self.putty_tools_available()
+                            && ui
+                                .add_enabled(
+                                    !install_running,
+                                    egui::Button::new(self.tr("ssh.openssh_install.use_putty")),
+                                )
+                                .clicked()
+                        {
+                            switch_client = Some(SshClientKind::PuttyPlink);
+                        }
+                        if ui
+                            .add_enabled(
+                                !install_running,
+                                egui::Button::new(self.tr("ssh.openssh_install.recheck")),
+                            )
+                            .clicked()
+                        {
+                            recheck_requested = true;
+                        }
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        !install_running,
+                        egui::Button::new(self.tr("ssh.install.open_settings")),
+                    )
+                    .clicked()
+                {
+                    open_settings = true;
+                }
+                if ui
+                    .add_enabled(
+                        !install_running,
+                        egui::Button::new(self.tr("ssh.install.later")),
+                    )
+                    .clicked()
+                {
+                    dismiss_requested = true;
+                }
+            });
+        });
+
+        if install_requested {
+            self.start_ssh_tool_task(SshToolAction::InstallOpenSsh, None);
+        }
+        if guide_requested {
+            if let Err(error) = open_url(OPENSSH_INSTALL_GUIDE_URL) {
+                self.error = Some(error.to_string());
+            }
+        }
+        if recheck_requested {
+            self.configure_git_ssh_client();
+            self.refresh_ssh_install_prompt();
+            if self.pending_ssh_install_prompt.is_none() {
+                self.show_toast(self.tr("ssh.openssh_install.detected").to_owned());
+            }
+        }
+        if let Some(client) = switch_client {
+            self.set_ssh_client(client);
+        }
+        if open_settings {
+            self.settings_tab = SettingsTab::Git;
+            self.settings_open = true;
+        }
+        if dismiss_requested {
+            self.pending_ssh_install_prompt = None;
+        }
+    }
+
     fn repository_benchmark_progress_modal(&mut self, ctx: &egui::Context) {
         if self.repository_benchmark_task.is_none() {
             return;
@@ -5738,6 +6887,7 @@ impl GitAgentApp {
     }
 
     fn desktop_menu_bar(&mut self, ui: &mut Ui, has_repo: bool, has_remote: bool) {
+        let requested_top_menu = self.requested_top_menu.take();
         let repo_action_busy = self.loading_repo || self.remote_git_busy();
         let repo_action_enabled = !repo_action_busy && has_repo;
         let remote_action_enabled = repo_action_enabled && has_remote;
@@ -5755,707 +6905,806 @@ impl GitAgentApp {
             .is_some_and(|snapshot| !snapshot.commits.is_empty());
         ui.horizontal_centered(|ui| {
             ui.add_space(8.0);
-            top_menu_button(ui, menu_label(self.language, "file"), |ui| {
-                if menu_text_button(ui, true, self.tr("action.open")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.load_repository(path);
+            top_menu_button(
+                ui,
+                menu_label(self.language, "file"),
+                requested_top_menu == Some(TopMenu::File),
+                |ui| {
+                    if menu_shortcut_button(ui, true, self.tr("action.clone_new"), "Ctrl+N")
+                        .clicked()
+                    {
+                        self.open_repository_source_tab();
+                        ui.close_menu();
                     }
-                    ui.close_menu();
-                }
-            });
-            top_menu_button(ui, menu_label(self.language, "view"), |ui| {
-                if menu_shortcut_button(ui, has_repo, self.tr("action.refresh"), "F5").clicked() {
-                    self.refresh();
-                    ui.close_menu();
-                }
-                let tab_nav_enabled = self.open_tab_count() > 1;
-                if menu_shortcut_button(
-                    ui,
-                    tab_nav_enabled,
-                    menu_label(self.language, "next_tab"),
-                    "Ctrl+Tab",
-                )
-                .clicked()
-                {
-                    self.switch_to_next_tab();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    tab_nav_enabled,
-                    menu_label(self.language, "previous_tab"),
-                    "Ctrl+Shift+Tab",
-                )
-                .clicked()
-                {
-                    self.switch_to_previous_tab();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    has_repo,
-                    menu_label(self.language, "view_workspace"),
-                    "Ctrl+1",
-                )
-                .clicked()
-                {
-                    self.active_view = MainView::Workspace;
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    has_repo,
-                    menu_label(self.language, "view_history"),
-                    "Ctrl+2",
-                )
-                .clicked()
-                {
-                    self.active_view = MainView::History;
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    has_repo,
-                    menu_label(self.language, "view_search"),
-                    "Ctrl+3",
-                )
-                .clicked()
-                {
-                    self.active_view = MainView::Search;
-                    ui.close_menu();
-                }
-                let workspace_repositories_label = if self.show_workspace_repositories {
-                    menu_label(self.language, "hide_workspace_repositories")
-                } else {
-                    menu_label(self.language, "show_workspace_repositories")
-                };
-                if menu_shortcut_button(ui, true, workspace_repositories_label, "Ctrl+B").clicked()
-                {
-                    self.show_workspace_repositories = !self.show_workspace_repositories;
-                    ui.close_menu();
-                }
-                action_checkbox(
-                    ui,
-                    &mut self.history_show_branch_refs,
-                    menu_label(self.language, "show_branch_labels"),
-                );
-                action_checkbox(
-                    ui,
-                    &mut self.history_show_tag_refs,
-                    menu_label(self.language, "show_tag_labels"),
-                );
-            });
-            top_menu_button(ui, menu_label(self.language, "repo"), |ui| {
-                if menu_text_button(ui, has_repo, menu_label(self.language, "repo_settings"))
-                    .clicked()
-                {
-                    self.open_repo_settings_from_menu();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    has_repo && has_remote,
-                    menu_label(self.language, "repo_view_online"),
-                )
-                .clicked()
-                {
-                    self.open_remote_url();
-                    ui.close_menu();
-                }
-                let stage_toggle_enabled = git_dialog_enabled
-                    && self
-                        .snapshot
-                        .as_ref()
-                        .and_then(shortcut_stage_toggle_action)
-                        .is_some();
-                if menu_shortcut_button(
-                    ui,
-                    stage_toggle_enabled,
-                    menu_label(self.language, "repo_stage_toggle"),
-                    "Ctrl+Shift+C",
-                )
-                .clicked()
-                {
-                    self.stage_toggle_current_repository();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && has_worktree_changes,
-                    menu_label(self.language, "repo_discard"),
-                )
-                .clicked()
-                {
-                    self.pending_worktree_action = Some(WorktreeActionDialog::ConfirmDiscardAll);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_stash_changes"),
-                )
-                .clicked()
-                {
-                    self.handle_stash_action(StashMenuAction::Create);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    remote_action_enabled,
-                    menu_label(self.language, "repo_push"),
-                    "Ctrl+P",
-                )
-                .clicked()
-                {
-                    self.push_current();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    remote_action_enabled,
-                    menu_label(self.language, "repo_pull"),
-                    "Ctrl+L",
-                )
-                .clicked()
-                {
-                    self.pull_current();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    remote_action_enabled,
-                    menu_label(self.language, "repo_fetch"),
-                    "Ctrl+F",
-                )
-                .clicked()
-                {
-                    self.fetch_all();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_checkout"),
-                )
-                .clicked()
-                {
-                    self.open_checkout_dialog();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_branch"),
-                )
-                .clicked()
-                {
-                    self.handle_branch_action(BranchMenuAction::Create);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && has_merge_targets,
-                    menu_label(self.language, "repo_merge"),
-                )
-                .clicked()
-                {
-                    self.open_merge_dialog();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_tag"),
-                )
-                .clicked()
-                {
-                    self.handle_tag_action(TagMenuAction::Create);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && has_archive_target,
-                    menu_label(self.language, "repo_archive"),
-                )
-                .clicked()
-                {
-                    self.open_archive_dialog();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_interactive_rebase"),
-                )
-                .clicked()
-                {
-                    close_top_menu_popup(ui);
-                    self.open_interactive_rebase_dialog();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_add_submodule"),
-                )
-                .clicked()
-                {
-                    self.open_submodule_dialog();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_add_link_subtree"),
-                )
-                .clicked()
-                {
-                    self.open_subtree_dialog();
-                    ui.close_menu();
-                }
-                menu_button(ui, menu_label(self.language, "repo_git_lfs"), |ui| {
-                    if menu_text_button(
+                    if menu_shortcut_button(ui, true, self.tr("action.open"), "Ctrl+O").clicked() {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::OpenRepository);
+                        ui.close_menu();
+                    }
+                },
+            );
+            top_menu_button(
+                ui,
+                menu_label(self.language, "view"),
+                requested_top_menu == Some(TopMenu::View),
+                |ui| {
+                    if menu_shortcut_button(ui, has_repo, self.tr("action.refresh"), "F5").clicked()
+                    {
+                        self.refresh();
+                        ui.close_menu();
+                    }
+                    let tab_nav_enabled = self.open_tab_count() > 1;
+                    if menu_shortcut_button(
                         ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_initialize"),
+                        tab_nav_enabled,
+                        menu_label(self.language, "next_tab"),
+                        "Ctrl+Tab",
                     )
                     .clicked()
                     {
-                        self.open_lfs_intro_dialog();
+                        self.switch_to_next_tab();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        tab_nav_enabled,
+                        menu_label(self.language, "previous_tab"),
+                        "Ctrl+Shift+Tab",
+                    )
+                    .clicked()
+                    {
+                        self.switch_to_previous_tab();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        has_repo,
+                        menu_label(self.language, "view_workspace"),
+                        "Ctrl+1",
+                    )
+                    .clicked()
+                    {
+                        self.active_view = MainView::Workspace;
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        has_repo,
+                        menu_label(self.language, "view_history"),
+                        "Ctrl+2",
+                    )
+                    .clicked()
+                    {
+                        self.active_view = MainView::History;
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        has_repo,
+                        menu_label(self.language, "view_search"),
+                        "Ctrl+3",
+                    )
+                    .clicked()
+                    {
+                        self.active_view = MainView::Search;
+                        ui.close_menu();
+                    }
+                    let workspace_repositories_label = if self.show_workspace_repositories {
+                        menu_label(self.language, "hide_workspace_repositories")
+                    } else {
+                        menu_label(self.language, "show_workspace_repositories")
+                    };
+                    if menu_shortcut_button(ui, true, workspace_repositories_label, "Ctrl+B")
+                        .clicked()
+                    {
+                        self.show_workspace_repositories = !self.show_workspace_repositories;
+                        ui.close_menu();
+                    }
+                    action_checkbox(
+                        ui,
+                        &mut self.history_show_branch_refs,
+                        menu_label(self.language, "show_branch_labels"),
+                    );
+                    action_checkbox(
+                        ui,
+                        &mut self.history_show_tag_refs,
+                        menu_label(self.language, "show_tag_labels"),
+                    );
+                },
+            );
+            top_menu_button(
+                ui,
+                menu_label(self.language, "repo"),
+                requested_top_menu == Some(TopMenu::Repository),
+                |ui| {
+                    if menu_shortcut_button(
+                        ui,
+                        has_repo,
+                        menu_label(self.language, "repo_settings"),
+                        "Ctrl+Shift+,",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(
+                            MenuShortcutCommand::OpenRepositorySettings,
+                        );
                         ui.close_menu();
                     }
                     if menu_text_button(
                         ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_track_untrack"),
+                        has_repo && has_remote,
+                        menu_label(self.language, "repo_view_online"),
                     )
                     .clicked()
                     {
-                        self.open_lfs_track_dialog();
+                        self.open_remote_url();
                         ui.close_menu();
                     }
-                    if menu_text_button(
-                        ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_pull"),
-                    )
-                    .clicked()
-                    {
-                        self.execute_git_action(|root| git::lfs_pull(root));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_fetch"),
-                    )
-                    .clicked()
-                    {
-                        self.execute_git_action(|root| git::lfs_fetch(root));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_checkout"),
-                    )
-                    .clicked()
-                    {
-                        self.execute_git_action(|root| git::lfs_checkout(root));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_lfs_prune"),
-                    )
-                    .clicked()
-                    {
-                        self.execute_git_action(|root| git::lfs_prune(root));
-                        ui.close_menu();
-                    }
-                });
-                menu_button(ui, menu_label(self.language, "repo_git_flow"), |ui| {
-                    let git_flow_operation_enabled =
-                        git_flow_operation_menu_enabled(self.snapshot.as_ref(), git_dialog_enabled);
-                    if menu_text_button(
-                        ui,
-                        git_dialog_enabled,
-                        menu_label(self.language, "repo_git_flow_initialize"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_initialize_dialog();
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_start_feature"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
-                            git::GitFlowBranchKind::Feature,
-                        ));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_finish_feature"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
-                            git::GitFlowBranchKind::Feature,
-                        ));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_start_release"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
-                            git::GitFlowBranchKind::Release,
-                        ));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_finish_release"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
-                            git::GitFlowBranchKind::Release,
-                        ));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_start_hotfix"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Start(
-                            git::GitFlowBranchKind::Hotfix,
-                        ));
-                        ui.close_menu();
-                    }
-                    if menu_text_button(
-                        ui,
-                        git_flow_operation_enabled,
-                        menu_label(self.language, "repo_git_flow_finish_hotfix"),
-                    )
-                    .clicked()
-                    {
-                        self.open_git_flow_action_dialog(GitFlowOperation::Finish(
-                            git::GitFlowBranchKind::Hotfix,
-                        ));
-                        ui.close_menu();
-                    }
-                });
-                if menu_text_button(
-                    ui,
-                    has_repo && has_remote,
-                    menu_label(self.language, "repo_create_pull_request"),
-                )
-                .clicked()
-                {
-                    self.create_pull_request_current_branch();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "repo_benchmark_performance"),
-                )
-                .clicked()
-                {
-                    self.start_repository_benchmark();
-                    ui.close_menu();
-                }
-            });
-            top_menu_button(ui, menu_label(self.language, "actions"), |ui| {
-                let selected_worktree_action_state = self.selected_worktree_action_state();
-                let selected_conflict_path = self.selected_or_first_conflict_path();
-                let rebase_in_progress = self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.rebase_in_progress);
-
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::OpenSelected),
-                    menu_label(self.language, "actions_open"),
-                    "Shift+Ctrl+O",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::OpenSelected);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    has_repo,
-                    menu_label(self.language, "actions_show_in_file_manager"),
-                )
-                .clicked()
-                {
-                    self.open_resource_manager();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::OpenTerminal),
-                    menu_label(self.language, "actions_open_terminal"),
-                    "Shift+Alt+T",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::OpenTerminal);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::ExternalDiff),
-                    menu_label(self.language, "actions_external_diff"),
-                    "Ctrl+D",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::ExternalDiff);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "actions_create_patch"),
-                )
-                .clicked()
-                {
-                    self.open_create_patch_dialog();
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled,
-                    menu_label(self.language, "actions_apply_patch"),
-                )
-                .clicked()
-                {
-                    self.apply_patch_file();
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::StageSelected),
-                    menu_label(self.language, "actions_add"),
-                    "Ctrl+Shift+Plus",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::StageSelected);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::RemoveSelected),
-                    menu_label(self.language, "actions_remove"),
-                    "Ctrl+Del",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::RemoveSelected);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::UnstageSelected),
-                    menu_label(self.language, "actions_unstage"),
-                    "Ctrl+Shift+Minus",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::UnstageSelected);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::ToggleStageRepository),
-                    menu_label(self.language, "actions_add_remove"),
-                    "Ctrl+Shift+Alt+Plus",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::ToggleStageRepository);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled
-                        && selected_worktree_action_state
+                    let stage_toggle_enabled = git_dialog_enabled
+                        && self
+                            .snapshot
                             .as_ref()
-                            .is_some_and(|file| !file.untracked),
-                    menu_label(self.language, "actions_stop_tracking"),
-                )
-                .clicked()
-                {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::StopTracking {
-                            path: file.path,
-                        });
+                            .and_then(shortcut_stage_toggle_action)
+                            .is_some();
+                    if menu_shortcut_button(
+                        ui,
+                        stage_toggle_enabled,
+                        menu_label(self.language, "repo_stage_toggle"),
+                        "Ctrl+Shift+C",
+                    )
+                    .clicked()
+                    {
+                        self.stage_toggle_current_repository();
+                        ui.close_menu();
                     }
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && selected_worktree_action_state.is_some(),
-                    menu_label(self.language, "actions_ignore"),
-                )
-                .clicked()
-                {
-                    if let Some(file) = selected_worktree_action_state.clone() {
-                        self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore {
-                            pattern: normalize_worktree_path(&file.display_path),
-                        });
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && has_worktree_changes,
+                        menu_label(self.language, "repo_discard"),
+                    )
+                    .clicked()
+                    {
+                        self.pending_worktree_action =
+                            Some(WorktreeActionDialog::ConfirmDiscardAll);
+                        ui.close_menu();
                     }
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::ToggleStageRepository),
-                    stage_toggle_menu_label(self.language, self.snapshot.as_ref()),
-                    "Ctrl+Shift+C",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::ToggleStageRepository);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::DiscardSelected),
-                    menu_label(self.language, "actions_discard_selected"),
-                    "Shift+Ctrl+R",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::DiscardSelected);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && rebase_in_progress,
-                    menu_label(self.language, "actions_rebase_continue"),
-                )
-                .clicked()
-                {
-                    self.start_rebase_control_action(RebaseControlAction::Continue);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && rebase_in_progress,
-                    menu_label(self.language, "actions_rebase_abort"),
-                )
-                .clicked()
-                {
-                    self.start_rebase_control_action(RebaseControlAction::Abort);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    git_dialog_enabled && selected_conflict_path.is_some(),
-                    menu_label(self.language, "actions_resolve_conflicts"),
-                )
-                .clicked()
-                {
-                    self.open_selected_or_first_conflict_merge_tool();
-                    ui.close_menu();
-                }
-                hover_submenu_button_enabled(
-                    ui,
-                    true,
-                    menu_label(self.language, "actions_custom"),
-                    |ui| {
-                        for custom_action in self.custom_actions.clone() {
-                            if menu_text_button_with_text(
-                                ui,
-                                git_dialog_enabled,
-                                custom_action.name.clone(),
-                            )
-                            .clicked()
-                            {
-                                self.execute_custom_git_action(custom_action);
-                                ui.close_menu();
-                            }
-                        }
-                        if !self.custom_actions.is_empty() {
-                            ui.add_space(4.0);
-                        }
+                    if menu_shortcut_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_stash_changes"),
+                        "Ctrl+Shift+S",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::StashChanges);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        remote_action_enabled,
+                        menu_label(self.language, "repo_push"),
+                        "Ctrl+P",
+                    )
+                    .clicked()
+                    {
+                        self.push_current();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        remote_action_enabled,
+                        menu_label(self.language, "repo_pull"),
+                        "Ctrl+L",
+                    )
+                    .clicked()
+                    {
+                        self.pull_current();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        remote_action_enabled,
+                        menu_label(self.language, "repo_fetch"),
+                        "Ctrl+F",
+                    )
+                    .clicked()
+                    {
+                        self.fetch_all();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_checkout"),
+                        "Ctrl+Shift+U",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::Checkout);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_branch"),
+                        "Ctrl+Shift+B",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::CreateBranch);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        git_dialog_enabled && has_merge_targets,
+                        menu_label(self.language, "repo_merge"),
+                        "Ctrl+Shift+M",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::Merge);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_tag"),
+                        "Ctrl+Shift+T",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::CreateTag);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && has_archive_target,
+                        menu_label(self.language, "repo_archive"),
+                    )
+                    .clicked()
+                    {
+                        self.open_archive_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_interactive_rebase"),
+                    )
+                    .clicked()
+                    {
+                        close_top_menu_popup(ui);
+                        self.open_interactive_rebase_dialog();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_add_submodule"),
+                    )
+                    .clicked()
+                    {
+                        self.open_submodule_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_add_link_subtree"),
+                    )
+                    .clicked()
+                    {
+                        self.open_subtree_dialog();
+                        ui.close_menu();
+                    }
+                    menu_button(ui, menu_label(self.language, "repo_git_lfs"), |ui| {
                         if menu_text_button(
                             ui,
-                            true,
-                            menu_label(self.language, "actions_configure_custom"),
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_initialize"),
                         )
                         .clicked()
                         {
-                            self.open_custom_actions_settings();
+                            self.open_lfs_intro_dialog();
                             ui.close_menu();
                         }
-                    },
-                );
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::SelectedHistory),
-                    menu_label(self.language, "actions_selected_history"),
-                    "Shift+Alt+L",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::SelectedHistory);
-                    ui.close_menu();
-                }
-                if menu_shortcut_button(
-                    ui,
-                    self.actions_menu_command_enabled(ActionsMenuCommand::LineReview),
-                    menu_label(self.language, "actions_line_review"),
-                    "Shift+Alt+B",
-                )
-                .clicked()
-                {
-                    self.execute_actions_menu_command(ActionsMenuCommand::LineReview);
-                    ui.close_menu();
-                }
-                if menu_text_button(
-                    ui,
-                    selected_worktree_action_state.is_some(),
-                    menu_label(self.language, "actions_copy"),
-                )
-                .clicked()
-                {
-                    self.copy_selected_worktree_file_path(ui.ctx());
-                    ui.close_menu();
-                }
-            });
-            top_menu_button(ui, menu_label(self.language, "tools"), |ui| {
-                menu_text_button(ui, false, menu_label(self.language, "ssh_agent"));
-                menu_text_button(ui, false, menu_label(self.language, "process_viewer"));
-                if menu_text_button(ui, true, menu_label(self.language, "options")).clicked() {
-                    self.settings_tab = SettingsTab::General;
-                    self.settings_open = true;
-                    ui.close_menu();
-                }
-            });
-            top_menu_button(ui, menu_label(self.language, "help"), |ui| {
-                menu_text_button(ui, false, menu_label(self.language, "about"));
-            });
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_track_untrack"),
+                        )
+                        .clicked()
+                        {
+                            self.open_lfs_track_dialog();
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_pull"),
+                        )
+                        .clicked()
+                        {
+                            self.execute_git_action(|root| git::lfs_pull(root));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_fetch"),
+                        )
+                        .clicked()
+                        {
+                            self.execute_git_action(|root| git::lfs_fetch(root));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_checkout"),
+                        )
+                        .clicked()
+                        {
+                            self.execute_git_action(|root| git::lfs_checkout(root));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_lfs_prune"),
+                        )
+                        .clicked()
+                        {
+                            self.execute_git_action(|root| git::lfs_prune(root));
+                            ui.close_menu();
+                        }
+                    });
+                    menu_button(ui, menu_label(self.language, "repo_git_flow"), |ui| {
+                        let git_flow_operation_enabled = git_flow_operation_menu_enabled(
+                            self.snapshot.as_ref(),
+                            git_dialog_enabled,
+                        );
+                        if menu_text_button(
+                            ui,
+                            git_dialog_enabled,
+                            menu_label(self.language, "repo_git_flow_initialize"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_initialize_dialog();
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_start_feature"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                                git::GitFlowBranchKind::Feature,
+                            ));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_finish_feature"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                                git::GitFlowBranchKind::Feature,
+                            ));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_start_release"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                                git::GitFlowBranchKind::Release,
+                            ));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_finish_release"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                                git::GitFlowBranchKind::Release,
+                            ));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_start_hotfix"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Start(
+                                git::GitFlowBranchKind::Hotfix,
+                            ));
+                            ui.close_menu();
+                        }
+                        if menu_text_button(
+                            ui,
+                            git_flow_operation_enabled,
+                            menu_label(self.language, "repo_git_flow_finish_hotfix"),
+                        )
+                        .clicked()
+                        {
+                            self.open_git_flow_action_dialog(GitFlowOperation::Finish(
+                                git::GitFlowBranchKind::Hotfix,
+                            ));
+                            ui.close_menu();
+                        }
+                    });
+                    if menu_shortcut_button(
+                        ui,
+                        has_repo && has_remote,
+                        menu_label(self.language, "repo_create_pull_request"),
+                        "Shift+Alt+P",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::CreatePullRequest);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "repo_benchmark_performance"),
+                    )
+                    .clicked()
+                    {
+                        self.start_repository_benchmark();
+                        ui.close_menu();
+                    }
+                },
+            );
+            top_menu_button(
+                ui,
+                menu_label(self.language, "actions"),
+                requested_top_menu == Some(TopMenu::Actions),
+                |ui| {
+                    let selected_worktree_action_state = self.selected_worktree_action_state();
+                    let selected_conflict_path = self.selected_or_first_conflict_path();
+                    let rebase_in_progress = self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.rebase_in_progress);
+
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::OpenSelected),
+                        menu_label(self.language, "actions_open"),
+                        "Shift+Ctrl+O",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::OpenSelected);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        has_repo,
+                        menu_label(self.language, "actions_show_in_file_manager"),
+                    )
+                    .clicked()
+                    {
+                        self.open_resource_manager();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::OpenTerminal),
+                        menu_label(self.language, "actions_open_terminal"),
+                        "Shift+Alt+T",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::OpenTerminal);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::ExternalDiff),
+                        menu_label(self.language, "actions_external_diff"),
+                        "Ctrl+D",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::ExternalDiff);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "actions_create_patch"),
+                    )
+                    .clicked()
+                    {
+                        self.open_create_patch_dialog();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled,
+                        menu_label(self.language, "actions_apply_patch"),
+                    )
+                    .clicked()
+                    {
+                        self.apply_patch_file();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::StageSelected),
+                        menu_label(self.language, "actions_add"),
+                        "Ctrl+Shift+Plus",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::StageSelected);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::RemoveSelected),
+                        menu_label(self.language, "actions_remove"),
+                        "Ctrl+Del",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::RemoveSelected);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::UnstageSelected),
+                        menu_label(self.language, "actions_unstage"),
+                        "Ctrl+Shift+Minus",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::UnstageSelected);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(
+                            ActionsMenuCommand::ToggleStageRepository,
+                        ),
+                        menu_label(self.language, "actions_add_remove"),
+                        "Ctrl+Shift+Alt+Plus",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(
+                            ActionsMenuCommand::ToggleStageRepository,
+                        );
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled
+                            && selected_worktree_action_state
+                                .as_ref()
+                                .is_some_and(|file| !file.untracked),
+                        menu_label(self.language, "actions_stop_tracking"),
+                    )
+                    .clicked()
+                    {
+                        if let Some(file) = selected_worktree_action_state.clone() {
+                            self.handle_worktree_action(WorktreeMenuAction::StopTracking {
+                                path: file.path,
+                            });
+                        }
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && selected_worktree_action_state.is_some(),
+                        menu_label(self.language, "actions_ignore"),
+                    )
+                    .clicked()
+                    {
+                        if let Some(file) = selected_worktree_action_state.clone() {
+                            self.handle_worktree_action(WorktreeMenuAction::AddToGitIgnore {
+                                pattern: normalize_worktree_path(&file.display_path),
+                            });
+                        }
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(
+                            ActionsMenuCommand::ToggleStageRepository,
+                        ),
+                        stage_toggle_menu_label(self.language, self.snapshot.as_ref()),
+                        "Ctrl+Shift+C",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(
+                            ActionsMenuCommand::ToggleStageRepository,
+                        );
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::DiscardSelected),
+                        menu_label(self.language, "actions_discard_selected"),
+                        "Shift+Ctrl+R",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::DiscardSelected);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && rebase_in_progress,
+                        menu_label(self.language, "actions_rebase_continue"),
+                    )
+                    .clicked()
+                    {
+                        self.start_rebase_control_action(RebaseControlAction::Continue);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && rebase_in_progress,
+                        menu_label(self.language, "actions_rebase_abort"),
+                    )
+                    .clicked()
+                    {
+                        self.start_rebase_control_action(RebaseControlAction::Abort);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        git_dialog_enabled && selected_conflict_path.is_some(),
+                        menu_label(self.language, "actions_resolve_conflicts"),
+                    )
+                    .clicked()
+                    {
+                        self.open_selected_or_first_conflict_merge_tool();
+                        ui.close_menu();
+                    }
+                    hover_submenu_button_enabled(
+                        ui,
+                        true,
+                        menu_label(self.language, "actions_custom"),
+                        |ui| {
+                            for custom_action in self.custom_actions.clone() {
+                                if menu_text_button_with_text(
+                                    ui,
+                                    git_dialog_enabled,
+                                    custom_action.name.clone(),
+                                )
+                                .clicked()
+                                {
+                                    self.execute_custom_git_action(custom_action);
+                                    ui.close_menu();
+                                }
+                            }
+                            if !self.custom_actions.is_empty() {
+                                ui.add_space(4.0);
+                            }
+                            if menu_text_button(
+                                ui,
+                                true,
+                                menu_label(self.language, "actions_configure_custom"),
+                            )
+                            .clicked()
+                            {
+                                self.open_custom_actions_settings();
+                                ui.close_menu();
+                            }
+                        },
+                    );
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::SelectedHistory),
+                        menu_label(self.language, "actions_selected_history"),
+                        "Shift+Alt+L",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::SelectedHistory);
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        self.actions_menu_command_enabled(ActionsMenuCommand::LineReview),
+                        menu_label(self.language, "actions_line_review"),
+                        "Shift+Alt+B",
+                    )
+                    .clicked()
+                    {
+                        self.execute_actions_menu_command(ActionsMenuCommand::LineReview);
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        selected_worktree_action_state.is_some(),
+                        menu_label(self.language, "actions_copy"),
+                    )
+                    .clicked()
+                    {
+                        self.copy_selected_worktree_file_path(ui.ctx());
+                        ui.close_menu();
+                    }
+                },
+            );
+            top_menu_button(
+                ui,
+                menu_label(self.language, "tools"),
+                requested_top_menu == Some(TopMenu::Tools),
+                |ui| {
+                    let ssh_tool_enabled = self.ssh_tool_task.is_none();
+                    if menu_text_button(
+                        ui,
+                        ssh_tool_enabled,
+                        menu_label(self.language, "ssh_agent"),
+                    )
+                    .clicked()
+                    {
+                        self.start_ssh_agent();
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        ssh_tool_enabled,
+                        menu_label(self.language, "ssh_add_key"),
+                    )
+                    .clicked()
+                    {
+                        self.choose_and_add_ssh_key();
+                        ui.close_menu();
+                    }
+                    if menu_shortcut_button(
+                        ui,
+                        true,
+                        menu_label(self.language, "options"),
+                        "Ctrl+,",
+                    )
+                    .clicked()
+                    {
+                        self.execute_menu_shortcut_command(MenuShortcutCommand::OpenSettings);
+                        ui.close_menu();
+                    }
+                },
+            );
+            top_menu_button(
+                ui,
+                menu_label(self.language, "help"),
+                requested_top_menu == Some(TopMenu::Help),
+                |ui| {
+                    if menu_text_button(ui, true, menu_label(self.language, "about")).clicked() {
+                        self.update_dialog_open = false;
+                        self.about_open = true;
+                        ui.close_menu();
+                    }
+                    if menu_text_button(
+                        ui,
+                        self.update_task.is_none(),
+                        menu_label(self.language, "check_updates"),
+                    )
+                    .clicked()
+                    {
+                        self.start_update_check();
+                        ui.close_menu();
+                    }
+                },
+            );
         });
     }
 
@@ -6469,6 +7718,10 @@ impl GitAgentApp {
         let mut close_repo_tab = None;
         let mut close_source_tab = false;
         let mut reorder_repo_tab = None;
+        let mut repo_tab_rename = self.repo_tab_rename.take();
+        let mut rename_requested = None;
+        let mut rename_submitted = None;
+        let mut rename_cancelled = false;
 
         let full = ui.max_rect();
         let top_y = full.top();
@@ -6598,16 +7851,34 @@ impl GitAgentApp {
                 for item in visibility.visible_items.iter().copied() {
                     match item {
                         RepoTabVisibilityItem::Repo(index) => {
+                            let rename = repo_tab_rename
+                                .as_mut()
+                                .filter(|rename| rename.index == index);
+                            let tab_id = ui.id().with(("repo_tab", index));
                             let interaction = repo_tab_with_close(
                                 ui,
                                 UiIcon::Folder,
                                 active_repo_tab == Some(index),
                                 &repo_tab_names[index],
                                 &close_tab_label,
+                                tab_id,
+                                rename,
                             );
                             if interaction.close_clicked {
                                 close_repo_tab = Some(index);
-                            } else if interaction.response.drag_started() {
+                            } else if interaction.rename_cancelled {
+                                rename_cancelled = true;
+                            } else if interaction.rename_submitted {
+                                rename_submitted = repo_tab_rename
+                                    .as_ref()
+                                    .filter(|rename| rename.index == index)
+                                    .map(|rename| (index, rename.value.clone()));
+                            } else if interaction.rename_requested {
+                                rename_requested = Some(index);
+                                switch_to = Some(index);
+                            } else if repo_tab_rename.is_none()
+                                && interaction.response.drag_started()
+                            {
                                 self.repo_tab_drag.dragging_index = Some(index);
                             } else if let Some(from) = self.repo_tab_drag.dragging_index {
                                 if from != index && interaction.response.hovered() {
@@ -6618,12 +7889,15 @@ impl GitAgentApp {
                             }
                         }
                         RepoTabVisibilityItem::Source if source_tab_open => {
+                            let tab_id = ui.id().with("repository_source_tab");
                             let interaction = repo_tab_with_close(
                                 ui,
                                 UiIcon::Folder,
                                 source_active,
                                 &new_tab_label,
                                 &close_tab_label,
+                                tab_id,
+                                None,
                             );
                             if interaction.close_clicked {
                                 close_source_tab = true;
@@ -6653,6 +7927,17 @@ impl GitAgentApp {
                 }
             });
         });
+
+        self.repo_tab_rename = repo_tab_rename;
+        if rename_cancelled {
+            self.repo_tab_rename = None;
+        } else if let Some((index, value)) = rename_submitted {
+            self.apply_repo_tab_alias(index, &value);
+            self.repo_tab_rename = None;
+        }
+        if let Some(index) = rename_requested {
+            self.begin_repo_tab_rename(index);
+        }
 
         if !ui.input(|input| input.pointer.primary_down()) {
             self.repo_tab_drag.dragging_index = None;
@@ -9563,27 +10848,20 @@ impl GitAgentApp {
         let is_truncated = diff_text.lines().count() > 1_200;
         let truncated_label = self.tr("diff.truncated");
 
-        let max_height = ui.available_height().max(160.0);
-        ScrollArea::both()
-            .id_salt((
+        fill_diff_scroll_area(
+            ui,
+            (
                 "commit_diff_scroll",
                 hash,
                 path,
                 diff_display_mode_salt(mode),
-            ))
-            .max_height(max_height)
-            .show(ui, |ui| {
-                render_unified_diff(
-                    ui,
-                    &diff_text,
-                    mode,
-                    self.language,
-                    &mut self.selected_diff_rows,
-                );
-                if is_truncated {
-                    ui.label(RichText::new(truncated_label).color(theme::muted()));
-                }
-            });
+            ),
+            &diff_text,
+            mode,
+            self.language,
+            &mut self.selected_diff_rows,
+            is_truncated.then_some(truncated_label),
+        );
     }
 
     fn search_diff_viewer(&mut self, ui: &mut Ui, hash: &str, mode: DiffDisplayMode) {
@@ -9614,27 +10892,20 @@ impl GitAgentApp {
         let is_truncated = diff_text.lines().count() > 1_200;
         let truncated_label = self.tr("diff.truncated");
 
-        let max_height = ui.available_height().max(160.0);
-        ScrollArea::both()
-            .id_salt((
+        fill_diff_scroll_area(
+            ui,
+            (
                 "search_commit_diff_scroll",
                 hash,
                 path,
                 diff_display_mode_salt(mode),
-            ))
-            .max_height(max_height)
-            .show(ui, |ui| {
-                render_unified_diff(
-                    ui,
-                    &diff_text,
-                    mode,
-                    self.language,
-                    &mut self.search_selected_diff_rows,
-                );
-                if is_truncated {
-                    ui.label(RichText::new(truncated_label).color(theme::muted()));
-                }
-            });
+            ),
+            &diff_text,
+            mode,
+            self.language,
+            &mut self.search_selected_diff_rows,
+            is_truncated.then_some(truncated_label),
+        );
     }
 
     fn worktree_diff_viewer(&self, ui: &mut Ui) {
@@ -9661,30 +10932,20 @@ impl GitAgentApp {
             return;
         }
 
-        let available_diff_size = safe_ui_size(ui.available_size());
+        let truncated_label = self.tr("diff.truncated");
+        let mut selected_rows = Vec::new();
         let diff_response = worktree_diff_panel_frame().show(ui, |ui| {
             let inner_size = safe_ui_size(ui.available_size());
             safe_set_min_size(ui, inner_size);
-            let available_diff_height = available_diff_size
-                .y
-                .max(safe_ui_length(ui.available_height()));
-            let max_diff_height = available_diff_height.max(160.0);
-            ScrollArea::both()
-                .id_salt(("worktree_diff_scroll", key))
-                .max_height(max_diff_height)
-                .show(ui, |ui| {
-                    let mut selected_rows = Vec::new();
-                    render_unified_diff(
-                        ui,
-                        &diff.text,
-                        DiffDisplayMode::Full,
-                        self.language,
-                        &mut selected_rows,
-                    );
-                    if diff.text.lines().count() > 1_200 {
-                        ui.label(RichText::new(self.tr("diff.truncated")).color(theme::muted()));
-                    }
-                });
+            fill_diff_scroll_area(
+                ui,
+                ("worktree_diff_scroll", key),
+                &diff.text,
+                DiffDisplayMode::Full,
+                self.language,
+                &mut selected_rows,
+                (diff.text.lines().count() > 1_200).then_some(truncated_label),
+            );
         });
         let diff_rect = diff_response.response.rect;
         paint_workspace_card_inset_shadow(ui, diff_rect);
@@ -11333,18 +12594,15 @@ impl GitAgentApp {
                     ui.label(RichText::new(self.tr("diff.queued")).color(theme::muted()));
                     return;
                 };
-                ScrollArea::both()
-                    .id_salt(("create_patch_diff_scroll", &commit.hash, path))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        render_unified_diff(
-                            ui,
-                            &diff.text,
-                            dialog.diff_display_mode,
-                            self.language,
-                            &mut dialog.selected_diff_rows,
-                        );
-                    });
+                fill_diff_scroll_area(
+                    ui,
+                    ("create_patch_diff_scroll", &commit.hash, path),
+                    &diff.text,
+                    dialog.diff_display_mode,
+                    self.language,
+                    &mut dialog.selected_diff_rows,
+                    (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                );
             });
         });
     }
@@ -13950,11 +15208,7 @@ impl GitAgentApp {
             .auto_shrink([false, true])
             .show(ui, |ui| match self.settings_tab {
                 SettingsTab::General => self.global_general_settings(ui),
-                SettingsTab::Git => global_settings_empty_tab(
-                    ui,
-                    settings_tab_label(self.language, SettingsTab::Git),
-                    self.language,
-                ),
+                SettingsTab::Git => self.global_git_settings(ui),
                 SettingsTab::CustomActions => self.global_custom_actions_settings(ui),
                 SettingsTab::Verification => global_settings_empty_tab(
                     ui,
@@ -14034,6 +15288,148 @@ impl GitAgentApp {
         settings_section_title(ui, settings_tab_label(self.language, SettingsTab::Network));
         ui.add_space(12.0);
         self.global_remote_accounts_settings(ui);
+    }
+
+    fn global_git_settings(&mut self, ui: &mut Ui) {
+        let language = self.language;
+        let ssh_controls_enabled = self.ssh_tool_task.is_none();
+        settings_section_title(ui, i18n::t(language, "settings.ssh_configuration"));
+        ui.add_space(8.0);
+        if !ssh_controls_enabled {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(i18n::t(language, "ssh.openssh_install.installing"));
+            });
+            ui.add_space(8.0);
+        }
+
+        let mut selected_client = self.ssh_client;
+        settings_field(ui, i18n::t(language, "settings.ssh_client"), |ui| {
+            ui.add_enabled_ui(ssh_controls_enabled, |ui| {
+                ui.scope(|ui| {
+                    apply_menu_visuals(ui);
+                    egui::ComboBox::from_id_salt("settings_ssh_client")
+                        .selected_text(selected_client.label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut selected_client,
+                                SshClientKind::PuttyPlink,
+                                SshClientKind::PuttyPlink.label(),
+                            );
+                            ui.selectable_value(
+                                &mut selected_client,
+                                SshClientKind::OpenSsh,
+                                SshClientKind::OpenSsh.label(),
+                            );
+                        });
+                });
+            });
+        });
+        if selected_client != self.ssh_client {
+            self.set_ssh_client(selected_client);
+        }
+
+        ui.add_space(8.0);
+        let mut key_path_changed = false;
+        let mut browse_key = false;
+        settings_field(ui, i18n::t(language, "settings.ssh_key"), |ui| {
+            let hint = placeholder_for_label(language, i18n::t(language, "settings.ssh_key"));
+            themed_text_edit_selection(ui);
+            let edit_width = (ui.available_width() - 36.0).clamp(240.0, 440.0);
+            key_path_changed = ui
+                .add_enabled_ui(ssh_controls_enabled, |ui| {
+                    ui.add_sized(
+                        [edit_width, 24.0],
+                        themed_singleline_text_edit(&mut self.ssh_key_path, &hint),
+                    )
+                })
+                .inner
+                .changed();
+            browse_key = icon_button(
+                ui,
+                UiIcon::Folder,
+                i18n::t(language, "settings.ssh_choose_key"),
+                ssh_controls_enabled,
+            )
+            .clicked();
+        });
+        if key_path_changed {
+            self.save_app_settings();
+        }
+        if browse_key {
+            let mut dialog = rfd::FileDialog::new();
+            let configured = PathBuf::from(self.ssh_key_path.trim());
+            if let Some(parent) = configured.parent().filter(|parent| parent.is_dir()) {
+                dialog = dialog.set_directory(parent);
+            } else if let Some(directory) = default_ssh_key_directory() {
+                dialog = dialog.set_directory(directory);
+            }
+            if let Some(path) = dialog.pick_file() {
+                self.ssh_key_path = user_facing_path_string(&path);
+                self.save_app_settings();
+            }
+        }
+
+        ui.add_space(8.0);
+        let mut executable_changed = false;
+        let mut browse_executable = false;
+        settings_field(ui, i18n::t(language, "settings.ssh_executable"), |ui| {
+            themed_text_edit_selection(ui);
+            let edit_width = (ui.available_width() - 36.0).clamp(240.0, 440.0);
+            executable_changed = ui
+                .add_enabled_ui(ssh_controls_enabled, |ui| {
+                    ui.add_sized(
+                        [edit_width, 24.0],
+                        themed_singleline_text_edit(
+                            &mut self.ssh_executable_path,
+                            i18n::t(language, "settings.ssh_executable_placeholder"),
+                        ),
+                    )
+                })
+                .inner
+                .changed();
+            browse_executable = icon_button(
+                ui,
+                UiIcon::Folder,
+                i18n::t(language, "settings.ssh_choose_executable"),
+                ssh_controls_enabled,
+            )
+            .clicked();
+        });
+        if browse_executable {
+            let configured = PathBuf::from(self.ssh_executable_path.trim());
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(parent) = configured.parent().filter(|parent| parent.is_dir()) {
+                dialog = dialog.set_directory(parent);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                dialog = dialog.add_filter("Executable", &["exe"]);
+            }
+            if let Some(path) = dialog.pick_file() {
+                self.ssh_executable_path = user_facing_path_string(&path);
+                executable_changed = true;
+            }
+        }
+        if executable_changed {
+            self.configure_git_ssh_client();
+            self.refresh_ssh_install_prompt();
+            self.save_app_settings();
+        }
+
+        let resolved = self
+            .resolved_ssh_client_executable()
+            .map(|path| user_facing_path_string(&path));
+        let status = match (self.ssh_executable_path.trim().is_empty(), resolved) {
+            (true, Some(path)) => format!(
+                "{}: {path}",
+                i18n::t(language, "settings.ssh_auto_detected")
+            ),
+            (false, Some(path)) => path,
+            (_, None) => i18n::t(language, "settings.ssh_not_found").to_owned(),
+        };
+        ui.label(RichText::new(status).small().color(theme::muted()));
     }
 
     fn global_custom_actions_settings(&mut self, ui: &mut Ui) {
@@ -14712,6 +16108,19 @@ enum ActionsMenuCommand {
     LineReview,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuShortcutCommand {
+    OpenRepository,
+    OpenSettings,
+    OpenRepositorySettings,
+    StashChanges,
+    Checkout,
+    CreateBranch,
+    Merge,
+    CreateTag,
+    CreatePullRequest,
+}
+
 #[derive(Clone, Debug)]
 enum StashMenuAction {
     Create,
@@ -15312,6 +16721,68 @@ fn error_dialog_layout(screen: Rect, message: &str) -> ErrorDialogLayout {
         body_min_height: message_height + 74.0,
         message_height,
         desired_rows,
+    }
+}
+
+const ABOUT_MARKDOWN: &str = include_str!("../ABOUT.md");
+const ABOUT_ZH_MARKER: &str = "<!-- lang:zh-CN -->";
+const ABOUT_EN_MARKER: &str = "<!-- lang:en-US -->";
+
+fn about_markdown(language: Language) -> &'static str {
+    match language {
+        Language::Chinese => ABOUT_MARKDOWN
+            .split_once(ABOUT_ZH_MARKER)
+            .and_then(|(_, content)| content.split_once(ABOUT_EN_MARKER))
+            .map(|(content, _)| content.trim())
+            .unwrap_or(""),
+        Language::English => ABOUT_MARKDOWN
+            .split_once(ABOUT_EN_MARKER)
+            .map(|(_, content)| content.trim())
+            .unwrap_or(""),
+    }
+}
+
+fn render_about_markdown(ui: &mut Ui, markdown: &str) {
+    for line in markdown.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            ui.add_space(4.0);
+        } else if let Some(heading) = line.strip_prefix("## ") {
+            ui.label(
+                RichText::new(heading)
+                    .size(14.0)
+                    .strong()
+                    .color(theme::text()),
+            );
+        } else if let Some(item) = line.strip_prefix("- ") {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("-").color(theme::accent_deep()));
+                ui.add(
+                    egui::Label::new(RichText::new(item).color(theme::text()))
+                        .selectable(true)
+                        .wrap(),
+                );
+            });
+        } else {
+            ui.add(
+                egui::Label::new(RichText::new(line).color(theme::text()))
+                    .selectable(true)
+                    .wrap(),
+            );
+        }
+    }
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
     }
 }
 
@@ -16695,10 +18166,40 @@ fn window_control_button(ui: &mut Ui, label: &str, close: bool) -> egui::Respons
     pointing_hand_cursor(response)
 }
 
-fn top_menu_button(ui: &mut Ui, label: &'static str, add_contents: impl FnOnce(&mut Ui)) {
+fn top_menu_accelerator_pressed(ctx: &egui::Context) -> Option<TopMenu> {
+    let alt_only = egui::Modifiers {
+        alt: true,
+        ..egui::Modifiers::NONE
+    };
+    ctx.input_mut(|input| {
+        [
+            (egui::Key::F, TopMenu::File),
+            (egui::Key::V, TopMenu::View),
+            (egui::Key::R, TopMenu::Repository),
+            (egui::Key::A, TopMenu::Actions),
+            (egui::Key::T, TopMenu::Tools),
+            (egui::Key::H, TopMenu::Help),
+        ]
+        .into_iter()
+        .find_map(|(key, menu)| input.consume_key(alt_only, key).then_some(menu))
+    })
+}
+
+fn top_menu_button(
+    ui: &mut Ui,
+    label: &'static str,
+    force_open: bool,
+    add_contents: impl FnOnce(&mut Ui),
+) {
     ui.scope(|ui| {
         apply_menu_visuals(ui);
         let popup_id = ui.make_persistent_id(("top_menu_popup", label));
+        if force_open {
+            ui.memory_mut(|memory| {
+                memory.close_popup();
+                memory.open_popup(popup_id);
+            });
+        }
         let popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
         let fill = if popup_open {
             menu_text_button_hover_fill()
@@ -17031,8 +18532,9 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "undo") => "\u{64a4}\u{9500}",
         (Language::Chinese, "redo") => "\u{91cd}\u{505a}",
         (Language::Chinese, "ssh_agent") => "\u{542f}\u{52a8}SSH\u{52a9}\u{624b}...",
-        (Language::Chinese, "process_viewer") => "\u{8fdb}\u{7a0b}\u{67e5}\u{770b}\u{5668}",
+        (Language::Chinese, "ssh_add_key") => "\u{6dfb}\u{52a0}SSH\u{5bc6}\u{94a5}...",
         (Language::Chinese, "about") => "\u{5173}\u{4e8e} Git Agent",
+        (Language::Chinese, "check_updates") => "\u{68c0}\u{67e5}\u{66f4}\u{65b0}",
         (_, "file") => "File(F)",
         (_, "edit") => "Edit(E)",
         (_, "view") => "View(V)",
@@ -17123,8 +18625,9 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "undo") => "Undo",
         (_, "redo") => "Redo",
         (_, "ssh_agent") => "Start SSH Agent...",
-        (_, "process_viewer") => "Process Viewer",
+        (_, "ssh_add_key") => "Add SSH Key...",
         (_, "about") => "About Git Agent",
+        (_, "check_updates") => "Check for Updates",
         _ => "",
     }
 }
@@ -19392,6 +20895,9 @@ fn repo_tab_shadow_rect(rect: Rect, side: RepoTabShadowSide, layer: usize) -> Re
 struct RepoTabInteraction {
     tab_clicked: bool,
     close_clicked: bool,
+    rename_requested: bool,
+    rename_submitted: bool,
+    rename_cancelled: bool,
     response: egui::Response,
 }
 
@@ -19401,10 +20907,17 @@ fn repo_tab_with_close(
     selected: bool,
     label: &str,
     close_label: &str,
+    tab_id: egui::Id,
+    rename: Option<&mut RepoTabRenameState>,
 ) -> RepoTabInteraction {
     let width = repo_tab_width(ui, label);
-    let (_, response) =
-        ui.allocate_exact_size(Vec2::new(width, REPO_TAB_HEIGHT), Sense::click_and_drag());
+    let is_renaming = rename.is_some();
+    let sense = if is_renaming {
+        Sense::hover()
+    } else {
+        Sense::click_and_drag()
+    };
+    let (_, response) = ui.allocate_exact_size(Vec2::new(width, REPO_TAB_HEIGHT), sense);
     let rect = response.rect;
     let close_rect = Rect::from_center_size(
         Pos2::new(rect.right() - 12.0, rect.center().y),
@@ -19437,24 +20950,49 @@ fn repo_tab_with_close(
         .fit_to_exact_size(icon_rect.size())
         .tint(icon_color)
         .paint_at(ui, icon_rect);
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .text(
-            text_rect.left_center(),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(12.0),
-            text_color,
+    let mut rename_submitted = false;
+    let mut rename_cancelled = false;
+    if let Some(rename) = rename {
+        let editor_rect = Rect::from_center_size(
+            text_rect.center(),
+            Vec2::new(text_rect.width(), REPO_TAB_HEIGHT - 8.0),
         );
+        themed_text_edit_selection(ui);
+        let editor_response = ui.put(
+            editor_rect,
+            TextEdit::singleline(&mut rename.value)
+                .id(tab_id.with("rename"))
+                .font(FontId::proportional(12.0))
+                .text_color(text_color)
+                .frame(false),
+        );
+        let requested_focus = rename.request_focus;
+        if requested_focus {
+            editor_response.request_focus();
+            rename.request_focus = false;
+        }
+        let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        rename_cancelled = editor_response.has_focus() && escape_pressed;
+        rename_submitted = !rename_cancelled
+            && ((editor_response.has_focus() && enter_pressed)
+                || (!requested_focus && editor_response.lost_focus()));
+    } else {
+        ui.painter()
+            .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+            .text(
+                text_rect.left_center(),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(12.0),
+                text_color,
+            );
+    }
 
     let mut close_clicked = false;
     if show_close {
         let close_response = ui
-            .interact(
-                close_rect,
-                ui.id().with(("repo_tab_close", label)),
-                Sense::click(),
-            )
+            .interact(close_rect, tab_id.with("close"), Sense::click())
             .on_hover_text(close_label);
         close_clicked = close_response.clicked();
         let close_hovering = close_response.hovered();
@@ -19480,6 +21018,9 @@ fn repo_tab_with_close(
     RepoTabInteraction {
         tab_clicked: response.clicked() && !close_clicked,
         close_clicked,
+        rename_requested: response.double_clicked() && !close_clicked && !close_hovered,
+        rename_submitted,
+        rename_cancelled,
         response,
     }
 }
@@ -20129,12 +21670,8 @@ fn settings_dialog_title_row(
     });
 }
 
-fn global_settings_dialog_width(tab: SettingsTab) -> f32 {
-    match tab {
-        SettingsTab::General | SettingsTab::CustomActions => SETTINGS_DIALOG_WIDTH,
-        SettingsTab::Git | SettingsTab::Verification | SettingsTab::Network => 640.0,
-        _ => 640.0,
-    }
+fn global_settings_dialog_width(_tab: SettingsTab) -> f32 {
+    SETTINGS_DIALOG_WIDTH
 }
 
 fn global_settings_dialog_height(
@@ -20151,7 +21688,8 @@ fn global_settings_dialog_height(
         SettingsTab::Network => {
             (280.0 + remote_account_count.saturating_sub(1).min(5) as f32 * 24.0).min(420.0)
         }
-        SettingsTab::Git | SettingsTab::Verification => 240.0,
+        SettingsTab::Git => 330.0,
+        SettingsTab::Verification => 240.0,
         _ => 300.0,
     }
 }
@@ -20188,59 +21726,34 @@ fn settings_tab_label(language: Language, tab: SettingsTab) -> &'static str {
 }
 
 fn global_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: Language) {
-    const GLOBAL_TAB_COUNT: f32 = 5.0;
-    let width = REPO_SETTINGS_TAB_WIDTH * GLOBAL_TAB_COUNT + LAYOUT_GAP as f32 * 4.0;
-    soft_panel_frame(theme::panel_soft(), 4, 4)
-        .stroke(Stroke::NONE)
-        .shadow(panel_shadow())
-        .show(ui, |ui| {
-            safe_set_min_size(ui, frame_inner_size(width, REPO_SETTINGS_TABS_HEIGHT, 4, 4));
-            ui.allocate_ui_with_layout(
-                Vec2::new(width, REPO_SETTINGS_TAB_HEIGHT),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::General,
-                        UiIcon::Settings,
-                        settings_tab_label(language, SettingsTab::General),
-                    );
-                    ui.add_space(LAYOUT_GAP as f32);
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::Git,
-                        UiIcon::Branch,
-                        settings_tab_label(language, SettingsTab::Git),
-                    );
-                    ui.add_space(LAYOUT_GAP as f32);
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::CustomActions,
-                        UiIcon::Terminal,
-                        settings_tab_label(language, SettingsTab::CustomActions),
-                    );
-                    ui.add_space(LAYOUT_GAP as f32);
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::Verification,
-                        UiIcon::Warning,
-                        settings_tab_label(language, SettingsTab::Verification),
-                    );
-                    ui.add_space(LAYOUT_GAP as f32);
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::Network,
-                        UiIcon::Globe,
-                        settings_tab_label(language, SettingsTab::Network),
-                    );
-                },
-            );
-        });
+    let tabs = [
+        (
+            SettingsTab::General,
+            UiIcon::Settings,
+            settings_tab_label(language, SettingsTab::General),
+        ),
+        (
+            SettingsTab::Git,
+            UiIcon::Branch,
+            settings_tab_label(language, SettingsTab::Git),
+        ),
+        (
+            SettingsTab::CustomActions,
+            UiIcon::Terminal,
+            settings_tab_label(language, SettingsTab::CustomActions),
+        ),
+        (
+            SettingsTab::Verification,
+            UiIcon::Warning,
+            settings_tab_label(language, SettingsTab::Verification),
+        ),
+        (
+            SettingsTab::Network,
+            UiIcon::Globe,
+            settings_tab_label(language, SettingsTab::Network),
+        ),
+    ];
+    settings_tab_strip(ui, current, &tabs);
 }
 
 fn global_settings_empty_tab(ui: &mut Ui, title: &str, language: Language) {
@@ -20280,44 +21793,99 @@ fn repo_settings_content_max_height(tab: SettingsTab) -> f32 {
 }
 
 fn repo_settings_tab_strip(ui: &mut Ui, current: &mut SettingsTab, language: Language) {
-    soft_panel_frame(theme::panel_soft(), 4, 4)
-        .stroke(Stroke::NONE)
-        .shadow(panel_shadow())
-        .show(ui, |ui| {
-            safe_set_min_size(
-                ui,
-                frame_inner_size(
-                    REPO_SETTINGS_TAB_WIDTH * 2.0 + LAYOUT_GAP as f32,
-                    REPO_SETTINGS_TABS_HEIGHT,
-                    4,
-                    4,
-                ),
-            );
-            ui.allocate_ui_with_layout(
-                Vec2::new(
-                    REPO_SETTINGS_TAB_WIDTH * 2.0 + LAYOUT_GAP as f32,
-                    REPO_SETTINGS_TAB_HEIGHT,
-                ),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::RepoRemotes,
-                        UiIcon::Globe,
-                        settings_tab_label(language, SettingsTab::RepoRemotes),
-                    );
-                    ui.add_space(LAYOUT_GAP as f32);
-                    repo_settings_tab_button(
-                        ui,
-                        current,
-                        SettingsTab::RepoAdvanced,
-                        UiIcon::Settings,
-                        settings_tab_label(language, SettingsTab::RepoAdvanced),
-                    );
-                },
-            );
-        });
+    let tabs = [
+        (
+            SettingsTab::RepoRemotes,
+            UiIcon::Globe,
+            settings_tab_label(language, SettingsTab::RepoRemotes),
+        ),
+        (
+            SettingsTab::RepoAdvanced,
+            UiIcon::Settings,
+            settings_tab_label(language, SettingsTab::RepoAdvanced),
+        ),
+    ];
+    settings_tab_strip(ui, current, &tabs);
+}
+
+fn settings_tab_strip(
+    ui: &mut Ui,
+    current: &mut SettingsTab,
+    tabs: &[(SettingsTab, UiIcon, &str)],
+) {
+    let preferred_widths = tabs
+        .iter()
+        .map(|(_, _, label)| settings_tab_button_width(ui, label))
+        .collect::<Vec<_>>();
+    let preferred_content_width = settings_tab_content_width(&preferred_widths);
+    let available_width = safe_ui_length(ui.available_width());
+    let (row_rect, _) = ui.allocate_exact_size(
+        Vec2::new(available_width, REPO_SETTINGS_TABS_HEIGHT),
+        Sense::hover(),
+    );
+    let panel_rect =
+        centered_settings_tab_strip_rect(row_rect, preferred_content_width + f32::from(4_i8) * 2.0);
+    let inner_width = frame_inner_size(panel_rect.width(), panel_rect.height(), 4, 4).x;
+    let button_widths = fit_settings_tab_widths(&preferred_widths, inner_width);
+
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(panel_rect), |ui| {
+        ui.set_width(panel_rect.width());
+        soft_panel_frame(theme::panel_soft(), 4, 4)
+            .stroke(Stroke::NONE)
+            .shadow(panel_shadow())
+            .show(ui, |ui| {
+                safe_set_min_size(ui, Vec2::new(inner_width, REPO_SETTINGS_TAB_HEIGHT));
+                ui.allocate_ui_with_layout(
+                    Vec2::new(inner_width, REPO_SETTINGS_TAB_HEIGHT),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (index, ((tab, icon, label), width)) in
+                            tabs.iter().zip(button_widths.iter()).enumerate()
+                        {
+                            if index > 0 {
+                                ui.add_space(LAYOUT_GAP as f32);
+                            }
+                            repo_settings_tab_button(ui, current, *tab, *icon, label, *width);
+                        }
+                    },
+                );
+            });
+    });
+}
+
+fn settings_tab_button_width(ui: &Ui, label: &str) -> f32 {
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), FontId::proportional(11.0), theme::text())
+            .size()
+            .x
+    });
+    settings_tab_button_width_from_text_width(text_width)
+}
+
+fn settings_tab_button_width_from_text_width(text_width: f32) -> f32 {
+    (safe_ui_length(text_width) + SETTINGS_TAB_TEXT_CHROME_WIDTH).max(REPO_SETTINGS_TAB_WIDTH)
+}
+
+fn settings_tab_content_width(widths: &[f32]) -> f32 {
+    widths.iter().sum::<f32>() + LAYOUT_GAP as f32 * widths.len().saturating_sub(1) as f32
+}
+
+fn fit_settings_tab_widths(preferred: &[f32], available_content_width: f32) -> Vec<f32> {
+    let gap_width = LAYOUT_GAP as f32 * preferred.len().saturating_sub(1) as f32;
+    let button_budget = safe_ui_length(available_content_width - gap_width);
+    let preferred_sum = preferred.iter().sum::<f32>();
+    if preferred_sum <= button_budget || preferred_sum <= f32::EPSILON {
+        return preferred.to_vec();
+    }
+    let scale = button_budget / preferred_sum;
+    preferred.iter().map(|width| width * scale).collect()
+}
+
+fn centered_settings_tab_strip_rect(row_rect: Rect, preferred_width: f32) -> Rect {
+    let width = safe_ui_length(preferred_width).min(row_rect.width());
+    Rect::from_center_size(row_rect.center(), Vec2::new(width, row_rect.height()))
 }
 
 fn repo_settings_tab_button(
@@ -20326,12 +21894,11 @@ fn repo_settings_tab_button(
     tab: SettingsTab,
     icon: UiIcon,
     label: &str,
+    width: f32,
 ) -> egui::Response {
     let selected = *current == tab;
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(REPO_SETTINGS_TAB_WIDTH, REPO_SETTINGS_TAB_HEIGHT),
-        Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, REPO_SETTINGS_TAB_HEIGHT), Sense::click());
     let visuals = tab_visual_state(
         TabVisualMode::Connected,
         selected,
@@ -22988,6 +24555,34 @@ fn file_status_icon(kind: char) -> UiIcon {
     }
 }
 
+fn fill_diff_scroll_area(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash,
+    text: &str,
+    mode: DiffDisplayMode,
+    language: Language,
+    selected_rows: &mut Vec<DiffLineKey>,
+    truncated_label: Option<&str>,
+) {
+    let body_size = safe_ui_size(ui.available_size());
+    let (body_rect, _) = ui.allocate_exact_size(body_size, Sense::hover());
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+        safe_set_min_size(ui, body_rect.size());
+        ui.set_max_size(body_rect.size());
+        ui.set_clip_rect(body_rect);
+        ScrollArea::both()
+            .id_salt(id_salt)
+            .max_height(body_rect.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                render_unified_diff(ui, text, mode, language, selected_rows);
+                if let Some(label) = truncated_label {
+                    ui.label(RichText::new(label).color(theme::muted()));
+                }
+            });
+    });
+}
+
 fn render_unified_diff(
     ui: &mut Ui,
     text: &str,
@@ -22997,18 +24592,28 @@ fn render_unified_diff(
 ) {
     let previous_item_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = 0.0;
+    let items = collect_unified_diff_items(text, mode);
+    let digit_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                "0".to_owned(),
+                FontId::monospace(12.0),
+                Color32::TRANSPARENT,
+            )
+            .rect
+            .width()
+            .max(1.0)
+    });
+    let gutter_layout = diff_gutter_layout(&items, digit_width);
 
-    for item in collect_unified_diff_items(text, mode) {
+    for item in items {
         match item {
             DiffRenderItem::FileHeader(text) => {
                 ui.label(RichText::new(text).monospace().color(theme::info()));
             }
-            DiffRenderItem::HunkHeader(text) => {
-                diff_hunk_row(ui, &text);
-            }
             DiffRenderItem::Omitted => diff_omitted_row(ui),
             DiffRenderItem::Line(line) => {
-                diff_row(ui, &line, language, selected_rows);
+                diff_row(ui, &line, gutter_layout, language, selected_rows);
             }
         }
     }
@@ -23019,7 +24624,6 @@ fn render_unified_diff(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DiffRenderItem {
     FileHeader(String),
-    HunkHeader(String),
     Omitted,
     Line(DiffLine),
 }
@@ -23053,20 +24657,24 @@ impl DiffLine {
 
 fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRenderItem> {
     let mut items = Vec::new();
-    let mut hunk_header = None;
     let mut hunk_lines = Vec::new();
     let mut old_line: Option<usize> = None;
     let mut new_line: Option<usize> = None;
 
     for line in text.lines().take(1_200) {
         if line.starts_with("diff --git")
+            || line.starts_with("diff --cc ")
+            || line.starts_with("diff --combined ")
             || line.starts_with("index ")
             || line.starts_with("--- ")
             || line.starts_with("+++ ")
         {
-            push_diff_hunk_items(&mut items, hunk_header.take(), &hunk_lines, mode);
+            push_diff_hunk_items(&mut items, &hunk_lines, mode);
             hunk_lines.clear();
-            if line.starts_with("diff --git") {
+            if line.starts_with("diff --git")
+                || line.starts_with("diff --cc ")
+                || line.starts_with("diff --combined ")
+            {
                 if mode == DiffDisplayMode::Full {
                     items.push(DiffRenderItem::FileHeader(clean_diff_header(line)));
                 }
@@ -23075,12 +24683,11 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
         }
 
         if line.starts_with("@@") {
-            push_diff_hunk_items(&mut items, hunk_header.take(), &hunk_lines, mode);
+            push_diff_hunk_items(&mut items, &hunk_lines, mode);
             hunk_lines.clear();
             let (old_start, new_start) = parse_hunk_header(line);
             old_line = old_start;
             new_line = new_start;
-            hunk_header = Some(line.to_owned());
             continue;
         }
 
@@ -23122,13 +24729,12 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
         }
     }
 
-    push_diff_hunk_items(&mut items, hunk_header.take(), &hunk_lines, mode);
+    push_diff_hunk_items(&mut items, &hunk_lines, mode);
     items
 }
 
 fn push_diff_hunk_items(
     items: &mut Vec<DiffRenderItem>,
-    header: Option<String>,
     lines: &[DiffLine],
     mode: DiffDisplayMode,
 ) {
@@ -23138,9 +24744,6 @@ fn push_diff_hunk_items(
 
     match mode {
         DiffDisplayMode::Full => {
-            if let Some(header) = header {
-                items.push(DiffRenderItem::HunkHeader(header));
-            }
             items.extend(lines.iter().cloned().map(DiffRenderItem::Line));
         }
         DiffDisplayMode::Blocks => {
@@ -23191,9 +24794,45 @@ enum DiffKind {
     Context,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DiffGutterLayout {
+    left_width: f32,
+    right_width: f32,
+}
+
+impl DiffGutterLayout {
+    fn total_width(self) -> f32 {
+        self.left_width + self.right_width
+    }
+}
+
+fn diff_gutter_layout(items: &[DiffRenderItem], digit_width: f32) -> DiffGutterLayout {
+    let (left_digits, right_digits) = items.iter().fold((0usize, 0usize), |maximums, item| {
+        let DiffRenderItem::Line(line) = item else {
+            return maximums;
+        };
+        (
+            maximums.0.max(line.left_no.len()),
+            maximums.1.max(line.right_no.len()),
+        )
+    });
+    let column_width = |digits: usize| {
+        if digits == 0 {
+            0.0
+        } else {
+            (digits as f32 * digit_width + 8.0).max(18.0)
+        }
+    };
+    DiffGutterLayout {
+        left_width: column_width(left_digits),
+        right_width: column_width(right_digits),
+    }
+}
+
 fn diff_row(
     ui: &mut Ui,
     line: &DiffLine,
+    gutter_layout: DiffGutterLayout,
     language: Language,
     selected_rows: &mut Vec<DiffLineKey>,
 ) {
@@ -23253,9 +24892,10 @@ fn diff_row(
         }
     });
 
+    let gutter_width = gutter_layout.total_width();
     let gutter_bg = Rect::from_min_max(
         rect.left_top(),
-        Pos2::new(rect.left() + 96.0, rect.bottom()),
+        Pos2::new(rect.left() + gutter_width, rect.bottom()),
     );
     painter.rect_filled(
         gutter_bg,
@@ -23286,14 +24926,17 @@ fn diff_row(
         Color32::from_rgb(124, 135, 148)
     };
     painter.text(
-        Pos2::new(rect.left() + 36.0, rect.center().y),
+        Pos2::new(
+            rect.left() + gutter_layout.left_width - 4.0,
+            rect.center().y,
+        ),
         Align2::RIGHT_CENTER,
         &line.left_no,
         FontId::monospace(12.0),
         gutter,
     );
     painter.text(
-        Pos2::new(rect.left() + 74.0, rect.center().y),
+        Pos2::new(rect.left() + gutter_width - 4.0, rect.center().y),
         Align2::RIGHT_CENTER,
         &line.right_no,
         FontId::monospace(12.0),
@@ -23305,14 +24948,14 @@ fn diff_row(
         DiffKind::Context => " ",
     };
     painter.text(
-        Pos2::new(rect.left() + 104.0, rect.center().y),
+        Pos2::new(gutter_bg.right() + 6.0, rect.center().y),
         Align2::LEFT_CENTER,
         sign,
         FontId::monospace(12.0),
         text_color,
     );
     let text_rect = Rect::from_min_max(
-        Pos2::new(rect.left() + 122.0, rect.top()),
+        Pos2::new(gutter_bg.right() + 20.0, rect.top()),
         Pos2::new(rect.right() - 6.0, rect.bottom()),
     );
     if !selected {
@@ -23381,20 +25024,6 @@ fn draw_diff_indent_guides(ui: &mut Ui, text_rect: Rect, body: &str) {
     }
 }
 
-fn diff_hunk_row(ui: &mut Ui, text: &str) {
-    let width = ui.available_width().max(560.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(242, 247, 255));
-    ui.painter().text(
-        Pos2::new(rect.left() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        text,
-        FontId::monospace(12.0),
-        Color32::from_rgb(54, 103, 178),
-    );
-}
-
 fn diff_omitted_row(ui: &mut Ui) {
     let width = ui.available_width().max(560.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
@@ -23417,7 +25046,11 @@ fn diff_omitted_row(ui: &mut Ui) {
 }
 
 fn clean_diff_header(line: &str) -> String {
-    let raw = line.strip_prefix("diff --git ").unwrap_or(line);
+    let raw = line
+        .strip_prefix("diff --git ")
+        .or_else(|| line.strip_prefix("diff --cc "))
+        .or_else(|| line.strip_prefix("diff --combined "))
+        .unwrap_or(line);
     let mut parts = raw.split_whitespace();
     let left = parts.next().unwrap_or(raw).trim_start_matches("a/");
     let right = parts.next().unwrap_or(left).trim_start_matches("b/");
@@ -23429,14 +25062,19 @@ fn clean_diff_header(line: &str) -> String {
 }
 
 fn parse_hunk_header(line: &str) -> (Option<usize>, Option<usize>) {
-    let mut parts = line.split_whitespace();
-    let _ = parts.next();
-    let old = parts
-        .next()
+    let ranges = line
+        .split_whitespace()
+        .filter(|part| part.starts_with('-') || part.starts_with('+'))
+        .collect::<Vec<_>>();
+    let old = ranges
+        .iter()
+        .find(|part| part.starts_with('-'))
         .and_then(|part| part.trim_start_matches('-').split(',').next())
         .and_then(|value| value.parse::<usize>().ok());
-    let new = parts
-        .next()
+    let new = ranges
+        .iter()
+        .rev()
+        .find(|part| part.starts_with('+'))
         .and_then(|part| part.trim_start_matches('+').split(',').next())
         .and_then(|value| value.parse::<usize>().ok());
     (old, new)
@@ -23472,6 +25110,46 @@ fn shortcut_pressed(ctx: &egui::Context, key: egui::Key, shift: bool) -> bool {
             && !input.modifiers.alt
             && input.key_pressed(key)
     })
+}
+
+fn menu_shortcut_pressed(ctx: &egui::Context) -> Option<MenuShortcutCommand> {
+    ctx.input(|input| {
+        [
+            egui::Key::O,
+            egui::Key::Comma,
+            egui::Key::S,
+            egui::Key::U,
+            egui::Key::B,
+            egui::Key::M,
+            egui::Key::T,
+            egui::Key::P,
+        ]
+        .into_iter()
+        .find_map(|key| {
+            input
+                .key_pressed(key)
+                .then(|| menu_command_for_shortcut(input.modifiers, key))
+                .flatten()
+        })
+    })
+}
+
+fn menu_command_for_shortcut(
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Option<MenuShortcutCommand> {
+    match (modifiers.ctrl, modifiers.shift, modifiers.alt, key) {
+        (true, false, false, egui::Key::O) => Some(MenuShortcutCommand::OpenRepository),
+        (true, false, false, egui::Key::Comma) => Some(MenuShortcutCommand::OpenSettings),
+        (true, true, false, egui::Key::Comma) => Some(MenuShortcutCommand::OpenRepositorySettings),
+        (true, true, false, egui::Key::S) => Some(MenuShortcutCommand::StashChanges),
+        (true, true, false, egui::Key::U) => Some(MenuShortcutCommand::Checkout),
+        (true, true, false, egui::Key::B) => Some(MenuShortcutCommand::CreateBranch),
+        (true, true, false, egui::Key::M) => Some(MenuShortcutCommand::Merge),
+        (true, true, false, egui::Key::T) => Some(MenuShortcutCommand::CreateTag),
+        (false, true, true, egui::Key::P) => Some(MenuShortcutCommand::CreatePullRequest),
+        _ => None,
+    }
 }
 
 fn actions_menu_shortcut_pressed(ctx: &egui::Context) -> Option<ActionsMenuCommand> {
@@ -23651,6 +25329,423 @@ fn paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
         .to_string_lossy()
         .to_lowercase();
     left == right
+}
+
+fn default_ssh_key_directory() -> Option<PathBuf> {
+    let home = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    let ssh = home.join(".ssh");
+    Some(if ssh.is_dir() { ssh } else { home })
+}
+
+const PUTTY_DOWNLOAD_URL: &str = "https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html";
+#[cfg(target_os = "windows")]
+const OPENSSH_INSTALL_GUIDE_URL: &str =
+    "https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse";
+#[cfg(not(target_os = "windows"))]
+const OPENSSH_INSTALL_GUIDE_URL: &str = "https://www.openssh.com/portable.html";
+
+fn resolve_ssh_client_executable(client: SshClientKind, configured: &str) -> Option<PathBuf> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        return path.is_file().then_some(path);
+    }
+    match client {
+        SshClientKind::PuttyPlink => find_putty_tool(&platform_executable_name("plink")),
+        SshClientKind::OpenSsh => find_openssh_tool(&platform_executable_name("ssh")),
+    }
+}
+
+fn platform_executable_name(base: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{base}.exe")
+    } else {
+        base.to_owned()
+    }
+}
+
+fn find_openssh_tool(name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    if let Some(windows) = env::var_os("WINDIR") {
+        let path = PathBuf::from(windows).join("System32/OpenSSH").join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    find_executable_on_path(name)
+}
+
+fn find_putty_tool(name: &str) -> Option<PathBuf> {
+    let program_files_roots = ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(env::var_os)
+        .map(PathBuf::from);
+    find_putty_tool_in_program_files(name, program_files_roots)
+        .or_else(|| find_executable_on_path(name))
+}
+
+fn find_putty_tool_in_program_files(
+    name: &str,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    roots
+        .into_iter()
+        .map(|root| root.join("PuTTY").join(name))
+        .find(|path| path.is_file())
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+fn companion_executable(configured: &str, base: &str) -> Option<PathBuf> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let parent = Path::new(configured).parent()?;
+    let path = parent.join(platform_executable_name(base));
+    path.is_file().then_some(path)
+}
+
+fn putty_agent_executable(configured: &str) -> Option<PathBuf> {
+    companion_executable(configured, "pageant")
+        .or_else(|| find_putty_tool(&platform_executable_name("pageant")))
+}
+
+fn openssh_add_executable(configured: &str) -> Option<PathBuf> {
+    companion_executable(configured, "ssh-add")
+        .or_else(|| find_openssh_tool(&platform_executable_name("ssh-add")))
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_OPENSSH_INSTALL_ELEVATION_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$command = "`$ErrorActionPreference = 'Stop'; Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' | Out-Null"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+try {
+    $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+    exit $process.ExitCode
+} catch {
+    exit 1223
+}
+"#;
+
+fn install_openssh_client(language: Language) -> anyhow::Result<String> {
+    let executable_name = platform_executable_name("ssh");
+    if let Some(path) = find_openssh_tool(&executable_name) {
+        return Ok(user_facing_path_string(&path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = hidden_command(Path::new("powershell.exe"))
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_OPENSSH_INSTALL_ELEVATION_SCRIPT,
+            ])
+            .status()?;
+        for _ in 0..30 {
+            if let Some(path) = find_openssh_tool(&executable_name) {
+                return Ok(user_facing_path_string(&path));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let detail = status
+            .code()
+            .map(|code| format!(" (exit code {code})"))
+            .unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "{}{detail}",
+            i18n::t(language, "ssh.openssh_install.failed")
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Err(anyhow::anyhow!(i18n::t(
+        language,
+        "ssh.openssh_install.guided_only"
+    )))
+}
+
+fn launch_ssh_agent(
+    client: SshClientKind,
+    configured: &str,
+    key: Option<&Path>,
+    language: Language,
+) -> anyhow::Result<SshAgentStatus> {
+    match client {
+        SshClientKind::PuttyPlink => {
+            let pageant = putty_agent_executable(configured).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pageant was not found. Install the official PuTTY package, or select OpenSSH in Options > Git."
+                )
+            })?;
+            let mut command = Command::new(&pageant);
+            if let Some(key) = key {
+                command.arg(key);
+            }
+            command.spawn().map_err(|error| {
+                anyhow::anyhow!("Failed to start {}: {error}", pageant.display())
+            })?;
+            Ok(SshAgentStatus {
+                client,
+                backend: user_facing_path_string(&pageant),
+                identities: Vec::new(),
+                can_list_identities: false,
+            })
+        }
+        SshClientKind::OpenSsh => {
+            ensure_openssh_agent_running(configured, language)?;
+            if let Some(key) = key {
+                launch_interactive_openssh_add(configured, key)?;
+            }
+            read_ssh_agent_status(client, configured, language)
+        }
+    }
+}
+
+fn read_ssh_agent_status(
+    client: SshClientKind,
+    configured: &str,
+    language: Language,
+) -> anyhow::Result<SshAgentStatus> {
+    match client {
+        SshClientKind::PuttyPlink => {
+            let pageant = putty_agent_executable(configured).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pageant was not found. Install the official PuTTY package, or select OpenSSH in Options > Git."
+                )
+            })?;
+            Ok(SshAgentStatus {
+                client,
+                backend: user_facing_path_string(&pageant),
+                identities: Vec::new(),
+                can_list_identities: false,
+            })
+        }
+        SshClientKind::OpenSsh => {
+            ensure_openssh_agent_running(configured, language)?;
+            let ssh_add = openssh_add_executable(configured)
+                .ok_or_else(|| anyhow::anyhow!(i18n::t(language, "ssh.openssh_agent_not_found")))?;
+            let output = hidden_command(&ssh_add).arg("-l").output()?;
+            if !openssh_agent_available(&output) {
+                return Err(anyhow::anyhow!(i18n::t(
+                    language,
+                    "ssh.openssh_agent_connect_failed"
+                )));
+            }
+            Ok(SshAgentStatus {
+                client,
+                backend: "OpenSSH ssh-agent".to_owned(),
+                identities: openssh_identity_lines(&output.stdout),
+                can_list_identities: true,
+            })
+        }
+    }
+}
+
+fn openssh_identity_lines(stdout: &[u8]) -> Vec<String> {
+    std::str::from_utf8(stdout)
+        .ok()
+        .into_iter()
+        .flat_map(str::lines)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|bits| bits.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn ssh_agent_should_prompt_for_key(status: &SshAgentStatus) -> bool {
+    !status.can_list_identities || status.identities.is_empty()
+}
+
+fn add_ssh_key_to_agent(
+    client: SshClientKind,
+    configured: &str,
+    key: &Path,
+    language: Language,
+) -> anyhow::Result<String> {
+    if !key.is_file() {
+        return Err(anyhow::anyhow!("SSH key does not exist: {}", key.display()));
+    }
+    match client {
+        SshClientKind::PuttyPlink => {
+            let pageant = putty_agent_executable(configured).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pageant was not found. Install the official PuTTY package, or select OpenSSH in Options > Git."
+                )
+            })?;
+            Command::new(&pageant)
+                .arg(key)
+                .spawn()
+                .map_err(|error| anyhow::anyhow!("Failed to load SSH key: {error}"))?;
+        }
+        SshClientKind::OpenSsh => {
+            ensure_openssh_agent_running(configured, language)?;
+            launch_interactive_openssh_add(configured, key)?;
+        }
+    }
+    Ok(user_facing_path_string(key))
+}
+
+fn ensure_openssh_agent_running(configured: &str, language: Language) -> anyhow::Result<()> {
+    let ssh_add = openssh_add_executable(configured)
+        .ok_or_else(|| anyhow::anyhow!(i18n::t(language, "ssh.openssh_agent_not_found")))?;
+    let first_check = hidden_command(&ssh_add).arg("-l").output()?;
+    if openssh_agent_available(&first_check) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = hidden_command(Path::new("sc.exe"))
+            .args(["start", "ssh-agent"])
+            .output()?;
+        if !output.status.success() {
+            if sc_error_code(&output) == Some(1060) {
+                return Err(anyhow::anyhow!(i18n::t(
+                    language,
+                    "ssh.openssh_agent_service_missing"
+                )));
+            }
+            if !start_windows_openssh_agent_elevated()? {
+                return Err(anyhow::anyhow!(i18n::t(
+                    language,
+                    "ssh.openssh_agent_elevation_failed"
+                )));
+            }
+        }
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            let check = hidden_command(&ssh_add).arg("-l").output()?;
+            if openssh_agent_available(&check) {
+                return Ok(());
+            }
+        }
+        return Err(anyhow::anyhow!(i18n::t(
+            language,
+            "ssh.openssh_agent_connect_failed"
+        )));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Err(anyhow::anyhow!(
+        "OpenSSH agent is not available in this application environment"
+    ))
+}
+
+fn openssh_agent_available(output: &std::process::Output) -> bool {
+    output.status.success() || output_contains_ascii(output, b"no identities")
+}
+
+fn output_contains_ascii(output: &std::process::Output, needle: &[u8]) -> bool {
+    [&output.stderr[..], &output.stdout[..]]
+        .iter()
+        .any(|bytes| {
+            bytes
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn sc_error_code(output: &std::process::Output) -> Option<u32> {
+    parse_sc_error_code(&output.stderr).or_else(|| parse_sc_error_code(&output.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_sc_error_code(bytes: &[u8]) -> Option<u32> {
+    let marker = b"FAILED ";
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window.eq_ignore_ascii_case(marker))?
+        + marker.len();
+    let digits = bytes[start..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_OPENSSH_AGENT_ELEVATION_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$command = "Set-Service -Name 'ssh-agent' -StartupType Manual; Start-Service -Name 'ssh-agent'"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+try {
+    $process = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+    exit $process.ExitCode
+} catch {
+    exit 1223
+}
+"#;
+
+#[cfg(target_os = "windows")]
+fn start_windows_openssh_agent_elevated() -> anyhow::Result<bool> {
+    Ok(hidden_command(Path::new("powershell.exe"))
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_OPENSSH_AGENT_ELEVATION_SCRIPT,
+        ])
+        .status()?
+        .success())
+}
+
+fn hidden_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    command
+}
+
+fn launch_interactive_openssh_add(configured: &str, key: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let ssh_add = openssh_add_executable(configured)
+            .ok_or_else(|| anyhow::anyhow!("OpenSSH ssh-add was not found"))?;
+        let executable = user_facing_path_string(&ssh_add).replace('\'', "''");
+        let key = user_facing_path_string(key).replace('\'', "''");
+        let script = format!(
+            "& '{executable}' -- '{key}'; if ($LASTEXITCODE -ne 0) {{ Read-Host 'Press Enter to close' }}"
+        );
+        let status = Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", &script])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("ssh-add failed"))
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let ssh_add = openssh_add_executable(configured)
+            .ok_or_else(|| anyhow::anyhow!("OpenSSH ssh-add was not found"))?;
+        Command::new(ssh_add)
+            .arg(key)
+            .spawn()
+            .map(|_| ())
+            .map_err(Into::into)
+    }
 }
 
 fn open_command_prompt(root: &Path) -> std::io::Result<()> {
@@ -26449,6 +28544,9 @@ mod ui_tests {
             inactive_repo_refresh_seconds: 90,
             remote_accounts: vec![RemoteAccountSettings::default()],
             custom_actions: Vec::new(),
+            ssh_client: SshClientKind::OpenSsh,
+            ssh_key_path: r"D:\Users\me\.ssh\id_ed25519".to_owned(),
+            ssh_executable_path: r"C:\Windows\System32\OpenSSH\ssh.exe".to_owned(),
         };
         let raw = serde_json::to_string(&settings).unwrap();
         assert!(raw.contains("\"theme\":\"Light\""));
@@ -26457,6 +28555,9 @@ mod ui_tests {
         assert!(raw.contains("\"workspaces\""));
         assert!(raw.contains("\"active_repo_refresh_seconds\":30"));
         assert!(raw.contains("\"inactive_repo_refresh_seconds\":90"));
+        assert!(raw.contains("\"ssh_client\":\"OpenSsh\""));
+        assert!(raw.contains("id_ed25519"));
+        assert!(raw.contains("ssh.exe"));
         assert!(raw.contains(r#"D:\\code"#));
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -26484,6 +28585,349 @@ mod ui_tests {
         assert_eq!(frame.fill, Color32::TRANSPARENT);
         assert_eq!(frame.stroke, Stroke::NONE);
         assert_eq!(frame.inner_margin.left, 0);
+    }
+
+    #[test]
+    fn ssh_client_executable_prefers_configured_file_and_install_prompt_is_wired() {
+        let executable = env::temp_dir().join(format!(
+            "git-agent-custom-ssh-client-{}",
+            std::process::id()
+        ));
+        fs::write(&executable, b"test executable").unwrap();
+        let configured = user_facing_path_string(&executable);
+
+        assert_eq!(
+            resolve_ssh_client_executable(SshClientKind::OpenSsh, &configured),
+            Some(executable.clone())
+        );
+        assert_eq!(
+            resolve_ssh_client_executable(
+                SshClientKind::PuttyPlink,
+                &format!("{configured}.missing")
+            ),
+            None
+        );
+
+        let first_root = env::temp_dir().join(format!(
+            "git-agent-putty-program-files-first-{}",
+            std::process::id()
+        ));
+        let second_root = env::temp_dir().join(format!(
+            "git-agent-putty-program-files-second-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&first_root);
+        let _ = fs::remove_dir_all(&second_root);
+        let first_plink = first_root
+            .join("PuTTY")
+            .join(platform_executable_name("plink"));
+        let second_plink = second_root
+            .join("PuTTY")
+            .join(platform_executable_name("plink"));
+        fs::create_dir_all(first_plink.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_plink.parent().unwrap()).unwrap();
+        fs::write(&first_plink, b"first").unwrap();
+        fs::write(&second_plink, b"second").unwrap();
+        assert_eq!(
+            find_putty_tool_in_program_files(
+                &platform_executable_name("plink"),
+                [first_root.clone(), second_root.clone()]
+            ),
+            Some(first_plink)
+        );
+
+        let source = include_str!("app.rs");
+        for required in [
+            "fn ssh_install_prompt_modal(",
+            "self.ssh_install_prompt_modal(ctx);",
+            "PUTTY_DOWNLOAD_URL",
+            "OPENSSH_INSTALL_GUIDE_URL",
+            "self.settings_tab = SettingsTab::Git;",
+            "switch_client = Some(SshClientKind::OpenSsh);",
+            "self.refresh_ssh_install_prompt();",
+            "resolve_ssh_client_executable(self.ssh_client, &self.ssh_executable_path)",
+            "dialog.pick_file()",
+        ] {
+            assert!(source.contains(required), "{required}");
+        }
+        let finder_start = source.find("fn find_putty_tool(name:").unwrap();
+        let finder_end = source[finder_start..]
+            .find("fn find_executable_on_path(")
+            .unwrap();
+        let finder_source = &source[finder_start..finder_start + finder_end];
+        assert!(finder_source.contains("ProgramW6432"));
+        assert!(finder_source.contains("ProgramFiles(x86)"));
+        assert!(!finder_source.contains("SourceTree"));
+        assert!(!finder_source.contains("LOCALAPPDATA"));
+        assert!(!finder_source.contains("max_by_key"));
+
+        fs::remove_file(executable).unwrap();
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn disabled_openssh_agent_uses_elevated_start_and_localized_errors() {
+        assert_eq!(
+            parse_sc_error_code(
+                b"[SC] StartService FAILED 1058:\r\n\xb7\xfe\xce\xf1\xb1\xbb\xbd\xfb\xd3\xc3"
+            ),
+            Some(1058)
+        );
+        for required in [
+            "Set-Service -Name 'ssh-agent' -StartupType Manual",
+            "Start-Service -Name 'ssh-agent'",
+            "-Verb RunAs",
+            "-WindowStyle Hidden",
+            "-Wait",
+        ] {
+            assert!(
+                WINDOWS_OPENSSH_AGENT_ELEVATION_SCRIPT.contains(required),
+                "{required}"
+            );
+        }
+        for key in [
+            "ssh.openssh_agent_not_found",
+            "ssh.openssh_agent_service_missing",
+            "ssh.openssh_agent_elevation_failed",
+            "ssh.openssh_agent_connect_failed",
+        ] {
+            let message = i18n::t(Language::Chinese, key);
+            assert!(!message.is_empty(), "{key}");
+            assert!(!message.contains('\u{fffd}'), "{key}: {message}");
+        }
+
+        let source = include_str!("app.rs");
+        let start = source.find("fn ensure_openssh_agent_running(").unwrap();
+        let end = source[start..].find("fn hidden_command(").unwrap();
+        let agent_source = &source[start..start + end];
+        assert!(agent_source.contains("start_windows_openssh_agent_elevated()"));
+        assert!(!agent_source.contains("from_utf8_lossy"));
+    }
+
+    #[test]
+    fn openssh_agent_status_lists_only_non_empty_identity_lines() {
+        assert_eq!(
+            openssh_identity_lines(
+                b"256 SHA256:first first@example.com (ED25519)\r\n\r\n4096 SHA256:second key two (RSA)\n"
+            ),
+            vec![
+                "256 SHA256:first first@example.com (ED25519)",
+                "4096 SHA256:second key two (RSA)",
+            ]
+        );
+        assert!(openssh_identity_lines(b"The agent has no identities.\r\n").is_empty());
+        assert!(openssh_identity_lines(b"The agent has no identities\n").is_empty());
+        assert!(openssh_identity_lines(b"").is_empty());
+        assert!(openssh_identity_lines(&[0xff, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn ssh_agent_key_prompt_matches_source_tree_no_key_flow() {
+        let no_openssh_keys = SshAgentStatus {
+            client: SshClientKind::OpenSsh,
+            backend: "OpenSSH ssh-agent".to_owned(),
+            identities: Vec::new(),
+            can_list_identities: true,
+        };
+        assert!(ssh_agent_should_prompt_for_key(&no_openssh_keys));
+
+        let mut with_openssh_key = no_openssh_keys.clone();
+        with_openssh_key
+            .identities
+            .push("256 SHA256:key user@example.com (ED25519)".to_owned());
+        assert!(!ssh_agent_should_prompt_for_key(&with_openssh_key));
+
+        let pageant_status = SshAgentStatus {
+            client: SshClientKind::PuttyPlink,
+            backend: "pageant".to_owned(),
+            identities: Vec::new(),
+            can_list_identities: false,
+        };
+        assert!(ssh_agent_should_prompt_for_key(&pageant_status));
+    }
+
+    #[test]
+    fn ssh_agent_status_transition_is_immediate_async_and_localized() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source.find(start).unwrap();
+            let end = source[start..].find(end).unwrap();
+            &source[start..start + end]
+        }
+
+        let source = include_str!("app.rs");
+        let start = section(
+            source,
+            "fn start_ssh_agent(&mut self)",
+            "fn refresh_ssh_agent_status(&mut self)",
+        );
+        let visible = start.find("self.ssh_agent_status_open = true;").unwrap();
+        let pending = start
+            .find("self.start_ssh_tool_task(SshToolAction::StartAgent, None);")
+            .unwrap();
+        assert!(visible < pending);
+        assert!(start.contains("self.ssh_agent_status = None;"));
+        assert!(start.contains("self.ssh_load_key_prompt_open = false;"));
+
+        let task = section(source, "fn start_ssh_tool_task(", "fn start_update_check(");
+        let owned = task.find("self.ssh_tool_task = Some(receiver);").unwrap();
+        let spawned = task.find("thread::spawn(move ||").unwrap();
+        assert!(owned < spawned);
+        assert!(task.contains("SshToolAction::RefreshAgentStatus"));
+
+        let modal = section(
+            source,
+            "fn ssh_agent_status_modal(",
+            "fn ssh_install_prompt_modal(",
+        );
+        for required in [
+            "tool_busy",
+            "self.ssh_tool_task.is_some()",
+            "self.refresh_ssh_agent_status();",
+            "self.choose_and_add_ssh_key();",
+            ".selectable(true)",
+            "ssh.load_key.message",
+            "let action_width = [add_key, refresh, close]",
+            "dialog_sized_action_button",
+        ] {
+            assert!(modal.contains(required), "{required}");
+        }
+
+        let poll = section(
+            source,
+            "if let Some(receiver) = self.ssh_tool_task.take()",
+            "if let Some(receiver) = self.create_patch_task.take()",
+        );
+        assert!(poll.contains("self.ssh_tool_action = None;"));
+        assert!(poll.contains("SshToolTaskOutput::AgentStatus(status)"));
+        assert!(poll.contains("ssh_agent_should_prompt_for_key(&status)"));
+
+        for key in [
+            "ssh.status.title",
+            "ssh.status.running",
+            "ssh.status.no_keys",
+            "ssh.status.openssh_background",
+            "ssh.status.add_key",
+            "ssh.load_key.title",
+            "ssh.load_key.message",
+            "ssh.load_key.yes",
+            "ssh.load_key.no",
+        ] {
+            for language in [Language::Chinese, Language::English] {
+                let message = i18n::t(language, key);
+                assert!(!message.is_empty(), "{key}");
+                assert_ne!(message, key, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn openssh_install_transition_is_async_localized_and_shares_busy_gate() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source.find(start).unwrap();
+            let end = source[start..].find(end).unwrap();
+            &source[start..start + end]
+        }
+
+        for key in [
+            "ssh.openssh_installed",
+            "ssh.openssh_install.title",
+            "ssh.openssh_install.message",
+            "ssh.openssh_install.install",
+            "ssh.openssh_install.installing",
+            "ssh.openssh_install.guide",
+            "ssh.openssh_install.recheck",
+            "ssh.openssh_install.detected",
+            "ssh.openssh_install.failed",
+        ] {
+            for language in [Language::Chinese, Language::English] {
+                let message = i18n::t(language, key);
+                assert!(!message.is_empty(), "{key}");
+                assert!(!message.contains('\u{fffd}'), "{key}: {message}");
+                assert_ne!(message, key, "{key}");
+            }
+        }
+
+        let source = include_str!("app.rs");
+        let set_client = section(source, "fn set_ssh_client(", "fn start_ssh_agent(");
+        assert!(set_client.contains("self.refresh_ssh_install_prompt();"));
+        assert!(!set_client.contains("if self.ssh_client == client {\n            return;"));
+
+        let task = section(source, "fn start_ssh_tool_task(", "fn start_update_check(");
+        let busy_position = task.find("self.ssh_tool_task = Some(receiver);").unwrap();
+        let spawn_position = task.find("thread::spawn(move ||").unwrap();
+        assert!(busy_position < spawn_position);
+        assert!(task.contains("install_openssh_client(language).map(SshToolTaskOutput::Message)"));
+
+        let poll = section(
+            source,
+            "if let Some(receiver) = self.ssh_tool_task.take()",
+            "if let Some(receiver) = self.create_patch_task.take()",
+        );
+        assert!(poll.contains("self.ssh_tool_action = None;"));
+        assert!(poll.contains("self.refresh_ssh_install_prompt();"));
+
+        let prompt = section(
+            source,
+            "fn ssh_install_prompt_modal(",
+            "fn repository_benchmark_progress_modal(",
+        );
+        assert!(prompt.contains("install_running"));
+        assert!(prompt.contains("!install_running"));
+        assert!(prompt.contains("SshToolAction::InstallOpenSsh"));
+
+        let settings = section(
+            source,
+            "fn global_git_settings(",
+            "fn global_custom_actions_settings(",
+        );
+        assert!(settings.contains("let ssh_controls_enabled = self.ssh_tool_task.is_none();"));
+        assert!(settings.contains("add_enabled_ui(ssh_controls_enabled"));
+
+        let tools_menu = section(
+            source,
+            "menu_label(self.language, \"tools\"),",
+            "menu_label(self.language, \"help\"),",
+        );
+        assert!(tools_menu.contains("let ssh_tool_enabled = self.ssh_tool_task.is_none();"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_openssh_install_uses_optional_feature_with_elevation() {
+        for required in [
+            "Add-WindowsCapability",
+            "OpenSSH.Client~~~~0.0.1.0",
+            "-Verb RunAs",
+            "-WindowStyle Hidden",
+            "-Wait",
+            "-PassThru",
+        ] {
+            assert!(
+                WINDOWS_OPENSSH_INSTALL_ELEVATION_SCRIPT.contains(required),
+                "{required}"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_accelerators_cover_every_top_level_menu() {
+        let source = include_str!("app.rs");
+        let start = source.find("fn top_menu_accelerator_pressed(").unwrap();
+        let end = source[start..].find("fn top_menu_button(").unwrap();
+        let accelerator_source = &source[start..start + end];
+        for mapping in [
+            "(egui::Key::F, TopMenu::File)",
+            "(egui::Key::V, TopMenu::View)",
+            "(egui::Key::R, TopMenu::Repository)",
+            "(egui::Key::A, TopMenu::Actions)",
+            "(egui::Key::T, TopMenu::Tools)",
+            "(egui::Key::H, TopMenu::Help)",
+        ] {
+            assert!(accelerator_source.contains(mapping), "{mapping}");
+        }
+        assert!(accelerator_source.contains("input.consume_key(alt_only, key)"));
     }
 
     #[test]
@@ -26969,9 +29413,10 @@ mod ui_tests {
         assert!(!worktree_diff_source.contains("panel_heading_inline"));
         assert!(!worktree_diff_source.contains("RichText::new(&selected.display_path)"));
         assert!(worktree_diff_source.contains("worktree_diff_panel_frame().show(ui, |ui|"));
-        assert!(worktree_diff_source.contains("let available_diff_size = safe_ui_size"));
         assert!(worktree_diff_source.contains("let inner_size = safe_ui_size"));
         assert!(worktree_diff_source.contains("safe_set_min_size(ui, inner_size)"));
+        assert!(worktree_diff_source.contains("fill_diff_scroll_area("));
+        assert!(!worktree_diff_source.contains("available_diff_height.max(160.0)"));
         assert!(worktree_diff_source.contains("let diff_rect = diff_response.response.rect"));
         assert!(worktree_diff_source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
 
@@ -28783,27 +31228,35 @@ mod ui_tests {
             "repo_git_flow_initialize",
             "repo_create_pull_request",
             "repo_benchmark_performance",
-            "self.open_repo_settings_from_menu();",
+            "MenuShortcutCommand::OpenRepositorySettings",
             "self.open_remote_url();",
             "self.stage_toggle_current_repository();",
             "has_worktree_changes",
             "WorktreeActionDialog::ConfirmDiscardAll",
-            "self.handle_stash_action(StashMenuAction::Create);",
+            "MenuShortcutCommand::StashChanges",
             "menu_shortcut_button(",
             "\"Ctrl+Shift+C\"",
+            "\"Ctrl+Shift+,\"",
+            "\"Ctrl+Shift+S\"",
             "\"Ctrl+P\"",
             "\"Ctrl+L\"",
             "\"Ctrl+F\"",
+            "\"Ctrl+Shift+U\"",
+            "\"Ctrl+Shift+B\"",
+            "\"Ctrl+Shift+M\"",
+            "\"Ctrl+Shift+T\"",
+            "\"Shift+Alt+P\"",
             "self.push_current();",
             "self.pull_current();",
             "self.fetch_all();",
-            "self.open_merge_dialog();",
+            "MenuShortcutCommand::Checkout",
+            "MenuShortcutCommand::CreateBranch",
+            "MenuShortcutCommand::Merge",
+            "MenuShortcutCommand::CreateTag",
             "self.open_archive_dialog();",
             "self.open_submodule_dialog();",
             "self.open_subtree_dialog();",
-            "self.handle_branch_action(BranchMenuAction::Create);",
-            "self.handle_tag_action(TagMenuAction::Create);",
-            "self.create_pull_request_current_branch();",
+            "MenuShortcutCommand::CreatePullRequest",
             "self.start_repository_benchmark();",
         ] {
             assert!(repo_source.contains(required), "{required}");
@@ -29142,6 +31595,126 @@ mod ui_tests {
         assert_eq!(
             actions_menu_command_for_shortcut(modifiers(true, false, false), egui::Key::O),
             None
+        );
+    }
+
+    #[test]
+    fn menu_shortcuts_add_missing_defaults_without_replacing_existing_bindings() {
+        let modifiers = |ctrl, shift, alt| egui::Modifiers {
+            ctrl,
+            command: ctrl,
+            shift,
+            alt,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                modifiers(true, false, false),
+                egui::Key::O,
+                MenuShortcutCommand::OpenRepository,
+            ),
+            (
+                modifiers(true, false, false),
+                egui::Key::Comma,
+                MenuShortcutCommand::OpenSettings,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::Comma,
+                MenuShortcutCommand::OpenRepositorySettings,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::S,
+                MenuShortcutCommand::StashChanges,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::U,
+                MenuShortcutCommand::Checkout,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::B,
+                MenuShortcutCommand::CreateBranch,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::M,
+                MenuShortcutCommand::Merge,
+            ),
+            (
+                modifiers(true, true, false),
+                egui::Key::T,
+                MenuShortcutCommand::CreateTag,
+            ),
+            (
+                modifiers(false, true, true),
+                egui::Key::P,
+                MenuShortcutCommand::CreatePullRequest,
+            ),
+        ];
+
+        for (modifiers, key, expected) in cases {
+            assert_eq!(menu_command_for_shortcut(modifiers, key), Some(expected));
+        }
+
+        let discard_modifiers = modifiers(true, true, false);
+        assert_eq!(
+            menu_command_for_shortcut(discard_modifiers, egui::Key::R),
+            None
+        );
+        assert_eq!(
+            actions_menu_command_for_shortcut(discard_modifiers, egui::Key::R),
+            Some(ActionsMenuCommand::DiscardSelected)
+        );
+        assert_eq!(
+            menu_command_for_shortcut(modifiers(true, false, true), egui::Key::O),
+            None
+        );
+    }
+
+    #[test]
+    fn menu_shortcuts_are_displayed_and_dispatched_after_text_input_guard() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        for shortcut in [
+            "\"Ctrl+O\"",
+            "\"Ctrl+,\"",
+            "\"Ctrl+Shift+,\"",
+            "\"Ctrl+Shift+S\"",
+            "\"Ctrl+Shift+U\"",
+            "\"Ctrl+Shift+B\"",
+            "\"Ctrl+Shift+M\"",
+            "\"Ctrl+Shift+T\"",
+            "\"Shift+Alt+P\"",
+        ] {
+            assert!(menu_source.contains(shortcut), "{shortcut}");
+        }
+
+        let shortcut_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcut_end = implementation_source[shortcut_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcut_source = &implementation_source[shortcut_start..shortcut_start + shortcut_end];
+        let text_guard = shortcut_source.find("ctx.wants_keyboard_input()").unwrap();
+        let menu_dispatch = shortcut_source.find("menu_shortcut_pressed(ctx)").unwrap();
+
+        assert!(text_guard < menu_dispatch);
+        assert!(
+            shortcut_source[menu_dispatch..]
+                .contains("self.execute_menu_shortcut_command(command);")
+        );
+        assert!(
+            !implementation_source
+                .contains("input.modifiers.ctrl && input.key_pressed(egui::Key::Comma)")
         );
     }
 
@@ -29526,7 +32099,7 @@ mod ui_tests {
             "fn open_merge_dialog(&mut self)",
             "fn merge_action_modal(&mut self",
             "self.merge_action_modal(ctx);",
-            "self.open_merge_dialog();",
+            "MenuShortcutCommand::Merge => self.open_merge_dialog()",
         ] {
             assert!(implementation_source.contains(required), "{required}");
         }
@@ -29539,7 +32112,9 @@ mod ui_tests {
         assert!(menu_source.contains("repo_merge"));
         assert!(menu_source.contains("has_merge_targets"));
         assert!(menu_source.contains("git_dialog_enabled && has_merge_targets"));
-        assert!(menu_source.contains("self.open_merge_dialog();"));
+        assert!(menu_source.contains("MenuShortcutCommand::Merge"));
+        assert!(menu_source.contains("\"Ctrl+Shift+M\""));
+        assert!(menu_source.contains("self.execute_menu_shortcut_command("));
 
         let dialog_start = implementation_source
             .find("fn merge_action_modal(&mut self")
@@ -29612,14 +32187,12 @@ mod ui_tests {
             .unwrap();
         let menu_source = &implementation_source[menu_start..menu_start + menu_end];
         assert!(menu_source.contains("repo_interactive_rebase"));
-        assert!(menu_source.contains(
-            "menu_text_button(\n                    ui,\n                    git_dialog_enabled,\n                    menu_label(self.language, \"repo_interactive_rebase\"),\n                )"
-        ));
+        assert!(menu_source.contains("menu_label(self.language, \"repo_interactive_rebase\")"));
+        assert!(menu_source.contains("self.open_interactive_rebase_dialog();"));
         assert!(!menu_source.contains("has_interactive_rebase_targets"));
         assert!(!menu_source.contains("has_interactive_rebase_targets || rebase_in_progress"));
-        assert!(menu_source.contains(
-            "close_top_menu_popup(ui);\n                    self.open_interactive_rebase_dialog();"
-        ));
+        assert!(menu_source.contains("close_top_menu_popup(ui);"));
+        assert!(menu_source.contains("self.open_interactive_rebase_dialog();"));
         assert!(!menu_source.contains("menu_text_button(\n                    ui,\n                    false,\n                    menu_label(self.language, \"repo_interactive_rebase\"),\n                );"));
 
         let dialog_start = implementation_source
@@ -30534,9 +33107,8 @@ mod ui_tests {
         assert!(menu_source.contains("let git_flow_operation_enabled"));
         assert!(menu_source.contains("git_flow_operation_menu_enabled("));
         assert!(!menu_source.contains("repo_git_flow_next_action"));
-        assert!(menu_source.contains(
-            "menu_text_button(\n                        ui,\n                        git_flow_operation_enabled,\n                        menu_label(self.language, \"repo_git_flow_start_feature\"),"
-        ));
+        assert!(menu_source.contains("menu_label(self.language, \"repo_git_flow_start_feature\")"));
+        assert!(menu_source.contains("git_flow_operation_enabled"));
         assert!(!menu_source.contains(
             "menu_text_button(\n                        ui,\n                        false,\n                        menu_label(self.language, \"repo_git_flow_initialize\")"
         ));
@@ -30899,9 +33471,7 @@ mod ui_tests {
         assert!(menu_source.contains("let has_worktree_changes"));
         assert!(menu_source.contains("!snapshot.status.is_empty()"));
         assert!(menu_source.contains("git_dialog_enabled && has_worktree_changes"));
-        assert!(menu_source.contains(
-            "self.pending_worktree_action = Some(WorktreeActionDialog::ConfirmDiscardAll);"
-        ));
+        assert!(menu_source.contains("Some(WorktreeActionDialog::ConfirmDiscardAll);"));
 
         let dialog_start = implementation_source
             .find("fn worktree_action_modal(")
@@ -31405,10 +33975,90 @@ mod ui_tests {
         let search_source = &source[search_start..search_start + search_end];
 
         for body_source in [history_source, search_source] {
-            assert!(body_source.contains("ScrollArea::both()"));
+            assert!(body_source.contains("fill_diff_scroll_area("));
+            assert!(!body_source.contains("ui.available_height().max(160.0)"));
             assert!(!body_source.contains("diff_panel_frame().show"));
             assert!(!body_source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
         }
+
+        let helper_start = source.find("fn fill_diff_scroll_area(").unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn render_unified_diff(")
+            .unwrap();
+        let helper_source = &source[helper_start..helper_start + helper_end];
+        assert!(helper_source.contains("ScrollArea::both()"));
+        assert!(helper_source.contains("let body_size = safe_ui_size(ui.available_size())"));
+        assert!(helper_source.contains("ui.allocate_exact_size(body_size, Sense::hover())"));
+        assert!(helper_source.contains("safe_set_min_size(ui, body_rect.size())"));
+        assert!(helper_source.contains("ui.set_max_size(body_rect.size())"));
+        assert!(helper_source.contains("ui.set_clip_rect(body_rect)"));
+        assert!(helper_source.contains(".max_height(body_rect.height())"));
+        assert!(helper_source.contains(".auto_shrink([false, false])"));
+    }
+
+    #[test]
+    fn every_in_app_file_diff_uses_the_shared_fill_scroll_area() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert_eq!(
+            implementation_source
+                .matches("fill_diff_scroll_area(")
+                .count(),
+            5
+        );
+        for salt in [
+            "commit_diff_scroll",
+            "search_commit_diff_scroll",
+            "worktree_diff_scroll",
+            "create_patch_diff_scroll",
+        ] {
+            assert!(implementation_source.contains(salt), "{salt}");
+        }
+    }
+
+    #[test]
+    fn repository_refresh_comparison_ignores_only_relative_time_labels() {
+        let commit = Commit {
+            hash: "abcdef123456".to_owned(),
+            short_hash: "abcdef1".to_owned(),
+            relative_time: "1 minute ago".to_owned(),
+            subject: "keep reading".to_owned(),
+            ..Commit::default()
+        };
+        let mut left = RepositorySnapshot {
+            root: PathBuf::from("D:/repo"),
+            commits: vec![commit.clone()],
+            date_commits: vec![commit.clone()],
+            topology_commits: vec![commit.clone()],
+            all_date_commits: vec![commit.clone()],
+            all_topology_commits: vec![commit],
+            stashes: vec![StashEntry {
+                selector: "stash@{0}".to_owned(),
+                relative_time: "1 minute ago".to_owned(),
+                message: "draft".to_owned(),
+            }],
+            ..RepositorySnapshot::default()
+        };
+        let mut right = left.clone();
+
+        for commits in [
+            &mut right.commits,
+            &mut right.date_commits,
+            &mut right.topology_commits,
+            &mut right.all_date_commits,
+            &mut right.all_topology_commits,
+        ] {
+            commits[0].relative_time = "2 minutes ago".to_owned();
+        }
+        right.stashes[0].relative_time = "2 minutes ago".to_owned();
+        assert!(repository_snapshots_equal_for_refresh(&left, &right));
+
+        right.all_date_commits[0].subject = "real repository change".to_owned();
+        assert!(!repository_snapshots_equal_for_refresh(&left, &right));
+
+        right.all_date_commits[0].subject = left.all_date_commits[0].subject.clone();
+        left.status.push(" M src/app.rs".to_owned());
+        assert!(!repository_snapshots_equal_for_refresh(&left, &right));
     }
 
     #[test]
@@ -31812,13 +34462,15 @@ mod ui_tests {
             .unwrap();
         let history_diff_source =
             &implementation_source[history_diff_start..history_diff_start + history_diff_end];
-        assert!(history_diff_source.contains("ScrollArea::both()"));
+        assert!(history_diff_source.contains("fill_diff_scroll_area("));
         assert!(!history_diff_source.contains("theme::panel_recessed()"));
         assert!(!history_diff_source.contains("paint_workspace_card_inset_shadow(ui, diff_rect)"));
 
         let diff_row_start = source.find("fn diff_row(").unwrap();
-        let hunk_start = source[diff_row_start..].find("fn diff_hunk_row(").unwrap();
-        let diff_row_source = &source[diff_row_start..diff_row_start + hunk_start];
+        let row_end = source[diff_row_start..]
+            .find("fn diff_row_clip_rect(")
+            .unwrap();
+        let diff_row_source = &source[diff_row_start..diff_row_start + row_end];
         assert!(diff_row_source.contains("Color32::from_rgb(214, 250, 221)"));
         assert!(diff_row_source.contains("Color32::from_rgb(255, 226, 226)"));
         assert!(!diff_row_source.contains("from_rgba_unmultiplied(55, 135, 75"));
@@ -31837,16 +34489,52 @@ mod ui_tests {
     }
 
     #[test]
+    fn unified_diff_hides_hunk_metadata_and_compacts_line_number_gutter() {
+        let diff = "\
+diff --cc src/file.rs
+index 1111111,2222222..3333333
+--- a/src/file.rs
++++ b/src/file.rs
+@@@ -7,2 -8,2 +109,3 @@@
+ context
+-removed
++added";
+        let items = collect_unified_diff_items(diff, DiffDisplayMode::Full);
+
+        assert!(!items.iter().any(|item| match item {
+            DiffRenderItem::FileHeader(text) => text.contains("@@@"),
+            DiffRenderItem::Omitted => false,
+            DiffRenderItem::Line(line) => line.body.contains("@@@"),
+        }));
+        let first_line = items
+            .iter()
+            .find_map(|item| match item {
+                DiffRenderItem::Line(line) => Some(line),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first_line.left_no, "7");
+        assert_eq!(first_line.right_no, "109");
+
+        let gutter = diff_gutter_layout(&items, 7.0);
+        assert_eq!(gutter.left_width, 18.0);
+        assert_eq!(gutter.right_width, 29.0);
+        assert!(gutter.total_width() < 96.0);
+    }
+
+    #[test]
     fn unified_diff_draws_indent_guide_dots_inside_rows() {
         let source = include_str!("app.rs");
         let diff_row_start = source.find("fn diff_row(").unwrap();
-        let hunk_start = source[diff_row_start..].find("fn diff_hunk_row(").unwrap();
-        let diff_row_source = &source[diff_row_start..diff_row_start + hunk_start];
+        let row_end = source[diff_row_start..]
+            .find("fn diff_row_clip_rect(")
+            .unwrap();
+        let diff_row_source = &source[diff_row_start..diff_row_start + row_end];
         assert!(diff_row_source.contains("draw_diff_indent_guides(ui, text_rect, &line.body)"));
         assert!(diff_row_source.contains("if !selected"));
 
         let guide_start = source.find("fn draw_diff_indent_guides(").unwrap();
-        let guide_end = source[guide_start..].find("fn diff_hunk_row(").unwrap();
+        let guide_end = source[guide_start..].find("fn diff_omitted_row(").unwrap();
         let guide_source = &source[guide_start..guide_start + guide_end];
         assert!(guide_source.contains("circle_filled"));
         assert!(guide_source.contains("layout_no_wrap"));
@@ -31857,8 +34545,10 @@ mod ui_tests {
     fn unified_diff_rows_clip_background_and_text_to_visible_area() {
         let source = include_str!("app.rs");
         let diff_row_start = source.find("fn diff_row(").unwrap();
-        let hunk_start = source[diff_row_start..].find("fn diff_hunk_row(").unwrap();
-        let diff_row_source = &source[diff_row_start..diff_row_start + hunk_start];
+        let row_end = source[diff_row_start..]
+            .find("fn diff_row_clip_rect(")
+            .unwrap();
+        let diff_row_source = &source[diff_row_start..diff_row_start + row_end];
         assert!(diff_row_source.contains("let row_clip = diff_row_clip_rect(ui, rect);"));
         assert!(diff_row_source.contains("let painter = ui.painter().with_clip_rect(row_clip);"));
         assert!(diff_row_source.contains("let text_clip = text_rect.intersect(row_clip);"));
@@ -31873,7 +34563,7 @@ mod ui_tests {
         assert!(helper_source.contains("rect.intersect(ui.clip_rect())"));
 
         let guide_start = source.find("fn draw_diff_indent_guides(").unwrap();
-        let guide_end = source[guide_start..].find("fn diff_hunk_row(").unwrap();
+        let guide_end = source[guide_start..].find("fn diff_omitted_row(").unwrap();
         let guide_source = &source[guide_start..guide_start + guide_end];
         assert!(guide_source.contains("text_rect.intersect(ui.clip_rect())"));
     }
@@ -32813,7 +35503,10 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("BranchActionDialog::ConfirmDetachedCheckout"));
         assert!(implementation_source.contains("fn open_checkout_dialog(&mut self)"));
         assert!(implementation_source.contains("fn checkout_dialog_modal("));
-        assert!(implementation_source.contains("self.open_checkout_dialog();"));
+        assert!(
+            implementation_source
+                .contains("MenuShortcutCommand::Checkout => self.open_checkout_dialog()")
+        );
 
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -32821,13 +35514,14 @@ diff --git a/file.txt b/file.txt
             .unwrap();
         let menu_source = &implementation_source[menu_start..menu_start + menu_end];
         assert!(menu_source.contains("menu_label(self.language, \"repo_checkout\")"));
-        assert!(menu_source.contains("self.open_checkout_dialog();"));
+        assert!(menu_source.contains("MenuShortcutCommand::Checkout"));
+        assert!(menu_source.contains("self.execute_menu_shortcut_command("));
         let normalized_menu_source: String = menu_source
             .chars()
             .filter(|ch| !ch.is_whitespace())
             .collect();
         assert!(normalized_menu_source.contains(
-            "menu_text_button(ui,git_dialog_enabled,menu_label(self.language,\"repo_checkout\"),)"
+            "menu_shortcut_button(ui,git_dialog_enabled,menu_label(self.language,\"repo_checkout\"),\"Ctrl+Shift+U\",)"
         ));
 
         let dialog_start = implementation_source
@@ -33276,6 +35970,54 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
+    fn file_clone_new_opens_or_reopens_the_single_repository_source_tab() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
+        let menu_end = implementation_source[menu_start..]
+            .find("fn top_bar_panel(")
+            .unwrap();
+        let menu_source = &implementation_source[menu_start..menu_start + menu_end];
+        let file_start = menu_source
+            .find("menu_label(self.language, \"file\")")
+            .unwrap();
+        let file_end = menu_source[file_start..]
+            .find("menu_label(self.language, \"view\")")
+            .unwrap();
+        let file_source = &menu_source[file_start..file_start + file_end];
+        assert!(file_source.contains("self.tr(\"action.clone_new\")"));
+        assert!(file_source.contains("\"Ctrl+N\""));
+        assert!(file_source.contains("self.open_repository_source_tab();"));
+
+        let open_start = implementation_source
+            .find("fn open_repository_source_tab(")
+            .unwrap();
+        let open_end = implementation_source[open_start..]
+            .find("fn repository_source_active(")
+            .unwrap();
+        let open_source = &implementation_source[open_start..open_start + open_end];
+        assert!(open_source.contains("self.source_tab_open = true;"));
+        assert!(open_source.contains("self.active_repo_tab = None;"));
+        assert!(!open_source.contains("push("));
+
+        let shortcut_start = implementation_source
+            .find("fn handle_global_shortcuts(")
+            .unwrap();
+        let shortcut_end = implementation_source[shortcut_start..]
+            .find("fn poll_tasks(")
+            .unwrap();
+        let shortcut_source = &implementation_source[shortcut_start..shortcut_start + shortcut_end];
+        assert!(shortcut_source.contains("shortcut_pressed(ctx, egui::Key::N, false)"));
+        assert!(shortcut_source.contains("self.open_repository_source_tab();"));
+        assert_eq!(
+            i18n::t(Language::Chinese, "action.clone_new"),
+            "\u{514b}\u{9686}/\u{65b0}\u{5efa}"
+        );
+        assert_eq!(i18n::t(Language::English, "action.clone_new"), "Clone/New");
+    }
+
+    #[test]
     fn repo_tab_shadow_geometry_reads_as_top_left_light_source() {
         let rect = Rect::from_min_size(Pos2::new(100.0, 20.0), Vec2::new(120.0, 28.0));
         let top = repo_tab_shadow_rect(rect, RepoTabShadowSide::Top, 2);
@@ -33488,6 +36230,7 @@ diff --git a/file.txt b/file.txt
         let repo_path = repo.display().to_string();
         let state = RepoTabsState {
             tabs: vec![repo_path.clone(), repo_path],
+            tab_aliases: HashMap::new(),
             active_repo_tab: Some(0),
             source_tab_open: true,
             source_tab_active: true,
@@ -33515,6 +36258,7 @@ diff --git a/file.txt b/file.txt
                 repo.display().to_string(),
                 repo.display().to_string(),
             ],
+            tab_aliases: HashMap::new(),
             active_repo_tab: Some(0),
             source_tab_open: true,
             source_tab_active: true,
@@ -33527,6 +36271,48 @@ diff --git a/file.txt b/file.txt
         assert!(paths_equal(&tabs[0].root, &repo));
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn repo_tabs_state_restores_alias_and_blank_alias_uses_folder_name() {
+        let base = env::temp_dir().join(format!("git-agent-tab-alias-test-{}", std::process::id()));
+        let repo = base.join("repo-folder");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let mut state = RepoTabsState {
+            tabs: vec![repo.display().to_string()],
+            ..RepoTabsState::default()
+        };
+        state
+            .tab_aliases
+            .insert(repo_state_key(&repo), "  Work Alias  ".to_owned());
+        assert_eq!(state.repo_tabs()[0].name, "Work Alias");
+
+        state
+            .tab_aliases
+            .insert(repo_state_key(&repo), "   ".to_owned());
+        assert_eq!(state.repo_tabs()[0].name, "repo-folder");
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn repository_tab_alias_editor_supports_double_click_submit_and_cancel() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let tab_start = implementation_source
+            .find("fn repo_tab_with_close(")
+            .unwrap();
+        let tab_end = implementation_source[tab_start..]
+            .find("fn repo_tab_overflow_menu(")
+            .unwrap();
+        let tab_source = &implementation_source[tab_start..tab_start + tab_end];
+
+        assert!(tab_source.contains("response.double_clicked()"));
+        assert!(tab_source.contains("TextEdit::singleline(&mut rename.value)"));
+        assert!(tab_source.contains("egui::Key::Enter"));
+        assert!(tab_source.contains("egui::Key::Escape"));
+        assert!(tab_source.contains("editor_response.lost_focus()"));
     }
 
     #[test]
@@ -33788,7 +36574,10 @@ diff --git a/file.txt b/file.txt
         assert!(poll_source.contains("for (requested_root, result) in repo_results"));
         assert!(poll_source.contains("Ok(snapshot)"));
         assert!(poll_source.contains("self.cache_repository_snapshot(&snapshot)"));
-        assert!(poll_source.contains("if self.active_repo_root_matches(&requested_root)"));
+        assert!(
+            poll_source
+                .contains("let active_repo = self.active_repo_root_matches(&requested_root)")
+        );
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
         assert!(poll_source.contains("self.loading_repo = self.active_repo_has_pending_load()"));
     }
@@ -33891,6 +36680,44 @@ diff --git a/file.txt b/file.txt
         assert!(poll_source.contains("let was_foreground ="));
         assert!(poll_source.contains("self.foreground_repo_loads.remove"));
         assert!(poll_source.contains("if was_foreground && self.active_repo_root_matches"));
+    }
+
+    #[test]
+    fn unchanged_background_refresh_preserves_all_active_list_and_diff_state() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation_source.contains("fn active_snapshot_matches_background_refresh("));
+        assert!(implementation_source.contains("repository_snapshots_equal_for_refresh("));
+
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation_source[poll_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let poll_source = &implementation_source[poll_start..poll_start + poll_end];
+        assert!(poll_source.contains("let unchanged_background_snapshot = active_repo"));
+        assert!(poll_source.contains("&& !was_foreground"));
+        assert!(poll_source.contains("self.active_snapshot_matches_background_refresh(&snapshot)"));
+        assert!(poll_source.contains("if !unchanged_background_snapshot"));
+        assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
+
+        let apply_start = implementation_source
+            .find("fn apply_repository_snapshot(")
+            .unwrap();
+        let apply_end = implementation_source[apply_start..]
+            .find("fn active_snapshot_matches_background_refresh(")
+            .unwrap();
+        let apply_source = &implementation_source[apply_start..apply_start + apply_end];
+        for reset in [
+            "self.selected_commit =",
+            "self.search_selected_commit =",
+            "self.details_cache.clear()",
+            "self.diff_cache.clear()",
+            "self.selected_file_path = None",
+            "self.search_selected_file_path = None",
+            "self.selected_worktree_file = None",
+        ] {
+            assert!(apply_source.contains(reset), "{reset}");
+        }
     }
 
     #[test]
@@ -34226,9 +37053,17 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn settings_and_repo_settings_are_separate_flows() {
-        assert!(SETTINGS_DIALOG_WIDTH <= 780.0);
+        assert_eq!(SETTINGS_DIALOG_WIDTH, 640.0);
         assert!(SETTINGS_DIALOG_HEIGHT <= 600.0);
-        assert_eq!(global_settings_dialog_width(SettingsTab::Network), 640.0);
+        for tab in [
+            SettingsTab::General,
+            SettingsTab::Git,
+            SettingsTab::CustomActions,
+            SettingsTab::Verification,
+            SettingsTab::Network,
+        ] {
+            assert_eq!(global_settings_dialog_width(tab), SETTINGS_DIALOG_WIDTH);
+        }
         assert_eq!(
             global_settings_dialog_height(SettingsTab::Network, 0, 1, 0),
             280.0
@@ -34310,6 +37145,36 @@ diff --git a/file.txt b/file.txt
             i18n::t(Language::Chinese, "settings.language"),
             "\u{8bed}\u{8a00}"
         );
+    }
+
+    #[test]
+    fn settings_tabs_measure_labels_and_center_every_language_width() {
+        assert_eq!(settings_tab_button_width_from_text_width(20.0), 104.0);
+        assert_eq!(settings_tab_button_width_from_text_width(140.0), 174.0);
+
+        let row = Rect::from_min_size(Pos2::new(14.0, 44.0), Vec2::new(612.0, 34.0));
+        for strip_width in [544.0, 578.0] {
+            let strip = centered_settings_tab_strip_rect(row, strip_width);
+            assert!((strip.center().x - row.center().x).abs() < f32::EPSILON);
+            assert!(((strip.left() - row.left()) - (row.right() - strip.right())).abs() < 0.01);
+        }
+
+        let preferred = [104.0, 104.0, 174.0, 104.0, 104.0];
+        assert_eq!(
+            settings_tab_content_width(&preferred),
+            preferred.iter().sum::<f32>() + LAYOUT_GAP as f32 * 4.0
+        );
+        assert_eq!(fit_settings_tab_widths(&preferred, 622.0), preferred);
+        let fitted = fit_settings_tab_widths(&preferred, 492.0);
+        assert!((settings_tab_content_width(&fitted) - 492.0).abs() < 0.01);
+
+        let source = include_str!("app.rs");
+        let strip_start = source.find("fn settings_tab_strip(").unwrap();
+        let strip_end = source[strip_start..]
+            .find("fn settings_tab_button_width(")
+            .unwrap();
+        let strip_source = &source[strip_start..strip_start + strip_end];
+        assert!(strip_source.contains("ui.spacing_mut().item_spacing.x = 0.0;"));
     }
 
     #[test]
@@ -34563,6 +37428,122 @@ diff --git a/file.txt b/file.txt
         assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
         assert!(implementation_source.contains("self.maybe_refresh_repositories(ctx)"));
         assert!(!implementation_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
+    }
+
+    #[test]
+    fn help_menu_uses_about_and_async_release_update_without_process_viewer() {
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source.find(start).unwrap();
+            let end = source[start..].find(end).unwrap();
+            &source[start..start + end]
+        }
+
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(!implementation.contains("process_viewer"));
+        assert!(!implementation.contains("process_viewer_modal"));
+
+        let help_menu = section(
+            implementation,
+            "menu_label(self.language, \"help\"),",
+            "fn top_bar_panel(&mut self",
+        );
+        let about = help_menu
+            .find("menu_label(self.language, \"about\")")
+            .unwrap();
+        let update = help_menu
+            .find("menu_label(self.language, \"check_updates\")")
+            .unwrap();
+        assert!(about < update);
+        assert!(help_menu.contains("self.about_open = true;"));
+        assert!(help_menu.contains("self.start_update_check();"));
+        assert!(help_menu.contains("self.update_task.is_none()"));
+
+        let check = section(
+            implementation,
+            "fn start_update_check(&mut self)",
+            "fn start_update_install(&mut self)",
+        );
+        let visible = check.find("self.update_dialog_open = true;").unwrap();
+        let owned = check.find("self.update_task = Some(receiver);").unwrap();
+        let spawned = check.find("thread::spawn(move ||").unwrap();
+        assert!(visible < owned && owned < spawned);
+        assert!(check.contains("self.update_task_action = Some(UpdateTaskAction::Check)"));
+
+        let install = section(
+            implementation,
+            "fn start_update_install(&mut self)",
+            "fn open_repo_config_file(&mut self)",
+        );
+        let install_owned = install.find("self.update_task = Some(receiver);").unwrap();
+        let install_spawned = install.find("thread::spawn(move ||").unwrap();
+        assert!(install_owned < install_spawned);
+        assert!(install.contains("self.update_task.is_some()"));
+        assert!(install.contains("updater::download_and_install(&asset)"));
+
+        let poll = section(
+            implementation,
+            "if let Some(receiver) = self.update_task.take()",
+            "if let Some(receiver) = self.create_patch_task.take()",
+        );
+        assert!(poll.contains("self.update_task_action = None;"));
+        assert!(poll.contains("self.update_task = Some(receiver);"));
+        assert!(poll.contains("UpdateTaskOutput::Checked(release)"));
+        assert!(poll.contains("UpdateTaskOutput::Installed(outcome)"));
+        assert!(poll.contains("update.stopped"));
+
+        let modal = section(
+            implementation,
+            "fn update_modal(&mut self",
+            "fn ssh_agent_status_modal(&mut self",
+        );
+        assert!(modal.contains("let task_busy = self.update_task.is_some();"));
+        assert!(modal.contains("!task_busy"));
+        assert!(modal.contains("update.download_install"));
+        assert!(modal.contains("self.start_update_install();"));
+    }
+
+    #[test]
+    fn about_copy_is_loaded_from_single_localized_markdown_file() {
+        assert!(ABOUT_MARKDOWN.contains(ABOUT_ZH_MARKER));
+        assert!(ABOUT_MARKDOWN.contains(ABOUT_EN_MARKER));
+
+        let chinese = about_markdown(Language::Chinese);
+        let english = about_markdown(Language::English);
+        assert!(!chinese.is_empty());
+        assert!(!english.is_empty());
+        assert_ne!(chinese, english);
+        assert!(!chinese.contains("<!-- lang:"));
+        assert!(!english.contains("<!-- lang:"));
+        assert!(english.contains("Git Agent is a desktop client"));
+
+        for key in [
+            "about.title",
+            "about.version",
+            "about.repository",
+            "update.title",
+            "update.current_version",
+            "update.latest_version",
+            "update.checking",
+            "update.installing",
+            "update.available",
+            "update.up_to_date",
+            "update.package",
+            "update.no_asset",
+            "update.download_install",
+            "update.open_release",
+            "update.retry",
+            "update.failed",
+            "update.installed",
+            "update.restart_required",
+            "update.stopped",
+        ] {
+            for language in [Language::Chinese, Language::English] {
+                let translated = i18n::t(language, key);
+                assert!(!translated.is_empty(), "{key}");
+                assert_ne!(translated, key, "{key}");
+            }
+        }
     }
 
     #[test]

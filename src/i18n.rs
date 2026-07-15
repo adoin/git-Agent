@@ -52,7 +52,238 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("settings.appearance", "\u{5916}\u{89c2}"),
     ("settings.theme", "\u{4e3b}\u{9898}"),
     ("settings.language", "\u{8bed}\u{8a00}"),
+    (
+        "settings.ssh_configuration",
+        "SSH \u{5ba2}\u{6237}\u{7aef}\u{914d}\u{7f6e}",
+    ),
+    ("settings.ssh_client", "SSH \u{5ba2}\u{6237}\u{7aef}"),
+    ("settings.ssh_key", "SSH \u{5bc6}\u{94a5}"),
+    (
+        "settings.ssh_choose_key",
+        "\u{9009}\u{62e9} SSH \u{5bc6}\u{94a5}",
+    ),
+    (
+        "settings.ssh_executable",
+        "\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}",
+    ),
+    (
+        "settings.ssh_executable_placeholder",
+        "\u{7559}\u{7a7a}\u{65f6}\u{6309}\u{6240}\u{9009}\u{5ba2}\u{6237}\u{7aef}\u{81ea}\u{52a8}\u{67e5}\u{627e}",
+    ),
+    (
+        "settings.ssh_choose_executable",
+        "\u{9009}\u{62e9}\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}",
+    ),
+    (
+        "settings.ssh_auto_detected",
+        "\u{81ea}\u{52a8}\u{68c0}\u{6d4b}",
+    ),
+    (
+        "settings.ssh_not_found",
+        "\u{672a}\u{627e}\u{5230}\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}",
+    ),
+    (
+        "ssh.agent_started",
+        "SSH \u{52a9}\u{624b}\u{5df2}\u{542f}\u{52a8}",
+    ),
+    ("ssh.status.title", "SSH \u{52a9}\u{624b}"),
+    ("ssh.status.client", "\u{5ba2}\u{6237}\u{7aef}"),
+    ("ssh.status.state", "\u{72b6}\u{6001}"),
+    ("ssh.status.running", "\u{6b63}\u{5728}\u{8fd0}\u{884c}"),
+    (
+        "ssh.status.starting",
+        "\u{6b63}\u{5728}\u{542f}\u{52a8} SSH \u{52a9}\u{624b}",
+    ),
+    (
+        "ssh.status.refreshing",
+        "\u{6b63}\u{5728}\u{5237}\u{65b0}\u{72b6}\u{6001}",
+    ),
+    (
+        "ssh.status.adding_key",
+        "\u{6b63}\u{5728}\u{6dfb}\u{52a0} SSH \u{5bc6}\u{94a5}",
+    ),
+    ("ssh.status.backend", "\u{52a9}\u{624b}\u{540e}\u{7aef}"),
+    (
+        "ssh.status.loaded_keys",
+        "\u{5df2}\u{52a0}\u{8f7d}\u{5bc6}\u{94a5}",
+    ),
+    (
+        "ssh.status.no_keys",
+        "\u{672a}\u{52a0}\u{8f7d}\u{4efb}\u{4f55} SSH \u{5bc6}\u{94a5}",
+    ),
+    (
+        "ssh.status.external_key_list",
+        "\u{5bc6}\u{94a5}\u{5217}\u{8868}\u{7531} Pageant \u{7ba1}\u{7406}\u{3002}",
+    ),
+    (
+        "ssh.status.openssh_background",
+        "OpenSSH ssh-agent \u{4f5c}\u{4e3a}\u{540e}\u{53f0}\u{670d}\u{52a1}\u{8fd0}\u{884c}\u{ff0c}\u{4e0d}\u{4f1a}\u{6253}\u{5f00}\u{72ec}\u{7acb}\u{7a97}\u{53e3}\u{3002}",
+    ),
+    (
+        "ssh.status.putty_tray",
+        "Pageant \u{5728}\u{7cfb}\u{7edf}\u{6258}\u{76d8}\u{8fd0}\u{884c}\u{ff0c}\u{53ef}\u{5728} Pageant \u{4e2d}\u{67e5}\u{770b}\u{548c}\u{7ba1}\u{7406}\u{5bc6}\u{94a5}\u{3002}",
+    ),
+    ("ssh.status.refresh", "\u{5237}\u{65b0}"),
+    ("ssh.status.add_key", "\u{6dfb}\u{52a0}\u{5bc6}\u{94a5}"),
+    (
+        "ssh.load_key.title",
+        "\u{52a0}\u{8f7d} SSH \u{5bc6}\u{94a5}\u{ff1f}",
+    ),
+    (
+        "ssh.load_key.message",
+        "\u{8981}\u{73b0}\u{5728}\u{52a0}\u{8f7d}\u{4e00}\u{4e2a} SSH \u{5bc6}\u{94a5}\u{5417}\u{ff1f}\u{9009}\u{62e9}\u{201c}\u{5426}\u{201d}\u{540e}\u{ff0c}\u{4ecd}\u{53ef}\u{7a0d}\u{540e}\u{901a}\u{8fc7}\u{201c}\u{5de5}\u{5177} > \u{6dfb}\u{52a0} SSH \u{5bc6}\u{94a5}\u{201d}\u{52a0}\u{8f7d}\u{3002}",
+    ),
+    ("ssh.load_key.yes", "\u{662f}"),
+    ("ssh.load_key.no", "\u{5426}"),
+    (
+        "ssh.key_added",
+        "SSH \u{5bc6}\u{94a5}\u{5df2}\u{4ea4}\u{7ed9}\u{52a9}\u{624b}",
+    ),
+    (
+        "ssh.task_stopped",
+        "SSH \u{5de5}\u{5177}\u{4efb}\u{52a1}\u{610f}\u{5916}\u{505c}\u{6b62}",
+    ),
+    (
+        "ssh.openssh_agent_not_found",
+        "\u{672a}\u{627e}\u{5230} OpenSSH ssh-add\u{3002}\u{8bf7}\u{5728}\u{201c}\u{9009}\u{9879} > Git\u{201d}\u{4e2d}\u{9009}\u{62e9}\u{6709}\u{6548}\u{7684} OpenSSH \u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}\u{3002}",
+    ),
+    (
+        "ssh.openssh_agent_service_missing",
+        "\u{672a}\u{627e}\u{5230} Windows OpenSSH ssh-agent \u{670d}\u{52a1}\u{3002}\u{8bf7}\u{5148}\u{5b89}\u{88c5} Windows OpenSSH \u{5ba2}\u{6237}\u{7aef}\u{529f}\u{80fd}\u{3002}",
+    ),
+    (
+        "ssh.openssh_agent_elevation_failed",
+        "\u{65e0}\u{6cd5}\u{542f}\u{7528} Windows OpenSSH ssh-agent \u{670d}\u{52a1}\u{3002}\u{8bf7}\u{5141}\u{8bb8}\u{7ba1}\u{7406}\u{5458}\u{6743}\u{9650}\u{8bf7}\u{6c42}\u{ff0c}\u{7136}\u{540e}\u{91cd}\u{8bd5}\u{3002}",
+    ),
+    (
+        "ssh.openssh_agent_connect_failed",
+        "Windows OpenSSH ssh-agent \u{670d}\u{52a1}\u{5df2}\u{542f}\u{52a8}\u{ff0c}\u{4f46} ssh-add \u{65e0}\u{6cd5}\u{8fde}\u{63a5}\u{3002}",
+    ),
+    (
+        "ssh.openssh_installed",
+        "OpenSSH \u{5ba2}\u{6237}\u{7aef}\u{5df2}\u{5b89}\u{88c5}",
+    ),
+    (
+        "ssh.openssh_install.title",
+        "\u{672a}\u{627e}\u{5230} OpenSSH",
+    ),
+    (
+        "ssh.openssh_install.message",
+        "\u{5f53}\u{524d}\u{9009}\u{62e9} OpenSSH\u{ff0c}\u{4f46}\u{7cfb}\u{7edf}\u{4e2d}\u{672a}\u{627e}\u{5230}\u{53ef}\u{7528}\u{7684} ssh \u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}\u{3002}",
+    ),
+    (
+        "ssh.openssh_install.windows_hint",
+        "Windows \u{5c06}\u{901a}\u{8fc7}\u{7cfb}\u{7edf}\u{53ef}\u{9009}\u{529f}\u{80fd}\u{5b89}\u{88c5} OpenSSH Client\u{3002}\u{9700}\u{8981}\u{7ba1}\u{7406}\u{5458}\u{6743}\u{9650}\u{548c}\u{7f51}\u{7edc}\u{8fde}\u{63a5}\u{3002}",
+    ),
+    (
+        "ssh.openssh_install.unix_hint",
+        "macOS \u{901a}\u{5e38}\u{81ea}\u{5e26} OpenSSH\u{ff1b}Linux \u{8bf7}\u{901a}\u{8fc7}\u{7cfb}\u{7edf}\u{5305}\u{7ba1}\u{7406}\u{5668}\u{5b89}\u{88c5} openssh-client\u{ff0c}\u{6216}\u{624b}\u{52a8}\u{6307}\u{5b9a}\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}\u{3002}",
+    ),
+    ("ssh.openssh_install.install", "\u{5b89}\u{88c5} OpenSSH"),
+    (
+        "ssh.openssh_install.installing",
+        "\u{6b63}\u{5728}\u{5b89}\u{88c5} OpenSSH\u{3002}\u{8bf7}\u{5728}\u{7cfb}\u{7edf}\u{63d0}\u{793a}\u{4e2d}\u{5141}\u{8bb8}\u{7ba1}\u{7406}\u{5458}\u{6743}\u{9650}\u{3002}",
+    ),
+    (
+        "ssh.openssh_install.guide",
+        "\u{6253}\u{5f00}\u{5b89}\u{88c5}\u{6307}\u{5357}",
+    ),
+    (
+        "ssh.openssh_install.recheck",
+        "\u{91cd}\u{65b0}\u{68c0}\u{6d4b}",
+    ),
+    (
+        "ssh.openssh_install.detected",
+        "\u{5df2}\u{68c0}\u{6d4b}\u{5230} OpenSSH \u{5ba2}\u{6237}\u{7aef}",
+    ),
+    (
+        "ssh.openssh_install.use_putty",
+        "\u{4f7f}\u{7528} PuTTY / Plink",
+    ),
+    (
+        "ssh.openssh_install.failed",
+        "\u{65e0}\u{6cd5}\u{5b89}\u{88c5} Windows OpenSSH \u{5ba2}\u{6237}\u{7aef}\u{3002}\u{8bf7}\u{68c0}\u{67e5}\u{7f51}\u{7edc}\u{8fde}\u{63a5}\u{548c} Windows \u{53ef}\u{9009}\u{529f}\u{80fd}\u{670d}\u{52a1}\u{ff0c}\u{6216}\u{6253}\u{5f00}\u{5b89}\u{88c5}\u{6307}\u{5357}\u{624b}\u{52a8}\u{5b89}\u{88c5}\u{3002}",
+    ),
+    (
+        "ssh.openssh_install.guided_only",
+        "\u{5f53}\u{524d}\u{7cfb}\u{7edf}\u{4e0d}\u{652f}\u{6301}\u{81ea}\u{52a8}\u{5b89}\u{88c5} OpenSSH\u{3002}\u{8bf7}\u{6309}\u{5b89}\u{88c5}\u{6307}\u{5357}\u{64cd}\u{4f5c}\u{ff0c}\u{6216}\u{5728}\u{201c}\u{9009}\u{9879} > Git\u{201d}\u{4e2d}\u{6307}\u{5b9a}\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}\u{3002}",
+    ),
+    (
+        "ssh.install.title",
+        "\u{672a}\u{627e}\u{5230} PuTTY / Plink",
+    ),
+    (
+        "ssh.install.message",
+        "\u{5f53}\u{524d}\u{9009}\u{62e9} PuTTY / Plink\u{ff0c}\u{4f46}\u{7cfb}\u{7edf}\u{4e2d}\u{7f3a}\u{5c11} Plink \u{6216} Pageant\u{3002}PuTTY \u{514d}\u{8d39}\u{4e14}\u{5f00}\u{6e90}\u{3002}\u{8bf7}\u{5b89}\u{88c5}\u{5b8c}\u{6574}\u{7684} PuTTY\u{ff0c}\u{6216}\u{5207}\u{6362}\u{5230} OpenSSH\u{ff1b}\u{4e5f}\u{53ef}\u{4ee5}\u{5728}\u{201c}\u{9009}\u{9879} > Git\u{201d}\u{4e2d}\u{6307}\u{5b9a}\u{5df2}\u{5b89}\u{88c5}\u{7684}\u{5ba2}\u{6237}\u{7aef}\u{7a0b}\u{5e8f}\u{3002}",
+    ),
+    (
+        "ssh.install.auto_detect_hint",
+        "\u{7559}\u{7a7a}\u{65f6}\u{ff0c}\u{672c}\u{7a0b}\u{5e8f}\u{4f1a}\u{6309}\u{5f53}\u{524d}\u{64cd}\u{4f5c}\u{7cfb}\u{7edf}\u{548c} SSH \u{5ba2}\u{6237}\u{7aef}\u{7c7b}\u{578b}\u{81ea}\u{52a8}\u{67e5}\u{627e}\u{3002}\u{624b}\u{52a8}\u{6307}\u{5b9a}\u{540e}\u{ff0c}\u{5c06}\u{4f18}\u{5148}\u{4f7f}\u{7528}\u{8be5}\u{6587}\u{4ef6}\u{3002}",
+    ),
+    (
+        "ssh.install.download",
+        "\u{6253}\u{5f00}\u{5b98}\u{65b9}\u{4e0b}\u{8f7d}",
+    ),
+    ("ssh.install.use_openssh", "\u{4f7f}\u{7528} OpenSSH"),
+    (
+        "ssh.install.open_settings",
+        "\u{6253}\u{5f00} SSH \u{8bbe}\u{7f6e}",
+    ),
+    ("ssh.install.later", "\u{7a0d}\u{540e}"),
+    ("about.title", "\u{5173}\u{4e8e} Git Agent"),
+    ("about.version", "\u{7248}\u{672c}"),
+    ("about.repository", "\u{9879}\u{76ee}\u{4e3b}\u{9875}"),
+    ("update.title", "\u{68c0}\u{67e5}\u{66f4}\u{65b0}"),
+    ("update.current_version", "\u{5f53}\u{524d}\u{7248}\u{672c}"),
+    ("update.latest_version", "\u{6700}\u{65b0}\u{7248}\u{672c}"),
+    (
+        "update.checking",
+        "\u{6b63}\u{5728}\u{68c0}\u{67e5} GitHub Release",
+    ),
+    (
+        "update.installing",
+        "\u{6b63}\u{5728}\u{4e0b}\u{8f7d}\u{5e76}\u{542f}\u{52a8}\u{5b89}\u{88c5}",
+    ),
+    (
+        "update.available",
+        "\u{6709}\u{53ef}\u{7528}\u{66f4}\u{65b0}",
+    ),
+    (
+        "update.up_to_date",
+        "\u{5f53}\u{524d}\u{5df2}\u{662f}\u{6700}\u{65b0}\u{7248}\u{672c}",
+    ),
+    ("update.package", "\u{5b89}\u{88c5}\u{5305}"),
+    (
+        "update.no_asset",
+        "\u{672a}\u{627e}\u{5230}\u{9002}\u{7528}\u{4e8e}\u{5f53}\u{524d}\u{7cfb}\u{7edf}\u{7684}\u{5b89}\u{88c5}\u{5305}",
+    ),
+    (
+        "update.download_install",
+        "\u{4e0b}\u{8f7d}\u{5e76}\u{5b89}\u{88c5}",
+    ),
+    (
+        "update.open_release",
+        "\u{6253}\u{5f00}\u{53d1}\u{5e03}\u{9875}\u{9762}",
+    ),
+    ("update.retry", "\u{91cd}\u{8bd5}"),
+    (
+        "update.failed",
+        "\u{68c0}\u{67e5}\u{6216}\u{5b89}\u{88c5}\u{66f4}\u{65b0}\u{5931}\u{8d25}",
+    ),
+    (
+        "update.installed",
+        "\u{66f4}\u{65b0}\u{5df2}\u{5b89}\u{88c5}",
+    ),
+    (
+        "update.restart_required",
+        "\u{8bf7}\u{91cd}\u{542f} Git Agent \u{4ee5}\u{4f7f}\u{7528}\u{65b0}\u{7248}\u{672c}",
+    ),
+    (
+        "update.stopped",
+        "\u{66f4}\u{65b0}\u{4efb}\u{52a1}\u{610f}\u{5916}\u{505c}\u{6b62}",
+    ),
     ("menu.copy", "\u{590d}\u{5236}"),
+    ("action.clone_new", "\u{514b}\u{9686}/\u{65b0}\u{5efa}"),
     (
         "menu.interactive_rebase_children",
         "\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{6b64}\u{63d0}\u{4ea4}\u{4e4b}\u{540e}\u{7684}\u{63d0}\u{4ea4}...",
@@ -1201,6 +1432,7 @@ const ZH_SOURCE: &[(&str, &str)] = &[
 const EN: &[(&str, &str)] = &[
     ("app.title", "Git Agent"),
     ("app.subtitle", "fast visual Git client"),
+    ("action.clone_new", "Clone/New"),
     ("action.open", "Open"),
     ("action.refresh", "Refresh"),
     ("action.fetch", "Fetch"),
@@ -1280,6 +1512,140 @@ const EN: &[(&str, &str)] = &[
     ("options.title", "Options"),
     ("settings.appearance", "Appearance"),
     ("settings.theme", "Theme"),
+    ("settings.ssh_configuration", "SSH Client Configuration"),
+    ("settings.ssh_client", "SSH client"),
+    ("settings.ssh_key", "SSH key"),
+    ("settings.ssh_choose_key", "Choose SSH key"),
+    ("settings.ssh_executable", "Client executable"),
+    (
+        "settings.ssh_executable_placeholder",
+        "Leave empty to auto-detect the selected client",
+    ),
+    ("settings.ssh_choose_executable", "Choose client executable"),
+    ("settings.ssh_auto_detected", "Auto-detected"),
+    ("settings.ssh_not_found", "Client executable not found"),
+    ("ssh.agent_started", "SSH agent started"),
+    ("ssh.status.title", "SSH Agent"),
+    ("ssh.status.client", "Client"),
+    ("ssh.status.state", "Status"),
+    ("ssh.status.running", "Running"),
+    ("ssh.status.starting", "Starting SSH agent"),
+    ("ssh.status.refreshing", "Refreshing status"),
+    ("ssh.status.adding_key", "Adding SSH key"),
+    ("ssh.status.backend", "Agent backend"),
+    ("ssh.status.loaded_keys", "Loaded keys"),
+    ("ssh.status.no_keys", "No SSH keys are loaded"),
+    (
+        "ssh.status.external_key_list",
+        "The key list is managed by Pageant.",
+    ),
+    (
+        "ssh.status.openssh_background",
+        "OpenSSH ssh-agent runs as a background service and does not open a separate window.",
+    ),
+    (
+        "ssh.status.putty_tray",
+        "Pageant runs in the system tray; open Pageant to inspect and manage keys.",
+    ),
+    ("ssh.status.refresh", "Refresh"),
+    ("ssh.status.add_key", "Add Key"),
+    ("ssh.load_key.title", "Load SSH Key?"),
+    (
+        "ssh.load_key.message",
+        "Do you want to load an SSH key now? Choose No to load one later from Tools > Add SSH Key.",
+    ),
+    ("ssh.load_key.yes", "Yes"),
+    ("ssh.load_key.no", "No"),
+    ("ssh.key_added", "SSH key sent to agent"),
+    ("ssh.task_stopped", "SSH tool task stopped unexpectedly"),
+    (
+        "ssh.openssh_agent_not_found",
+        "OpenSSH ssh-add was not found. Choose a valid OpenSSH client executable in Options > Git.",
+    ),
+    (
+        "ssh.openssh_agent_service_missing",
+        "The Windows OpenSSH ssh-agent service was not found. Install the Windows OpenSSH Client feature first.",
+    ),
+    (
+        "ssh.openssh_agent_elevation_failed",
+        "Unable to enable the Windows OpenSSH ssh-agent service. Allow the administrator permission request, then try again.",
+    ),
+    (
+        "ssh.openssh_agent_connect_failed",
+        "The Windows OpenSSH ssh-agent service started, but ssh-add cannot connect.",
+    ),
+    ("ssh.openssh_installed", "OpenSSH client installed"),
+    ("ssh.openssh_install.title", "OpenSSH Not Found"),
+    (
+        "ssh.openssh_install.message",
+        "OpenSSH is selected, but no usable ssh client executable was found on this system.",
+    ),
+    (
+        "ssh.openssh_install.windows_hint",
+        "Windows will install OpenSSH Client as an optional system feature. Administrator permission and a network connection are required.",
+    ),
+    (
+        "ssh.openssh_install.unix_hint",
+        "OpenSSH normally ships with macOS. On Linux, install openssh-client with the system package manager, or choose the client executable manually.",
+    ),
+    ("ssh.openssh_install.install", "Install OpenSSH"),
+    (
+        "ssh.openssh_install.installing",
+        "Installing OpenSSH. Allow the administrator permission request from the system.",
+    ),
+    ("ssh.openssh_install.guide", "Open Installation Guide"),
+    ("ssh.openssh_install.recheck", "Check Again"),
+    ("ssh.openssh_install.detected", "OpenSSH client detected"),
+    ("ssh.openssh_install.use_putty", "Use PuTTY / Plink"),
+    (
+        "ssh.openssh_install.failed",
+        "Unable to install Windows OpenSSH Client. Check the network connection and Windows optional feature service, or follow the installation guide manually.",
+    ),
+    (
+        "ssh.openssh_install.guided_only",
+        "Automatic OpenSSH installation is not supported on this system. Follow the installation guide, or choose a client executable in Options > Git.",
+    ),
+    ("ssh.install.title", "PuTTY / Plink Not Found"),
+    (
+        "ssh.install.message",
+        "PuTTY / Plink is selected, but Plink or Pageant is missing. PuTTY is free and open source. Install the complete PuTTY package, switch to OpenSSH, or choose an installed client executable in Options > Git.",
+    ),
+    (
+        "ssh.install.auto_detect_hint",
+        "When empty, Git Agent detects the executable for the selected SSH client and operating system. A manually selected file takes priority.",
+    ),
+    ("ssh.install.download", "Open Official Download"),
+    ("ssh.install.use_openssh", "Use OpenSSH"),
+    ("ssh.install.open_settings", "Open SSH Settings"),
+    ("ssh.install.later", "Later"),
+    ("about.title", "About Git Agent"),
+    ("about.version", "Version"),
+    ("about.repository", "Project home"),
+    ("update.title", "Check for Updates"),
+    ("update.current_version", "Current version"),
+    ("update.latest_version", "Latest version"),
+    ("update.checking", "Checking GitHub Releases"),
+    (
+        "update.installing",
+        "Downloading and starting the installer",
+    ),
+    ("update.available", "An update is available"),
+    ("update.up_to_date", "Git Agent is up to date"),
+    ("update.package", "Installer"),
+    (
+        "update.no_asset",
+        "No installer is available for this operating system",
+    ),
+    ("update.download_install", "Download and Install"),
+    ("update.open_release", "Open Release Page"),
+    ("update.retry", "Retry"),
+    ("update.failed", "Unable to check or install the update"),
+    ("update.installed", "The update is installed"),
+    (
+        "update.restart_required",
+        "Restart Git Agent to use the new version",
+    ),
+    ("update.stopped", "The update task stopped unexpectedly"),
     ("repo.settings", "Repository Settings"),
     ("repo.settings.title", "Repository Settings"),
     ("repo.settings.remote_paths", "Remote repository paths"),

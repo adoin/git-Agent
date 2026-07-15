@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{OnceLock, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,10 +19,46 @@ use crate::patch::numbered_patch_paths;
 
 const HISTORY_COMMIT_LIMIT: usize = 50_000;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SshCommandConfig {
+    executable: Option<PathBuf>,
+    variant: Option<String>,
+}
+
+static SSH_COMMAND_CONFIG: OnceLock<RwLock<SshCommandConfig>> = OnceLock::new();
+
+pub fn configure_ssh_command(executable: Option<PathBuf>, variant: Option<String>) {
+    let lock = SSH_COMMAND_CONFIG.get_or_init(|| RwLock::new(SshCommandConfig::default()));
+    let mut config = lock
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *config = SshCommandConfig {
+        executable,
+        variant,
+    };
+}
+
+fn ssh_command_config() -> SshCommandConfig {
+    SSH_COMMAND_CONFIG
+        .get_or_init(|| RwLock::new(SshCommandConfig::default()))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn apply_ssh_command_config(command: &mut Command, config: &SshCommandConfig) {
+    if let Some(executable) = &config.executable {
+        command.env("GIT_SSH", executable);
+    }
+    if let Some(variant) = &config.variant {
+        command.env("GIT_SSH_VARIANT", variant);
+    }
+}
+
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Commit {
     pub hash: String,
     pub short_hash: String,
@@ -52,7 +89,7 @@ pub struct BlameLine {
     pub content: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Branch {
     pub name: String,
     pub current: bool,
@@ -60,14 +97,14 @@ pub struct Branch {
     pub upstream: Option<UpstreamStatus>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Remote {
     pub name: String,
     pub fetch_url: String,
     pub push_url: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryConfig {
     pub config_path: PathBuf,
     pub gitignore_path: PathBuf,
@@ -77,21 +114,21 @@ pub struct RepositoryConfig {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UpstreamStatus {
     pub name: String,
     pub ahead: usize,
     pub behind: usize,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StashEntry {
     pub selector: String,
     pub relative_time: String,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
     pub name: String,
     pub target: String,
@@ -143,7 +180,7 @@ pub struct RepositoryBenchmarkStepProgress {
     pub label_key: &'static str,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeFile {
     pub index_status: char,
     pub worktree_status: char,
@@ -160,7 +197,7 @@ impl WorktreeFile {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
     pub root: PathBuf,
     pub branch: String,
@@ -3254,12 +3291,15 @@ fn git_command() -> Command {
     {
         let mut command = Command::new("git");
         command.creation_flags(CREATE_NO_WINDOW);
+        apply_ssh_command_config(&mut command, &ssh_command_config());
         command
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        Command::new("git")
+        let mut command = Command::new("git");
+        apply_ssh_command_config(&mut command, &ssh_command_config());
+        command
     }
 }
 
@@ -3269,6 +3309,36 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_COMMIT_PATCH_REPO: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn ssh_command_config_sets_explicit_executable_and_variant() {
+        let executable = PathBuf::from("custom-ssh-client");
+        let config = SshCommandConfig {
+            executable: Some(executable.clone()),
+            variant: Some("ssh".to_owned()),
+        };
+        let mut command = Command::new("git");
+
+        apply_ssh_command_config(&mut command, &config);
+
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("GIT_SSH"),
+            Some(&Some(executable.to_string_lossy().into_owned()))
+        );
+        assert_eq!(
+            environment.get("GIT_SSH_VARIANT"),
+            Some(&Some("ssh".to_owned()))
+        );
+    }
 
     #[test]
     fn history_commit_limit_supports_large_repositories() {
