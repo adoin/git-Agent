@@ -4405,6 +4405,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         git_output(&root, &["init"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
         git_output(&root, &["config", "user.email", "tester@example.com"])?;
         git_output(&root, &["config", "user.name", "Git Agent Test"])?;
 
@@ -4486,6 +4487,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root)?;
         git_output(&root, &["init"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
         git_output(&root, &["config", "user.email", "tester@example.com"])?;
         git_output(&root, &["config", "user.name", "Git Agent Test"])?;
         fs::write(root.join("selected.txt"), "before\n")?;

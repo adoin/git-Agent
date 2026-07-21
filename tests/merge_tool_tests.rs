@@ -118,7 +118,7 @@ fn merge_tool_layout_uses_fixed_regions_and_unique_scroll_ids() {
     assert!(source.contains("shared_scroll_y"));
     assert!(source.contains("let frame_scroll_y = result_scroll_y;"));
     assert!(source.contains(".vertical_scroll_offset(scroll_y)"));
-    assert!(source.contains("merge_result_row("));
+    assert!(source.contains("merge_editable_result_row("));
     assert!(source.contains("paint_merge_block_connectors("));
     assert!(source.contains("merge_block_result_rect("));
     assert!(source.contains("merge_theme_label(app.language, app.theme)"));

@@ -31962,7 +31962,7 @@ mod ui_tests {
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains("snapshot.rebase_in_progress"));
-        assert!(panel_source.contains("self.rebase_commit_panel_body(ui, &snapshot);"));
+        assert!(panel_source.contains("self.rebase_commit_panel_body(ui, &snapshot, staged_count);"));
         assert!(
             panel_source.find("snapshot.rebase_in_progress").unwrap()
                 < panel_source.find("commit_message_editor_ui(").unwrap()
