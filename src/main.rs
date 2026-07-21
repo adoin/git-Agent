@@ -18,6 +18,7 @@ fn main() -> eframe::Result<()> {
             .with_title("Git Agent")
             .with_icon(app_icon_data())
             .with_decorations(false)
+            .with_transparent(true)
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
@@ -26,7 +27,10 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "Git Agent",
         options,
-        Box::new(|cc| Ok(Box::new(git_agent::app::GitAgentApp::new(cc)))),
+        Box::new(|cc| {
+            prefer_rounded_window_corners(cc);
+            Ok(Box::new(git_agent::app::GitAgentApp::new(cc)))
+        }),
     );
     append_app_log(format!(
         "run_native returned {}",
@@ -37,6 +41,35 @@ fn main() -> eframe::Result<()> {
     ));
     result
 }
+
+#[cfg(target_os = "windows")]
+fn prefer_rounded_window_corners(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+
+    let Ok(window_handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+        return;
+    };
+
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            handle.hwnd.get() as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prefer_rounded_window_corners(_: &eframe::CreationContext<'_>) {}
 
 fn install_panic_logger() {
     std::panic::set_hook(Box::new(|info| {
@@ -237,6 +270,8 @@ mod tests {
         assert!(logo.contains("<circle cx=\"42\" cy=\"22\""));
         assert!(logo.contains("fill=\"none\""));
         assert!(include_str!("main.rs").contains("with_decorations(false)"));
+        assert!(include_str!("main.rs").contains("DWMWA_WINDOW_CORNER_PREFERENCE"));
+        assert!(include_str!("main.rs").contains("DWMWCP_ROUND"));
     }
 
     #[test]

@@ -40,6 +40,8 @@ use crate::{
 };
 
 const TITLE_BAR_HEIGHT: f32 = 32.0;
+const WINDOW_CORNER_RADIUS: u8 = 6;
+const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 224.0;
 const TITLE_MENU_RESERVED_WIDTH: f32 = 420.0;
 const TOP_BAR_TAB_TOOL_JOIN_OVERLAP: f32 = 6.0;
 const TOP_BAR_HEIGHT: f32 =
@@ -122,6 +124,7 @@ const REPO_SETTINGS_REMOTE_DIALOG_WIDTH: f32 = 520.0;
 const SETTINGS_DIALOG_TITLE_HEIGHT: f32 = 32.0;
 const SETTINGS_DIALOG_TITLE_SIZE: f32 = 18.0;
 const ACTION_DIALOG_WIDTH: f32 = 392.0;
+const REBASE_CONTROL_DIALOG_HEIGHT: f32 = 300.0;
 const FETCH_DIALOG_WIDTH: f32 = 392.0;
 const PULL_DIALOG_WIDTH: f32 = 700.0;
 const PUSH_DIALOG_WIDTH: f32 = 790.0;
@@ -264,6 +267,32 @@ fn central_panel_margin(source_active: bool) -> egui::Margin {
     }
 }
 
+fn window_top_corner_radius(ctx: &egui::Context) -> CornerRadius {
+    if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        CornerRadius::ZERO
+    } else {
+        CornerRadius {
+            nw: WINDOW_CORNER_RADIUS,
+            ne: WINDOW_CORNER_RADIUS,
+            sw: 0,
+            se: 0,
+        }
+    }
+}
+
+fn window_bottom_corner_radius(ctx: &egui::Context) -> CornerRadius {
+    if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        CornerRadius::ZERO
+    } else {
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: WINDOW_CORNER_RADIUS,
+            se: WINDOW_CORNER_RADIUS,
+        }
+    }
+}
+
 fn repository_source_panel_y_margin() -> i8 {
     0
 }
@@ -389,6 +418,9 @@ pub struct GitAgentApp {
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
+    undo_entries: HashMap<String, RepositoryUndoEntry>,
+    redo_entries: HashMap<String, RepositoryUndoEntry>,
     create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
     repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
     repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
@@ -532,6 +564,37 @@ type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
+type RepositoryUndoTaskResult = (PathBuf, anyhow::Result<RepositoryUndoTaskOutcome>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryUndoDirection {
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Debug)]
+enum RepositoryUndoKind {
+    Position,
+    Commit { staged_diff: String },
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryUndoEntry {
+    root: PathBuf,
+    label: String,
+    before: git::RepositoryUndoPosition,
+    after: git::RepositoryUndoPosition,
+    kind: RepositoryUndoKind,
+}
+
+#[derive(Clone, Debug)]
+enum RepositoryUndoTaskOutcome {
+    Recorded(RepositoryUndoEntry),
+    Replayed {
+        entry: RepositoryUndoEntry,
+        direction: RepositoryUndoDirection,
+    },
+}
 type SshToolTaskResult = (SshToolAction, anyhow::Result<SshToolTaskOutput>);
 type UpdateTaskResult = (UpdateTaskAction, anyhow::Result<UpdateTaskOutput>);
 
@@ -599,6 +662,8 @@ struct RepoCommitState {
     no_verify: bool,
     gpg_sign: bool,
     message_history: Vec<String>,
+    /// Draft belongs to this repository store, never to the global visible editor.
+    draft_message: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -996,7 +1061,10 @@ struct MergeActionDialog {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InteractiveRebaseTodoAction {
     Pick,
+    Reword,
+    Edit,
     Squash,
+    Fixup,
     Drop,
 }
 
@@ -1004,7 +1072,10 @@ impl InteractiveRebaseTodoAction {
     fn to_git_action(self) -> git::InteractiveRebaseAction {
         match self {
             Self::Pick => git::InteractiveRebaseAction::Pick,
+            Self::Reword => git::InteractiveRebaseAction::Reword,
+            Self::Edit => git::InteractiveRebaseAction::Edit,
             Self::Squash => git::InteractiveRebaseAction::Squash,
+            Self::Fixup => git::InteractiveRebaseAction::Fixup,
             Self::Drop => git::InteractiveRebaseAction::Drop,
         }
     }
@@ -1014,6 +1085,12 @@ impl InteractiveRebaseTodoAction {
 enum InteractiveRebaseScope {
     LocalUnpushed,
     ChildrenOfCommit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct InteractiveRebaseAuthor {
+    name: String,
+    email: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1031,6 +1108,13 @@ struct InteractiveRebaseActionDialog {
     search: String,
     history_cache: HistoryCommitBrowserCache,
     actions: BTreeMap<String, InteractiveRebaseTodoAction>,
+    reword_messages: BTreeMap<String, String>,
+    reword_authors: BTreeMap<String, InteractiveRebaseAuthor>,
+    confirmed_reword_hashes: HashSet<String>,
+    editing_reword_hash: Option<String>,
+    ordered_hashes: Vec<String>,
+    original_ordered_hashes: Vec<String>,
+    dragged_hash: Option<String>,
     selected_hashes: HashSet<String>,
     squash_target_hash: Option<String>,
     squash_range_hashes: Vec<String>,
@@ -1044,6 +1128,7 @@ struct RebaseControlDialog {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RebaseControlAction {
+    Amend,
     Continue,
     Skip,
     Abort,
@@ -2289,6 +2374,9 @@ impl GitAgentApp {
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
             remote_git_task: None,
+            repository_undo_task: None,
+            undo_entries: HashMap::new(),
+            redo_entries: HashMap::new(),
             create_patch_task: None,
             repository_benchmark_task: None,
             repository_benchmark_progress: None,
@@ -2452,7 +2540,12 @@ impl GitAgentApp {
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| paths_equal(&snapshot.root, &path));
-        self.save_commit_message_draft_for_active_repo();
+        // Callers such as tab close can already point at the destination tab.
+        // In that case the visible editor still belongs to the outgoing tab and
+        // must not be written over the destination draft a second time.
+        if !self.active_repo_root_matches(&path) {
+            self.save_commit_message_draft_for_active_repo();
+        }
         self.ensure_repo_tab(path.clone());
         self.load_commit_state_for_active_repo();
         self.load_commit_message_draft_for_active_repo();
@@ -2647,10 +2740,9 @@ impl GitAgentApp {
             return;
         }
         if let Some(tab) = self.repo_tabs.get(index).cloned() {
-            self.save_commit_message_draft_for_active_repo();
             self.pending_create_patch_action = None;
-            self.active_repo_tab = Some(index);
-            self.save_repo_tabs();
+            // `load_repository` saves the currently visible repository before
+            // activating this target. Switching first would leak its draft.
             self.load_repository(tab.root);
         }
     }
@@ -2888,10 +2980,14 @@ impl GitAgentApp {
     }
 
     fn apply_merge_commit_message_default(&mut self, snapshot: &RepositorySnapshot) {
-        if let Some(message) = snapshot.merge_message.as_deref() {
-            if self.commit_message.trim().is_empty() {
-                self.commit_message = message.to_owned();
-            }
+        if !self.active_repo_root_matches(&snapshot.root) || snapshot.rebase_in_progress {
+            return;
+        }
+        if let Some(message) = snapshot.merge_message.as_deref()
+            && self.commit_message.trim().is_empty()
+        {
+            self.commit_message = message.to_owned();
+            self.save_commit_message_draft_for_active_repo();
         }
     }
 
@@ -3949,6 +4045,7 @@ impl GitAgentApp {
         self.loading_repo
             || self.branch_checkout_busy()
             || self.remote_git_busy()
+            || self.repository_undo_busy()
             || self.create_patch_busy()
             || self.merge_tool_busy()
             || self.repository_benchmark_task.is_some()
@@ -4075,6 +4172,7 @@ impl GitAgentApp {
                 self.load_repository_uncached(root);
                 return None;
             }
+            self.dismiss_rebase_blocked_dialogs();
             self.pending_rebase_control_action = Some(RebaseControlDialog::default());
             self.active_view = MainView::Workspace;
             return None;
@@ -4130,6 +4228,7 @@ impl GitAgentApp {
             .filter(|commit| !interactive_rebase_commit_is_merge(commit))
             .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
             .collect();
+        let ordered_hashes = interactive_rebase_default_order(&commits);
 
         self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
             scope: InteractiveRebaseScope::LocalUnpushed,
@@ -4145,6 +4244,13 @@ impl GitAgentApp {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions,
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            original_ordered_hashes: ordered_hashes.clone(),
+            ordered_hashes,
+            dragged_hash: None,
             selected_hashes: HashSet::new(),
             squash_target_hash: None,
             squash_range_hashes: Vec::new(),
@@ -4176,6 +4282,7 @@ impl GitAgentApp {
             .filter(|commit| !interactive_rebase_commit_is_merge(commit))
             .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
             .collect();
+        let ordered_hashes = interactive_rebase_default_order(&commits);
         let rewrites_published_history =
             interactive_rebase_rewrites_published_history(&snapshot, &commits);
 
@@ -4193,11 +4300,52 @@ impl GitAgentApp {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions,
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            original_ordered_hashes: ordered_hashes.clone(),
+            ordered_hashes,
+            dragged_hash: None,
             selected_hashes: HashSet::new(),
             squash_target_hash: None,
             squash_range_hashes: Vec::new(),
             validation_error: None,
         });
+    }
+
+    fn open_interactive_rebase_dialog_from_graph_drop(
+        &mut self,
+        source_hash: String,
+        target_hash: String,
+    ) {
+        let Some(snapshot) = self.prepare_interactive_rebase_snapshot() else {
+            return;
+        };
+        if !interactive_rebase_graph_drop_is_valid(&snapshot, &source_hash, &target_hash) {
+            self.error = Some(self.tr("interactive_rebase.graph_drag_invalid").to_owned());
+            return;
+        }
+
+        let source_short_hash = snapshot
+            .commits
+            .iter()
+            .find(|commit| commit.hash == source_hash)
+            .map(|commit| commit.short_hash.clone())
+            .unwrap_or_else(|| short_rebase_base_label(&source_hash));
+        let target_short_hash = snapshot
+            .commits
+            .iter()
+            .find(|commit| commit.hash == target_hash)
+            .map(|commit| commit.short_hash.clone())
+            .unwrap_or_else(|| short_rebase_base_label(&target_hash));
+
+        self.open_interactive_rebase_dialog_from_base(target_hash, target_short_hash);
+        if let Some(dialog) = self.pending_interactive_rebase_action.as_mut() {
+            dialog.selected_hash = source_hash;
+            dialog.selected_short_hash = source_short_hash;
+        }
+        self.show_toast(self.tr("interactive_rebase.graph_drag_started"));
     }
 
     fn open_archive_dialog(&mut self) {
@@ -4231,6 +4379,17 @@ impl GitAgentApp {
         if snapshot.branch == name {
             return;
         }
+
+        if !discard_changes {
+            let checkout_name = name.clone();
+            self.start_undoable_git_action(
+                menu_label(self.language, "repo_checkout").to_owned(),
+                RepositoryUndoKind::Position,
+                move |root| git::checkout_branch(root, &checkout_name),
+            );
+            self.pending_branch_checkout = Some(name);
+            return;
+        }
         let root = snapshot.root.clone();
 
         let (sender, receiver) = mpsc::channel();
@@ -4253,6 +4412,158 @@ impl GitAgentApp {
 
     fn remote_git_busy(&self) -> bool {
         self.remote_git_task.is_some() || self.credential_login_task.is_some()
+    }
+
+    fn repository_undo_busy(&self) -> bool {
+        self.repository_undo_task.is_some()
+    }
+
+    fn active_repository_undo_key(&self) -> Option<String> {
+        self.active_repo_root().map(|root| repo_state_key(&root))
+    }
+
+    fn can_undo_repository_action(&self) -> bool {
+        !self.branch_actions_busy()
+            && self
+                .active_repository_undo_key()
+                .is_some_and(|key| self.undo_entries.contains_key(&key))
+    }
+
+    fn can_redo_repository_action(&self) -> bool {
+        !self.branch_actions_busy()
+            && self
+                .active_repository_undo_key()
+                .is_some_and(|key| self.redo_entries.contains_key(&key))
+    }
+
+    fn start_undoable_git_action(
+        &mut self,
+        label: String,
+        kind: RepositoryUndoKind,
+        action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        self.repository_undo_task = Some(receiver);
+        self.loading_repo = true;
+        self.error = None;
+        self.last_notice = None;
+
+        thread::spawn(move || {
+            let result = (|| {
+                let before = git::repository_undo_position(&root)?;
+                let staged_diff = match &kind {
+                    RepositoryUndoKind::Position => {
+                        if !before.status.trim().is_empty() {
+                            anyhow::bail!("repository has uncommitted changes")
+                        }
+                        None
+                    }
+                    RepositoryUndoKind::Commit { .. } => {
+                        if git::repository_has_worktree_changes(&before) {
+                            anyhow::bail!("repository has unstaged or untracked changes")
+                        }
+                        Some(git::cached_binary_diff(&root)?)
+                    }
+                };
+
+                action(&root)?;
+                let after = git::repository_undo_position(&root)?;
+                if !after.status.trim().is_empty() {
+                    anyhow::bail!("action left uncommitted changes; it cannot be safely undone")
+                }
+
+                let kind = match kind {
+                    RepositoryUndoKind::Position => RepositoryUndoKind::Position,
+                    RepositoryUndoKind::Commit { .. } => RepositoryUndoKind::Commit {
+                        staged_diff: staged_diff.unwrap_or_default(),
+                    },
+                };
+                Ok(RepositoryUndoTaskOutcome::Recorded(RepositoryUndoEntry {
+                    root: root.clone(),
+                    label,
+                    before,
+                    after,
+                    kind,
+                }))
+            })();
+            let _ = sender.send((root, result));
+        });
+    }
+
+    fn start_repository_undo_replay(&mut self, direction: RepositoryUndoDirection) {
+        if self.repository_undo_busy() || self.branch_actions_busy() {
+            return;
+        }
+        let Some(key) = self.active_repository_undo_key() else {
+            return;
+        };
+        let entry = match direction {
+            RepositoryUndoDirection::Undo => self.undo_entries.get(&key),
+            RepositoryUndoDirection::Redo => self.redo_entries.get(&key),
+        };
+        let Some(entry) = entry.cloned() else {
+            return;
+        };
+
+        let root = entry.root.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.repository_undo_task = Some(receiver);
+        self.loading_repo = true;
+        self.error = None;
+        self.last_notice = None;
+
+        thread::spawn(move || {
+            let result = (|| {
+                let current = git::repository_undo_position(&root)?;
+                match (&entry.kind, direction) {
+                    (RepositoryUndoKind::Position, RepositoryUndoDirection::Undo) => {
+                        if current != entry.after || !current.status.trim().is_empty() {
+                            anyhow::bail!("repository changed after the recorded action")
+                        }
+                        git::restore_repository_undo_position(&root, &entry.before)?;
+                    }
+                    (RepositoryUndoKind::Position, RepositoryUndoDirection::Redo) => {
+                        if current != entry.before || !current.status.trim().is_empty() {
+                            anyhow::bail!("repository changed after the undo action")
+                        }
+                        git::restore_repository_undo_position(&root, &entry.after)?;
+                    }
+                    (RepositoryUndoKind::Commit { .. }, RepositoryUndoDirection::Undo) => {
+                        if current != entry.after || !current.status.trim().is_empty() {
+                            anyhow::bail!("repository changed after the recorded action")
+                        }
+                        git::reset_to_commit(&root, &entry.before.head, ResetMode::Soft)?;
+                    }
+                    (RepositoryUndoKind::Commit { staged_diff }, RepositoryUndoDirection::Redo) => {
+                        if current.branch != entry.before.branch
+                            || current.head != entry.before.head
+                            || git::repository_has_worktree_changes(&current)
+                            || git::cached_binary_diff(&root)? != *staged_diff
+                        {
+                            anyhow::bail!("staged changes changed after the undo action")
+                        }
+                        git::reset_to_commit(&root, &entry.after.head, ResetMode::Hard)?;
+                    }
+                }
+                Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction })
+            })();
+            let _ = sender.send((root, result));
+        });
+    }
+
+    fn undo_repository_action(&mut self) {
+        self.start_repository_undo_replay(RepositoryUndoDirection::Undo);
+    }
+
+    fn redo_repository_action(&mut self) {
+        self.start_repository_undo_replay(RepositoryUndoDirection::Redo);
     }
 
     fn create_patch_busy(&self) -> bool {
@@ -4345,6 +4656,10 @@ impl GitAgentApp {
         if self.remote_git_busy() || self.loading_repo {
             return;
         }
+        // Git actions reload the repository when complete. Persist the visible
+        // repository draft first so staging, fetching, and similar actions do
+        // not erase an in-progress commit message.
+        self.save_commit_message_draft_for_active_repo();
         self.pending_toolbar_single_click = None;
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
             return;
@@ -4641,10 +4956,21 @@ impl GitAgentApp {
         if !(snapshot.rebase_in_progress || git::repository_rebase_in_progress(&snapshot.root)) {
             return false;
         }
+        self.dismiss_rebase_blocked_dialogs();
         self.pending_rebase_control_action = Some(RebaseControlDialog::default());
         self.active_view = MainView::Workspace;
         self.error = None;
         true
+    }
+
+    fn dismiss_rebase_blocked_dialogs(&mut self) {
+        self.pending_pull_action = None;
+        self.pending_push_action = None;
+        self.pending_force_push_confirm = None;
+        self.pending_merge_action = None;
+        self.pending_interactive_rebase_action = None;
+        self.pending_rewritten_history_prompt = None;
+        self.pending_create_pull_request = None;
     }
 
     fn push_current(&mut self) {
@@ -4790,6 +5116,15 @@ impl GitAgentApp {
             return;
         }
 
+        if shortcut_pressed(ctx, egui::Key::Z, false) {
+            self.undo_repository_action();
+            return;
+        }
+        if shortcut_pressed(ctx, egui::Key::Y, false) || shortcut_pressed(ctx, egui::Key::Z, true) {
+            self.redo_repository_action();
+            return;
+        }
+
         if let Some(command) = actions_menu_shortcut_pressed(ctx) {
             self.execute_actions_menu_command(command);
             return;
@@ -4922,6 +5257,85 @@ impl GitAgentApp {
                     self.pending_branch_checkout = None;
                     self.loading_repo = false;
                     self.error = Some("Branch checkout stopped unexpectedly".to_owned());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.repository_undo_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(RepositoryUndoTaskOutcome::Recorded(entry)))) => {
+                    self.show_action_toast(
+                        self.undo_redo_toast_message("undo.toast.ready", &entry.label),
+                    );
+                    let key = repo_state_key(&entry.root);
+                    self.undo_entries.insert(key.clone(), entry);
+                    self.redo_entries.remove(&key);
+                    self.error = None;
+                    self.last_notice = None;
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction }))) => {
+                    match direction {
+                        RepositoryUndoDirection::Undo => {
+                            let message =
+                                self.undo_redo_toast_message("undo.toast.completed", &entry.label);
+                            let key = repo_state_key(&entry.root);
+                            self.undo_entries.remove(&key);
+                            self.redo_entries.insert(key, entry);
+                            self.show_action_toast(message);
+                        }
+                        RepositoryUndoDirection::Redo => {
+                            let message =
+                                self.undo_redo_toast_message("redo.toast.completed", &entry.label);
+                            let key = repo_state_key(&entry.root);
+                            self.undo_entries.insert(key.clone(), entry);
+                            self.redo_entries.remove(&key);
+                            self.show_action_toast(message);
+                        }
+                    }
+                    self.error = None;
+                    self.last_notice = None;
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.pending_branch_checkout = None;
+                    if git::repository_rebase_in_progress(&root) {
+                        self.dismiss_rebase_blocked_dialogs();
+                        self.pending_rebase_control_action = Some(RebaseControlDialog {
+                            message: Some(error.to_string()),
+                        });
+                        self.active_view = MainView::Workspace;
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                    } else {
+                        if self
+                            .pending_rewritten_history_prompt_root
+                            .as_ref()
+                            .is_some_and(|pending_root| paths_equal(pending_root, &root))
+                        {
+                            self.pending_rewritten_history_prompt_root = None;
+                        }
+                        self.loading_repo = false;
+                        self.error = Some(error.to_string());
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.repository_undo_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rewritten_history_prompt_root = None;
+                    self.pending_branch_checkout = None;
+                    self.loading_repo = false;
+                    self.error = Some("Repository undo task stopped unexpectedly".to_owned());
+                    self.last_notice = None;
                     ctx.request_repaint();
                 }
             }
@@ -5135,6 +5549,7 @@ impl GitAgentApp {
                         self.pending_rewritten_history_prompt_root = None;
                     }
                     if git::repository_rebase_in_progress(&root) {
+                        self.dismiss_rebase_blocked_dialogs();
                         self.pending_rebase_control_action = Some(RebaseControlDialog {
                             message: Some(error.to_string()),
                         });
@@ -5576,6 +5991,37 @@ impl GitAgentApp {
         self.request_file_diff(hash, path);
     }
 
+    fn revert_selected_history_hunk(&mut self, hash: &str, search_view: bool) {
+        if self.branch_actions_busy() {
+            return;
+        }
+        let path = if search_view {
+            self.search_selected_file_path.clone()
+        } else {
+            self.selected_file_path.clone()
+        };
+        let Some(path) = path else {
+            self.last_notice = Some(self.tr("diff.revert_select_line").to_owned());
+            return;
+        };
+        let selected_rows = if search_view {
+            &self.search_selected_diff_rows
+        } else {
+            &self.selected_diff_rows
+        };
+        let key = git::diff_key(hash, &path);
+        let patch = self
+            .diff_cache
+            .get(&key)
+            .and_then(|diff| selected_diff_hunk_patch(&diff.text, selected_rows));
+        let Some(patch) = patch else {
+            self.last_notice = Some(self.tr("diff.revert_select_line").to_owned());
+            return;
+        };
+
+        self.execute_git_action(move |root| git::revert_patch_text(root, &patch));
+    }
+
     fn request_file_diff(&mut self, hash: String, path: String) {
         let Some(snapshot) = &self.snapshot else {
             return;
@@ -5841,6 +6287,8 @@ impl GitAgentApp {
             return;
         };
         let key = repo_state_key(&root);
+        self.commit_state.draft_message = self.commit_message.clone();
+        self.save_commit_state_for_active_repo();
         if self.commit_message.is_empty() {
             self.commit_message_drafts.remove(&key);
         } else {
@@ -5850,12 +6298,16 @@ impl GitAgentApp {
     }
 
     fn load_commit_message_draft_for_active_repo(&mut self) {
-        self.commit_message = self
-            .active_repo_root()
-            .as_ref()
-            .and_then(|root| self.commit_message_drafts.get(&repo_state_key(root)))
-            .cloned()
-            .unwrap_or_default();
+        self.commit_message = self.commit_state.draft_message.clone();
+        if let Some(root) = self.active_repo_root() {
+            let key = repo_state_key(&root);
+            if self.commit_message.is_empty() {
+                self.commit_message_drafts.remove(&key);
+            } else {
+                self.commit_message_drafts
+                    .insert(key, self.commit_message.clone());
+            }
+        }
     }
 
     fn add_commit_message_history(&mut self, message: String) {
@@ -5925,28 +6377,46 @@ impl GitAgentApp {
             None
         };
         self.add_commit_message_history(message.clone());
-        self.start_remote_git_action(move |root| {
-            git::commit_with_options(root, &message, options)?;
-            if push_immediately {
-                if let Some((remote, branch, has_upstream)) = push_target {
-                    if has_upstream {
-                        git::push(root)
+        if !push_immediately && !options.amend {
+            self.start_undoable_git_action(
+                self.tr("commit.panel").to_owned(),
+                RepositoryUndoKind::Commit {
+                    staged_diff: String::new(),
+                },
+                move |root| git::commit_with_options(root, &message, options),
+            );
+        } else {
+            self.start_remote_git_action(move |root| {
+                git::commit_with_options(root, &message, options)?;
+                if push_immediately {
+                    if let Some((remote, branch, has_upstream)) = push_target {
+                        if has_upstream {
+                            git::push(root)
+                        } else {
+                            git::push_set_upstream(root, &remote, &branch)
+                        }
                     } else {
-                        git::push_set_upstream(root, &remote, &branch)
+                        git::push(root)
                     }
                 } else {
-                    git::push(root)
+                    Ok(())
                 }
-            } else {
-                Ok(())
-            }
-        });
+            });
+        }
         self.commit_message.clear();
         self.save_commit_message_draft_for_active_repo();
     }
 
     fn show_toast(&mut self, message: impl Into<String>) {
         self.toast_notice = Some((message.into(), Instant::now() + Duration::from_secs(1)));
+    }
+
+    fn show_action_toast(&mut self, message: impl Into<String>) {
+        self.toast_notice = Some((message.into(), Instant::now() + Duration::from_secs(2)));
+    }
+
+    fn undo_redo_toast_message(&self, key: &'static str, action: &str) -> String {
+        self.tr(key).replace("{action}", action)
     }
 
     fn toast_overlay(&mut self, ctx: &egui::Context) {
@@ -5968,21 +6438,29 @@ impl GitAgentApp {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(38, 48, 62, 232))
-                    .stroke(Stroke::new(
-                        1.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 38),
-                    ))
-                    .corner_radius(CornerRadius::same(4))
-                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .fill(theme::panel_soft())
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(6))
+                    .shadow(panel_shadow())
+                    .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(message).size(12.0).color(Color32::WHITE));
+                        ui.horizontal(|ui| {
+                            let (marker, _) =
+                                ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(marker.center(), 3.0, theme::accent());
+                            ui.label(RichText::new(message).size(12.0).color(theme::text()));
+                        });
                     });
             });
     }
 }
 
 impl App for GitAgentApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_if_needed(ctx, self.theme_mode, self.theme_accent);
         self.poll_tasks(ctx);
@@ -5999,13 +6477,19 @@ impl App for GitAgentApp {
         egui::TopBottomPanel::top("top_bar")
             .exact_height(self.top_bar_height())
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(theme::panel()).stroke(Stroke::NONE))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::panel())
+                    .corner_radius(window_top_corner_radius(ctx))
+                    .stroke(Stroke::NONE),
+            )
             .show(ctx, |ui| self.top_bar(ctx, ui));
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(theme::bg())
+                    .corner_radius(window_bottom_corner_radius(ctx))
                     .inner_margin(central_panel_margin(self.repository_source_active())),
             )
             .show(ctx, |ui| self.main_layout(ui));
@@ -6847,7 +7331,7 @@ impl GitAgentApp {
     ) {
         let rect = ui.max_rect();
         ui.painter()
-            .rect_filled(rect, CornerRadius::ZERO, theme::panel());
+            .rect_filled(rect, window_top_corner_radius(ctx), theme::panel());
 
         let controls_width = 128.0;
         let drag_rect = custom_title_drag_rect(rect, controls_width);
@@ -7742,7 +8226,7 @@ impl GitAgentApp {
         let tab_strip_row = repo_tab_strip_rect(tab_row, source_active);
         let top_island_rect = top_island_rect(full, title_row, tool_row, source_active);
         ui.painter()
-            .rect_filled(full, CornerRadius::ZERO, theme::bg());
+            .rect_filled(full, window_top_corner_radius(ui.ctx()), theme::bg());
         ui.painter().add(
             egui::Frame::new()
                 .fill(theme::chrome_bg())
@@ -8001,6 +8485,26 @@ impl GitAgentApp {
                                     .clicked()
                                 {
                                     self.active_view = MainView::Workspace;
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    "undo",
+                                    self.tr("undo"),
+                                    self.can_undo_repository_action(),
+                                )
+                                .clicked()
+                                {
+                                    self.undo_repository_action();
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    "redo",
+                                    self.tr("redo"),
+                                    self.can_redo_repository_action(),
+                                )
+                                .clicked()
+                                {
+                                    self.redo_repository_action();
                                 }
                                 let pull_response = toolbar_button(
                                     ui,
@@ -9386,6 +9890,7 @@ impl GitAgentApp {
             &mut self.layout_prefs,
             self.history_cherry_pick_mode,
             None,
+            false,
         );
         if prefs_changed {
             self.layout_prefs.save();
@@ -9410,6 +9915,7 @@ impl GitAgentApp {
         let mut menu_action = None;
         let mut hash_copied = false;
         let mut toggle_cherry_pick_hash = None;
+        let mut graph_rebase_drop = None;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(body_rect), |ui| {
             safe_set_min_size(ui, body_rect.size());
             ui.set_max_height(body_rect.height());
@@ -9448,7 +9954,7 @@ impl GitAgentApp {
                             let is_selected = self.selected_commit == Some(commit_index);
                             let cherry_pick_selected =
                                 self.selected_cherry_pick_hashes.contains(&commit.hash);
-                            let (response, copied_hash, select_for_cherry_pick) =
+                            let (response, copied_hash, select_for_cherry_pick, _, _, graph_drop) =
                                 history_commit_table_row(
                                     ui,
                                     commit,
@@ -9464,7 +9970,12 @@ impl GitAgentApp {
                                     self.history_cherry_pick_mode,
                                     cherry_pick_selected,
                                     false,
+                                    true,
+                                    None,
                                 );
+                            if graph_drop.is_some() {
+                                graph_rebase_drop = graph_drop;
+                            }
                             hash_copied |= copied_hash;
                             if select_for_cherry_pick {
                                 toggle_cherry_pick_hash = Some(commit.hash.clone());
@@ -9498,6 +10009,10 @@ impl GitAgentApp {
 
         if let Some(action) = menu_action {
             self.handle_commit_menu_action(action);
+        }
+
+        if let Some((source_hash, target_hash)) = graph_rebase_drop {
+            self.open_interactive_rebase_dialog_from_graph_drop(source_hash, target_hash);
         }
 
         if hash_copied {
@@ -9800,12 +10315,9 @@ impl GitAgentApp {
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
         ui.painter()
             .rect_filled(header_rect, CornerRadius::ZERO, theme::panel_soft());
+        let mut rollback_clicked = false;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
-            let rollback_label = if self.language == Language::Chinese {
-                "\u{56de}\u{6eda}\u{533a}\u{5757}"
-            } else {
-                "Hunks"
-            };
+            let rollback_label = self.tr("diff.revert_hunk");
             let blocks_label = self.tr("diff.blocks");
             let full_file_label = self.tr("diff.full_file");
             let switch_w = 122.0;
@@ -9821,7 +10333,7 @@ impl GitAgentApp {
                 Vec2::new(switch_w, 20.0),
             );
 
-            header_action_button_at(ui, rollback_rect, rollback_label);
+            rollback_clicked = header_action_button_at(ui, rollback_rect, rollback_label).clicked();
             diff_display_mode_switch(
                 ui,
                 switch_rect,
@@ -9852,6 +10364,9 @@ impl GitAgentApp {
                 draw_elided_path_label(ui, path_rect, path);
             }
         });
+        if rollback_clicked {
+            self.revert_selected_history_hunk(&commit.hash, false);
+        }
         self.diff_viewer(ui, &commit.hash, self.history_diff_display_mode);
     }
 
@@ -9865,12 +10380,9 @@ impl GitAgentApp {
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
         ui.painter()
             .rect_filled(header_rect, CornerRadius::ZERO, theme::panel_soft());
+        let mut rollback_clicked = false;
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
-            let rollback_label = if self.language == Language::Chinese {
-                "\u{56de}\u{6eda}\u{533a}\u{5757}"
-            } else {
-                "Hunks"
-            };
+            let rollback_label = self.tr("diff.revert_hunk");
             let blocks_label = self.tr("diff.blocks");
             let full_file_label = self.tr("diff.full_file");
             let switch_w = 122.0;
@@ -9886,7 +10398,7 @@ impl GitAgentApp {
                 Vec2::new(switch_w, 20.0),
             );
 
-            header_action_button_at(ui, rollback_rect, rollback_label);
+            rollback_clicked = header_action_button_at(ui, rollback_rect, rollback_label).clicked();
             diff_display_mode_switch(
                 ui,
                 switch_rect,
@@ -9917,6 +10429,9 @@ impl GitAgentApp {
                 draw_elided_path_label(ui, path_rect, path);
             }
         });
+        if rollback_clicked {
+            self.revert_selected_history_hunk(&commit.hash, true);
+        }
         self.search_diff_viewer(ui, &commit.hash, self.search_diff_display_mode);
     }
 
@@ -10545,7 +11060,7 @@ impl GitAgentApp {
                     .filter(|snapshot| snapshot.rebase_in_progress)
                     .cloned();
                 if let Some(snapshot) = rebase_snapshot {
-                    self.rebase_commit_panel_body(ui, &snapshot);
+                    self.rebase_commit_panel_body(ui, &snapshot, staged_count);
                     return;
                 }
 
@@ -10617,7 +11132,12 @@ impl GitAgentApp {
         });
     }
 
-    fn rebase_commit_panel_body(&mut self, ui: &mut Ui, snapshot: &RepositorySnapshot) {
+    fn rebase_commit_panel_body(
+        &mut self,
+        ui: &mut Ui,
+        snapshot: &RepositorySnapshot,
+        staged_count: usize,
+    ) {
         ui.horizontal(|ui| {
             panel_heading_inline(ui, self.tr("interactive_rebase.in_progress.title"));
         });
@@ -10646,9 +11166,13 @@ impl GitAgentApp {
             }
         } else {
             ui.label(
-                RichText::new(self.tr("interactive_rebase.in_progress.ready"))
-                    .color(theme::muted())
-                    .small(),
+                RichText::new(if snapshot.rebase_editing {
+                    self.tr("interactive_rebase.in_progress.edit_ready")
+                } else {
+                    self.tr("interactive_rebase.in_progress.ready")
+                })
+                .color(theme::muted())
+                .small(),
             );
         }
 
@@ -10680,13 +11204,27 @@ impl GitAgentApp {
             if dialog_sized_action_button(
                 ui,
                 self.tr("interactive_rebase.in_progress.continue"),
-                actions_enabled && !has_conflicts,
+                actions_enabled
+                    && !has_conflicts
+                    && (!snapshot.rebase_editing || staged_count == 0),
                 true,
                 REBASE_CONTROL_BUTTON_SIZE,
             )
             .clicked()
             {
                 self.start_rebase_control_action(RebaseControlAction::Continue);
+            }
+            if snapshot.rebase_editing
+                && dialog_sized_action_button(
+                    ui,
+                    self.tr("interactive_rebase.in_progress.amend"),
+                    actions_enabled && staged_count > 0,
+                    false,
+                    REBASE_CONTROL_BUTTON_SIZE,
+                )
+                .clicked()
+            {
+                self.start_rebase_control_action(RebaseControlAction::Amend);
             }
         });
     }
@@ -10705,6 +11243,9 @@ impl GitAgentApp {
         }
 
         match action {
+            RebaseControlAction::Amend => {
+                self.execute_git_action(|root| git::rebase_amend(root));
+            }
             RebaseControlAction::Continue => {
                 self.execute_git_action(|root| git::rebase_continue(root));
             }
@@ -11017,14 +11558,19 @@ impl GitAgentApp {
                         .small()
                         .color(theme::muted()),
                 );
-                egui::ComboBox::from_id_salt("pull_remote_branch_selector")
-                    .width((ui.available_width() - 76.0).max(180.0))
-                    .selected_text(dialog.remote_branch.as_str())
-                    .show_ui(ui, |ui| {
-                        for branch in &remote_branches {
-                            ui.selectable_value(&mut dialog.remote_branch, branch.clone(), branch);
-                        }
-                    });
+                let branch_choices = remote_branches
+                    .iter()
+                    .map(|branch| (branch.clone(), branch.clone()))
+                    .collect::<Vec<_>>();
+                searchable_branch_dropdown(
+                    ui,
+                    egui::Id::new("pull_remote_branch_selector"),
+                    &mut dialog.remote_branch,
+                    &branch_choices,
+                    (ui.available_width() - 76.0).max(180.0),
+                    self.tr("pull.remote_branch"),
+                    self.tr("repo.source.search"),
+                );
                 if ui
                     .add_enabled(actions_enabled, egui::Button::new(self.tr("pull.refresh")))
                     .clicked()
@@ -11181,7 +11727,13 @@ impl GitAgentApp {
                         self.tr("push.track"),
                     );
                     for row in &mut dialog.rows {
-                        push_branch_table_row(ui, table_width, row, &remote_branches);
+                        push_branch_table_row(
+                            ui,
+                            self.language,
+                            table_width,
+                            row,
+                            &remote_branches,
+                        );
                     }
                 });
 
@@ -11421,24 +11973,22 @@ impl GitAgentApp {
                             .small()
                             .color(theme::muted()),
                     );
-                    egui::ComboBox::from_id_salt("pull_request_local_branch_selector")
-                        .width(ui.available_width())
-                        .selected_text(dialog.local_branch.as_str())
-                        .show_ui(ui, |ui| {
-                            for branch in &local_branches {
-                                if ui
-                                    .selectable_value(
-                                        &mut dialog.local_branch,
-                                        branch.clone(),
-                                        branch,
-                                    )
-                                    .clicked()
-                                    && dialog.remote_branch.trim().is_empty()
-                                {
-                                    dialog.remote_branch = dialog.local_branch.clone();
-                                }
-                            }
-                        });
+                    let branch_choices = local_branches
+                        .iter()
+                        .map(|branch| (branch.clone(), branch.clone()))
+                        .collect::<Vec<_>>();
+                    if searchable_branch_dropdown(
+                        ui,
+                        egui::Id::new("pull_request_local_branch_selector"),
+                        &mut dialog.local_branch,
+                        &branch_choices,
+                        ui.available_width(),
+                        self.tr("pull_request.local_branch"),
+                        self.tr("repo.source.search"),
+                    ) && dialog.remote_branch.trim().is_empty()
+                    {
+                        dialog.remote_branch = dialog.local_branch.clone();
+                    }
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -11447,18 +11997,19 @@ impl GitAgentApp {
                             .small()
                             .color(theme::muted()),
                     );
-                    egui::ComboBox::from_id_salt("pull_request_remote_branch_selector")
-                        .width(ui.available_width())
-                        .selected_text(dialog.remote_branch.as_str())
-                        .show_ui(ui, |ui| {
-                            for branch in &remote_branch_choices {
-                                ui.selectable_value(
-                                    &mut dialog.remote_branch,
-                                    branch.clone(),
-                                    branch,
-                                );
-                            }
-                        });
+                    let branch_choices = remote_branch_choices
+                        .iter()
+                        .map(|branch| (branch.clone(), branch.clone()))
+                        .collect::<Vec<_>>();
+                    searchable_branch_dropdown(
+                        ui,
+                        egui::Id::new("pull_request_remote_branch_selector"),
+                        &mut dialog.remote_branch,
+                        &branch_choices,
+                        ui.available_width(),
+                        self.tr("pull_request.remote_branch"),
+                        self.tr("repo.source.search"),
+                    );
                 });
                 ui.add_space(4.0);
                 ui.label(
@@ -11549,6 +12100,7 @@ impl GitAgentApp {
         let mut close_after = false;
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
             None;
+        let mut undo_label: Option<String> = None;
         let remotes = self.remote_names();
 
         let title = match &dialog {
@@ -11666,6 +12218,7 @@ impl GitAgentApp {
                     if ui.button(self.tr("dialog.checkout")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::checkout_commit(root, &hash)));
+                        undo_label = Some(self.tr("dialog.checkout").to_owned());
                         close_after = true;
                     }
                     if ui.button(self.tr("dialog.cancel")).clicked() {
@@ -11686,6 +12239,7 @@ impl GitAgentApp {
                     if ui.button(self.tr("menu.cherry_pick")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::cherry_pick_commit(root, &hash)));
+                        undo_label = Some(self.tr("menu.cherry_pick").to_owned());
                         close_after = true;
                     }
                     if ui.button(self.tr("dialog.cancel")).clicked() {
@@ -11721,6 +12275,7 @@ impl GitAgentApp {
                         execute = Some(Box::new(move |root| {
                             git::cherry_pick_commits(root, &hashes)
                         }));
+                        undo_label = Some(self.tr("menu.cherry_pick").to_owned());
                         close_after = true;
                     }
                     if ui.button(self.tr("dialog.cancel")).clicked() {
@@ -11741,6 +12296,7 @@ impl GitAgentApp {
                     if ui.button(self.tr("menu.revert")).clicked() || submit_requested {
                         let hash = hash.clone();
                         execute = Some(Box::new(move |root| git::revert_commit(root, &hash)));
+                        undo_label = Some(self.tr("menu.revert").to_owned());
                         close_after = true;
                     }
                     if ui.button(self.tr("dialog.cancel")).clicked() {
@@ -11772,6 +12328,9 @@ impl GitAgentApp {
                         execute = Some(Box::new(move |root| {
                             git::reset_to_commit(root, &hash, mode)
                         }));
+                        if mode == ResetMode::Hard {
+                            undo_label = Some(self.tr("menu.reset").to_owned());
+                        }
                         close_after = true;
                     }
                     if ui.button(self.tr("dialog.cancel")).clicked() {
@@ -11782,7 +12341,11 @@ impl GitAgentApp {
         });
 
         if let Some(action) = execute {
-            self.execute_git_action(action);
+            if let Some(label) = undo_label {
+                self.start_undoable_git_action(label, RepositoryUndoKind::Position, action);
+            } else {
+                self.execute_git_action(action);
+            }
             self.clear_cherry_pick_selection();
         }
 
@@ -12474,8 +13037,10 @@ impl GitAgentApp {
                 show_context_menu: false,
                 select_rows: false,
                 multi_select: true,
+                show_rebase_plan_controls: false,
                 max_height: Some(245.0),
             },
+            None,
         );
         if browser_outcome.prefs_changed {
             self.layout_prefs.save();
@@ -12776,6 +13341,11 @@ impl GitAgentApp {
             interactive_rebase_rewrites_published_history(snapshot, &commits)
         });
         let disabled_hashes = interactive_rebase_disabled_hashes(&commits);
+        let plan_editing = dialog.editing_reword_hash.is_some();
+        let mut table_disabled_hashes = disabled_hashes.clone();
+        if plan_editing {
+            table_disabled_hashes.extend(commits.iter().map(|commit| commit.hash.clone()));
+        }
         dialog.selected_hashes.retain(|hash| {
             !disabled_hashes.contains(hash) && commits.iter().any(|commit| commit.hash == *hash)
         });
@@ -12799,6 +13369,7 @@ impl GitAgentApp {
                 .entry(commit.hash.clone())
                 .or_insert(InteractiveRebaseTodoAction::Pick);
         }
+        interactive_rebase_synchronize_plan(&mut dialog, &commits);
         if disabled_hashes.contains(&dialog.selected_hash)
             || !commits
                 .iter()
@@ -12847,10 +13418,11 @@ impl GitAgentApp {
                         self.tr("interactive_rebase.confirm_published"),
                     );
                 }
-                ui.add_space(4.0);
+                ui.add_space(8.0);
+                let table_commits = interactive_rebase_display_commits(&dialog, &commits);
                 let browser_outcome = history_commit_browser(
                     ui,
-                    &commits,
+                    &table_commits,
                     &dialog.selected_hash,
                     &mut dialog.branch_scope,
                     &mut dialog.sort_order,
@@ -12861,7 +13433,7 @@ impl GitAgentApp {
                     &mut self.layout_prefs,
                     self.language,
                     &dialog.selected_hashes,
-                    &disabled_hashes,
+                    &table_disabled_hashes,
                     &mut dialog.history_cache,
                     HistoryCommitBrowserConfig {
                         id_salt: "interactive_rebase_commit_browser_scroll",
@@ -12872,8 +13444,18 @@ impl GitAgentApp {
                         show_context_menu: false,
                         select_rows: true,
                         multi_select: false,
-                        max_height: Some(300.0),
+                        show_rebase_plan_controls: true,
+                        max_height: Some(430.0),
                     },
+                    Some(HistoryRebasePlanControls {
+                        actions: &mut dialog.actions,
+                        reword_messages: &mut dialog.reword_messages,
+                        reword_authors: &mut dialog.reword_authors,
+                        confirmed_reword_hashes: &mut dialog.confirmed_reword_hashes,
+                        editing_reword_hash: &mut dialog.editing_reword_hash,
+                        ordered_hashes: &mut dialog.ordered_hashes,
+                        dragged_hash: &mut dialog.dragged_hash,
+                    }),
                 );
                 hash_copied |= browser_outcome.hash_copied;
                 if browser_outcome.prefs_changed {
@@ -12891,11 +13473,20 @@ impl GitAgentApp {
 
                 ui.add_space(10.0);
                 let selected_actionable_hashes =
-                    interactive_rebase_selected_actionable_hashes(&dialog, &commits);
+                    interactive_rebase_selected_actionable_hashes(&dialog, &commits)
+                        .into_iter()
+                        .filter(|hash| !dialog.confirmed_reword_hashes.contains(hash))
+                        .collect::<Vec<_>>();
                 let selected_batch_count = selected_actionable_hashes.len();
-                let squash_targets = interactive_rebase_selected_squash_targets(&dialog, &commits);
+                let squash_targets = interactive_rebase_selected_squash_targets(&dialog, &commits)
+                    .into_iter()
+                    .filter(|commit| !dialog.confirmed_reword_hashes.contains(&commit.hash))
+                    .collect::<Vec<_>>();
                 let selected_squash_range_hashes =
-                    interactive_rebase_selected_squash_range_hashes(&dialog, &commits);
+                    interactive_rebase_selected_squash_range_hashes(&dialog, &commits)
+                        .into_iter()
+                        .filter(|hash| !dialog.confirmed_reword_hashes.contains(hash))
+                        .collect::<Vec<_>>();
                 let selected = commits
                     .iter()
                     .position(|commit| commit.hash == dialog.selected_hash)
@@ -12939,16 +13530,28 @@ impl GitAgentApp {
                         .small()
                         .color(theme::muted()),
                     );
-                    if ui.button(self.tr("interactive_rebase.reset")).clicked() {
+                    if ui
+                        .add_enabled(
+                            !plan_editing,
+                            egui::Button::new(self.tr("interactive_rebase.reset")),
+                        )
+                        .clicked()
+                    {
                         for action in dialog.actions.values_mut() {
                             *action = InteractiveRebaseTodoAction::Pick;
                         }
+                        dialog.ordered_hashes = dialog.original_ordered_hashes.clone();
+                        dialog.dragged_hash = None;
                         dialog.squash_target_hash = None;
                         dialog.squash_range_hashes.clear();
+                        dialog.reword_messages.clear();
+                        dialog.reword_authors.clear();
+                        dialog.confirmed_reword_hashes.clear();
+                        dialog.editing_reword_hash = None;
                     }
                     if ui
                         .add_enabled(
-                            selected_batch_count > 0,
+                            !plan_editing && selected_batch_count > 0,
                             egui::Button::new(self.tr("interactive_rebase.drop_selected")),
                         )
                         .clicked()
@@ -12961,7 +13564,8 @@ impl GitAgentApp {
                                 .insert(hash.clone(), InteractiveRebaseTodoAction::Drop);
                         }
                     }
-                    let can_squash_to_target = squash_targets.len() >= 2
+                    let can_squash_to_target = !plan_editing
+                        && squash_targets.len() >= 2
                         && selected_squash_range_hashes.len() >= 2
                         && dialog.squash_target_hash.is_some();
                     ui.label(
@@ -13020,7 +13624,7 @@ impl GitAgentApp {
                     }
                     if ui
                         .add_enabled(
-                            selected_batch_count > 0,
+                            !plan_editing && selected_batch_count > 0,
                             egui::Button::new(self.tr("interactive_rebase.reset_selected")),
                         )
                         .clicked()
@@ -13029,6 +13633,9 @@ impl GitAgentApp {
                             dialog
                                 .actions
                                 .insert(hash.clone(), InteractiveRebaseTodoAction::Pick);
+                            dialog.reword_messages.remove(hash);
+                            dialog.reword_authors.remove(hash);
+                            dialog.confirmed_reword_hashes.remove(hash);
                         }
                         dialog.squash_target_hash = None;
                         dialog.squash_range_hashes.clear();
@@ -13039,6 +13646,7 @@ impl GitAgentApp {
                         }
                         let submit_requested = dialog_default_submit_requested(ui);
                         let can_rebase = actions_enabled
+                            && !plan_editing
                             && !commits.is_empty()
                             && interactive_rebase_dialog_has_changes(&dialog);
                         if ui
@@ -13074,6 +13682,8 @@ impl GitAgentApp {
             },
         );
 
+        self.interactive_rebase_reword_modal(ctx, &mut dialog, &commits);
+
         if hash_copied {
             self.show_toast(self.tr("status.hash_copied"));
         }
@@ -13081,13 +13691,182 @@ impl GitAgentApp {
             if let Some(snapshot) = self.snapshot.as_ref() {
                 self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
             }
-            self.execute_git_action(action);
+            self.start_undoable_git_action(
+                self.tr("interactive_rebase.title").to_owned(),
+                RepositoryUndoKind::Position,
+                action,
+            );
         }
         if close_after {
             keep_open = false;
         }
         if keep_open {
             self.pending_interactive_rebase_action = Some(dialog);
+        }
+    }
+
+    fn interactive_rebase_reword_modal(
+        &self,
+        ctx: &egui::Context,
+        dialog: &mut InteractiveRebaseActionDialog,
+        commits: &[Commit],
+    ) {
+        let Some(hash) = dialog.editing_reword_hash.clone() else {
+            return;
+        };
+        let is_reword = dialog.actions.get(&hash) == Some(&InteractiveRebaseTodoAction::Reword);
+        let Some(commit) = commits.iter().find(|commit| commit.hash == hash) else {
+            dialog.editing_reword_hash = None;
+            return;
+        };
+        if !is_reword {
+            dialog.editing_reword_hash = None;
+            return;
+        }
+
+        let mut save = false;
+        let mut cancel_reword = false;
+        egui::Modal::new(egui::Id::new("interactive_rebase_reword_modal"))
+            .area(
+                egui::Modal::default_area(egui::Id::new("interactive_rebase_reword_modal"))
+                    .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset()),
+            )
+            .backdrop_color(Color32::from_black_alpha(136))
+            .frame(dialog_window_frame())
+            .show(ctx, |ui| {
+                let width = ACTION_DIALOG_WIDTH + 96.0;
+                egui::Frame::new()
+                    .fill(theme::panel())
+                    .corner_radius(CornerRadius::same(6))
+                    .shadow(panel_shadow())
+                    .inner_margin(egui::Margin::same(0))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        compact_dialog_title_bar(
+                            ui,
+                            self.tr("interactive_rebase.reword.title"),
+                            width,
+                        );
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width((width - 24.0).max(0.0));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {} {}",
+                                        self.tr("interactive_rebase.reword.commit"),
+                                        commit.short_hash,
+                                        commit.subject
+                                    ))
+                                    .small()
+                                    .color(theme::muted()),
+                                );
+                                ui.add_space(8.0);
+                                let message = dialog
+                                    .reword_messages
+                                    .entry(hash.clone())
+                                    .or_insert_with(|| commit.subject.clone());
+                                let author = dialog
+                                    .reword_authors
+                                    .entry(hash.clone())
+                                    .or_insert_with(|| InteractiveRebaseAuthor {
+                                        name: commit.author.clone(),
+                                        email: commit.author_email.clone(),
+                                    });
+                                themed_text_edit_selection(ui);
+                                egui::Frame::new()
+                                    .fill(theme::panel_recessed())
+                                    .corner_radius(CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.add_sized(
+                                            Vec2::new(ui.available_width(), 76.0),
+                                            TextEdit::multiline(message)
+                                                .frame(false)
+                                                .hint_text(
+                                                    self.tr("interactive_rebase.reword.hint"),
+                                                )
+                                                .text_color(theme::text()),
+                                        );
+                                    });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.set_height(24.0);
+                                    ui.add_sized(
+                                        Vec2::new(48.0, 20.0),
+                                        egui::Label::new(
+                                            RichText::new(
+                                                self.tr("interactive_rebase.reword.author"),
+                                            )
+                                            .small()
+                                            .color(theme::muted()),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        Vec2::new((ui.available_width() - 48.0).max(80.0), 24.0),
+                                        themed_singleline_text_edit(
+                                            &mut author.name,
+                                            self.tr("interactive_rebase.reword.author_hint"),
+                                        ),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.set_height(24.0);
+                                    ui.add_sized(
+                                        Vec2::new(48.0, 20.0),
+                                        egui::Label::new(
+                                            RichText::new(
+                                                self.tr("interactive_rebase.reword.email"),
+                                            )
+                                            .small()
+                                            .color(theme::muted()),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        Vec2::new((ui.available_width() - 48.0).max(80.0), 24.0),
+                                        themed_singleline_text_edit(
+                                            &mut author.email,
+                                            self.tr("interactive_rebase.reword.email_hint"),
+                                        ),
+                                    );
+                                });
+                                ui.add_space(10.0);
+                                dialog_footer_row(ui, |ui| {
+                                    if dialog_cancel_button(
+                                        ui,
+                                        self.tr("interactive_rebase.reword.cancel"),
+                                    )
+                                    .clicked()
+                                    {
+                                        cancel_reword = true;
+                                    }
+                                    if dialog_primary_button(
+                                        ui,
+                                        self.tr("interactive_rebase.reword.done"),
+                                        !message.trim().is_empty()
+                                            && !author.name.trim().is_empty()
+                                            && !author.email.trim().is_empty(),
+                                    )
+                                    .clicked()
+                                    {
+                                        save = true;
+                                    }
+                                });
+                            });
+                    });
+            });
+
+        if cancel_reword {
+            dialog
+                .actions
+                .insert(hash.clone(), InteractiveRebaseTodoAction::Pick);
+            dialog.reword_messages.remove(&hash);
+            dialog.reword_authors.remove(&hash);
+            dialog.confirmed_reword_hashes.remove(&hash);
+            dialog.editing_reword_hash = None;
+        } else if save {
+            dialog.confirmed_reword_hashes.insert(hash);
+            dialog.editing_reword_hash = None;
         }
     }
 
@@ -13106,12 +13885,21 @@ impl GitAgentApp {
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| !worktree_conflict_files(snapshot).is_empty());
+        let rebase_editing = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.rebase_editing);
+        let staged_count = self
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.staged.len());
         let actions_enabled = !self.branch_actions_busy();
 
-        compact_action_dialog(
+        fixed_action_dialog(
             ctx,
             self.tr("interactive_rebase.in_progress.title"),
             ACTION_DIALOG_WIDTH,
+            REBASE_CONTROL_DIALOG_HEIGHT,
             |ui| {
                 ui.label(
                     RichText::new(self.tr("interactive_rebase.in_progress.detail"))
@@ -13123,6 +13911,14 @@ impl GitAgentApp {
                         RichText::new(self.tr("interactive_rebase.in_progress.conflicts"))
                             .small()
                             .color(theme::warning()),
+                    );
+                }
+                if rebase_editing && !has_conflicts {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(self.tr("interactive_rebase.in_progress.edit_ready"))
+                            .small()
+                            .color(theme::muted()),
                     );
                 }
                 if let Some(message) = dialog.message.as_ref() {
@@ -13141,8 +13937,20 @@ impl GitAgentApp {
                             );
                         });
                 }
-                ui.add_space(12.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if has_conflicts {
+                    ui.add_space(10.0);
+                    if dialog_primary_button(
+                        ui,
+                        self.tr("worktree.resolve_conflicts"),
+                        actions_enabled,
+                    )
+                    .clicked()
+                    {
+                        open_conflicts = true;
+                        close_after = true;
+                    }
+                }
+                dialog_footer_row(ui, |ui| {
                     if ui.button(self.tr("dialog.close")).clicked() {
                         close_after = true;
                     }
@@ -13167,26 +13975,26 @@ impl GitAgentApp {
                         mark_rewrite_prompt = true;
                         close_after = true;
                     }
+                    if rebase_editing
+                        && ui
+                            .add_enabled(
+                                actions_enabled && staged_count > 0,
+                                egui::Button::new(self.tr("interactive_rebase.in_progress.amend")),
+                            )
+                            .clicked()
+                    {
+                        execute = Some(Box::new(|root| git::rebase_amend(root)));
+                        close_after = true;
+                    }
                     if dialog_primary_button(
                         ui,
                         self.tr("interactive_rebase.in_progress.continue"),
-                        actions_enabled && !has_conflicts,
+                        actions_enabled && !has_conflicts && (!rebase_editing || staged_count == 0),
                     )
                     .clicked()
                     {
                         execute = Some(Box::new(|root| git::rebase_continue(root)));
                         mark_rewrite_prompt = true;
-                        close_after = true;
-                    }
-                    if has_conflicts
-                        && dialog_primary_button(
-                            ui,
-                            self.tr("worktree.resolve_conflicts"),
-                            actions_enabled,
-                        )
-                        .clicked()
-                    {
-                        open_conflicts = true;
                         close_after = true;
                     }
                 });
@@ -13464,6 +14272,7 @@ impl GitAgentApp {
                             );
                             git_flow_start_point_row(
                                 ui,
+                                self.language,
                                 self.tr("git_flow.start_from"),
                                 start_point,
                                 &start_options,
@@ -13482,6 +14291,7 @@ impl GitAgentApp {
                         GitFlowOperation::Finish(kind) => {
                             git_flow_finish_branch_row(
                                 ui,
+                                self.language,
                                 git_flow_finish_branch_label(self.language, kind),
                                 branch_name,
                                 &finish_options,
@@ -14065,8 +14875,10 @@ impl GitAgentApp {
                     show_context_menu: false,
                     select_rows: false,
                     multi_select: false,
+                    show_rebase_plan_controls: false,
                     max_height: Some(300.0),
                 },
+                None,
             );
             hash_copied |= browser_outcome.hash_copied;
             if browser_outcome.prefs_changed {
@@ -14712,8 +15524,10 @@ impl GitAgentApp {
                                         show_context_menu: false,
                                         select_rows: false,
                                         multi_select: false,
+                                        show_rebase_plan_controls: false,
                                         max_height: Some(300.0),
                                     },
+                                    None,
                                 );
                                 hash_copied |= browser_outcome.hash_copied;
                                 if browser_outcome.prefs_changed {
@@ -14764,29 +15578,23 @@ impl GitAgentApp {
                                                 .color(theme::muted()),
                                         ),
                                     );
-                                    egui::ComboBox::from_id_salt("checkout_remote_branch_selector")
-                                        .width(ui.available_width())
-                                        .selected_text(if remote_branch.is_empty() {
-                                            self.tr("checkout.select_remote_branch")
-                                        } else {
-                                            remote_branch.as_str()
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            for branch in &remote_branch_choices {
-                                                if ui
-                                                    .selectable_value(
-                                                        remote_branch,
-                                                        branch.clone(),
-                                                        branch.as_str(),
-                                                    )
-                                                    .clicked()
-                                                    && local_branch.trim().is_empty()
-                                                {
-                                                    *local_branch =
-                                                        checkout_local_branch_default(branch);
-                                                }
-                                            }
-                                        });
+                                    let branch_choices = remote_branch_choices
+                                        .iter()
+                                        .map(|branch| (branch.clone(), branch.clone()))
+                                        .collect::<Vec<_>>();
+                                    if searchable_branch_dropdown(
+                                        ui,
+                                        egui::Id::new("checkout_remote_branch_selector"),
+                                        remote_branch,
+                                        &branch_choices,
+                                        ui.available_width(),
+                                        self.tr("checkout.select_remote_branch"),
+                                        self.tr("repo.source.search"),
+                                    ) && local_branch.trim().is_empty()
+                                    {
+                                        *local_branch =
+                                            checkout_local_branch_default(remote_branch);
+                                    }
                                 });
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
@@ -16819,6 +17627,40 @@ fn compact_action_dialog(
         });
 }
 
+fn fixed_action_dialog(
+    ctx: &egui::Context,
+    title: &str,
+    width: f32,
+    height: f32,
+    add_contents: impl FnOnce(&mut Ui),
+) {
+    let width = safe_ui_length(width).max(280.0);
+    let height = safe_ui_length(height).max(ACTION_DIALOG_TITLE_HEIGHT + 80.0);
+    egui::Window::new(title)
+        .title_bar(false)
+        .collapsible(false)
+        .fixed_size(Vec2::new(width, height))
+        .anchor(Align2::CENTER_TOP, dialog::top_anchor_offset())
+        .frame(dialog_window_frame())
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::panel())
+                .corner_radius(CornerRadius::same(6))
+                .shadow(panel_shadow())
+                .inner_margin(egui::Margin::same(0))
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    compact_dialog_title_bar(ui, title, width);
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width((width - 24.0).max(0.0));
+                            add_contents(ui);
+                        });
+                });
+        });
+}
+
 fn compact_dialog_title_bar(ui: &mut Ui, title: &str, width: f32) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(width, ACTION_DIALOG_TITLE_HEIGHT), Sense::hover());
@@ -17015,6 +17857,8 @@ fn resize_handle_rect(rect: Rect, vertical: bool) -> Rect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiIcon {
     Commit,
+    Undo,
+    Redo,
     Pull,
     Push,
     Fetch,
@@ -18066,6 +18910,8 @@ fn paint_action_checkbox_square(
 fn toolbar_icon(raw: &str, _label: &str) -> UiIcon {
     match raw {
         "commit" => UiIcon::Commit,
+        "undo" => UiIcon::Undo,
+        "redo" => UiIcon::Redo,
         "pull" => UiIcon::Pull,
         "push" => UiIcon::Push,
         "fetch" => UiIcon::Fetch,
@@ -18091,6 +18937,8 @@ fn toolbar_icon(raw: &str, _label: &str) -> UiIcon {
 fn icon_source(icon: UiIcon) -> egui::ImageSource<'static> {
     match icon {
         UiIcon::Commit => egui::include_image!("../assets/icons/commit.svg"),
+        UiIcon::Undo => egui::include_image!("../assets/icons/undo.svg"),
+        UiIcon::Redo => egui::include_image!("../assets/icons/redo.svg"),
         UiIcon::Pull => egui::include_image!("../assets/icons/pull.svg"),
         UiIcon::Push => egui::include_image!("../assets/icons/push.svg"),
         UiIcon::Fetch => egui::include_image!("../assets/icons/fetch.svg"),
@@ -18531,6 +19379,15 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (Language::Chinese, "custom_action_command") => "Git \u{547d}\u{4ee4}",
         (Language::Chinese, "undo") => "\u{64a4}\u{9500}",
         (Language::Chinese, "redo") => "\u{91cd}\u{505a}",
+        (Language::Chinese, "undo.toast.ready") => {
+            "\u{5df2}\u{5b8c}\u{6210} {action}\u{ff0c}\u{53ef}\u{64a4}\u{9500}"
+        }
+        (Language::Chinese, "undo.toast.completed") => {
+            "\u{5df2}\u{64a4}\u{9500} {action}\u{ff0c}\u{53ef}\u{91cd}\u{505a}"
+        }
+        (Language::Chinese, "redo.toast.completed") => {
+            "\u{5df2}\u{91cd}\u{505a} {action}\u{ff0c}\u{53ef}\u{518d}\u{6b21}\u{64a4}\u{9500}"
+        }
         (Language::Chinese, "ssh_agent") => "\u{542f}\u{52a8}SSH\u{52a9}\u{624b}...",
         (Language::Chinese, "ssh_add_key") => "\u{6dfb}\u{52a0}SSH\u{5bc6}\u{94a5}...",
         (Language::Chinese, "about") => "\u{5173}\u{4e8e} Git Agent",
@@ -18624,6 +19481,9 @@ fn menu_label(language: Language, key: &str) -> &'static str {
         (_, "custom_action_command") => "Git Command",
         (_, "undo") => "Undo",
         (_, "redo") => "Redo",
+        (_, "undo.toast.ready") => "{action} completed. Undo is available.",
+        (_, "undo.toast.completed") => "Undid {action}. Redo is available.",
+        (_, "redo.toast.completed") => "Redid {action}. Undo is available.",
         (_, "ssh_agent") => "Start SSH Agent...",
         (_, "ssh_add_key") => "Add SSH Key...",
         (_, "about") => "About Git Agent",
@@ -19279,6 +20139,7 @@ fn history_table_header(
     prefs: &mut LayoutPrefs,
     select_for_cherry_pick: bool,
     selection_header_checked: Option<bool>,
+    show_rebase_plan_controls: bool,
 ) -> (bool, bool) {
     let width = ui.available_width();
     let selection_width = if select_for_cherry_pick { 30.0 } else { 0.0 };
@@ -19319,9 +20180,45 @@ fn history_table_header(
         }
         x += selection_width;
     }
+    ui.painter().text(
+        Pos2::new(x, y),
+        Align2::LEFT_CENTER,
+        labels.0,
+        FontId::proportional(12.0),
+        theme::muted(),
+    );
+    x += graph_width;
+    if show_rebase_plan_controls {
+        let action_label = if language == Language::Chinese {
+            "\u{64cd}\u{4f5c}"
+        } else {
+            "Action"
+        };
+        ui.painter().text(
+            Pos2::new(x + 4.0, y),
+            Align2::LEFT_CENTER,
+            action_label,
+            FontId::proportional(12.0),
+            theme::muted(),
+        );
+        ui.painter().text(
+            Pos2::new(x + INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH + 4.0, y),
+            Align2::LEFT_CENTER,
+            labels.1,
+            FontId::proportional(12.0),
+            theme::muted(),
+        );
+    } else {
+        ui.painter().text(
+            Pos2::new(x, y),
+            Align2::LEFT_CENTER,
+            labels.1,
+            FontId::proportional(12.0),
+            theme::muted(),
+        );
+    }
+    x += cols.desc;
     for (label, col_w) in [
-        (labels.0, graph_width),
-        (labels.1, cols.desc),
         (labels.2, cols.date),
         (labels.3, cols.author),
         (labels.4, cols.hash),
@@ -19456,6 +20353,7 @@ struct HistoryCommitBrowserConfig {
     show_context_menu: bool,
     select_rows: bool,
     multi_select: bool,
+    show_rebase_plan_controls: bool,
     max_height: Option<f32>,
 }
 
@@ -19470,9 +20368,20 @@ impl Default for HistoryCommitBrowserConfig {
             show_context_menu: true,
             select_rows: false,
             multi_select: false,
+            show_rebase_plan_controls: false,
             max_height: None,
         }
     }
+}
+
+struct HistoryRebasePlanControls<'a> {
+    actions: &'a mut BTreeMap<String, InteractiveRebaseTodoAction>,
+    reword_messages: &'a mut BTreeMap<String, String>,
+    reword_authors: &'a mut BTreeMap<String, InteractiveRebaseAuthor>,
+    confirmed_reword_hashes: &'a mut HashSet<String>,
+    editing_reword_hash: &'a mut Option<String>,
+    ordered_hashes: &'a mut Vec<String>,
+    dragged_hash: &'a mut Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -19510,6 +20419,7 @@ fn history_commit_browser(
     disabled_hashes: &HashSet<String>,
     cache: &mut HistoryCommitBrowserCache,
     config: HistoryCommitBrowserConfig,
+    mut rebase_plan: Option<HistoryRebasePlanControls<'_>>,
 ) -> HistoryCommitBrowserOutcome {
     let mut outcome = HistoryCommitBrowserOutcome::default();
 
@@ -19631,6 +20541,7 @@ fn history_commit_browser(
         prefs,
         selectable_rows,
         config.multi_select.then_some(all_visible_selected),
+        config.show_rebase_plan_controls,
     );
     if prefs_changed {
         outcome.prefs_changed = true;
@@ -19648,6 +20559,10 @@ fn history_commit_browser(
         .max_height
         .unwrap_or_else(|| ui.available_height())
         .max(0.0);
+    // The table is newest-first while git's todo file is oldest-first. Keep the
+    // visual drop direction until the mutation point, where it is inverted.
+    let mut rebase_drop_target: Option<(String, String, bool)> = None;
+    let mut rebase_step_move: Option<(String, bool)> = None;
     ScrollArea::vertical()
         .id_salt((
             config.id_salt,
@@ -19676,22 +20591,47 @@ fn history_commit_browser(
                     let row = layout.rows.get(index);
                     let cherry_pick_selected = selected_cherry_pick_hashes.contains(&commit.hash);
                     let disabled = disabled_hashes.contains(&commit.hash);
-                    let (response, copied_hash, select_for_cherry_pick) = history_commit_table_row(
-                        ui,
-                        commit,
-                        row,
-                        graph_width,
-                        lane_count,
-                        prefs,
-                        language,
-                        selected,
-                        *show_remote_refs,
-                        show_branch_refs,
-                        show_tag_refs,
-                        selectable_rows,
-                        cherry_pick_selected,
-                        disabled,
-                    );
+                    let plan_controls = config
+                        .show_rebase_plan_controls
+                        .then(|| {
+                            rebase_plan
+                                .as_mut()
+                                .map(|controls| HistoryRebasePlanControls {
+                                    actions: &mut *controls.actions,
+                                    reword_messages: &mut *controls.reword_messages,
+                                    reword_authors: &mut *controls.reword_authors,
+                                    confirmed_reword_hashes: &mut *controls.confirmed_reword_hashes,
+                                    editing_reword_hash: &mut *controls.editing_reword_hash,
+                                    ordered_hashes: &mut *controls.ordered_hashes,
+                                    dragged_hash: &mut *controls.dragged_hash,
+                                })
+                        })
+                        .flatten();
+                    let (response, copied_hash, select_for_cherry_pick, drop_result, step_move, _) =
+                        history_commit_table_row(
+                            ui,
+                            commit,
+                            row,
+                            graph_width,
+                            lane_count,
+                            prefs,
+                            language,
+                            selected,
+                            *show_remote_refs,
+                            show_branch_refs,
+                            show_tag_refs,
+                            selectable_rows,
+                            cherry_pick_selected,
+                            disabled,
+                            false,
+                            plan_controls,
+                        );
+                    if drop_result.is_some() {
+                        rebase_drop_target = drop_result;
+                    }
+                    if step_move.is_some() {
+                        rebase_step_move = step_move;
+                    }
                     outcome.hash_copied |= copied_hash;
                     if select_for_cherry_pick {
                         if config.multi_select {
@@ -19720,6 +20660,23 @@ fn history_commit_browser(
                 }
             },
         );
+
+    if config.show_rebase_plan_controls {
+        if let Some(controls) = rebase_plan.as_mut() {
+            if let Some((source_hash, target_hash, insert_above_target)) = rebase_drop_target {
+                *controls.dragged_hash = None;
+                interactive_rebase_move_hash_from_display(
+                    controls.ordered_hashes,
+                    &source_hash,
+                    &target_hash,
+                    insert_above_target,
+                );
+            } else if let Some((hash, move_towards_newer)) = rebase_step_move {
+                *controls.dragged_hash = None;
+                interactive_rebase_step_hash(controls.ordered_hashes, &hash, move_towards_newer);
+            }
+        }
+    }
 
     outcome
 }
@@ -19757,7 +20714,16 @@ fn history_commit_table_row(
     select_for_cherry_pick: bool,
     cherry_pick_selected: bool,
     disabled: bool,
-) -> (egui::Response, bool, bool) {
+    enable_graph_rebase_drag: bool,
+    mut rebase_plan: Option<HistoryRebasePlanControls<'_>>,
+) -> (
+    egui::Response,
+    bool,
+    bool,
+    Option<(String, String, bool)>,
+    Option<(String, bool)>,
+    Option<(String, String)>,
+) {
     let response = ui.allocate_response(
         Vec2::new(ui.available_width(), HISTORY_TABLE_ROW_HEIGHT),
         if disabled {
@@ -19806,6 +20772,43 @@ fn history_commit_table_row(
         rect.right_bottom(),
     );
     draw_history_graph_cell(ui, content_rect, row, graph_width, lane_count);
+    let mut graph_rebase_drop = None;
+    if enable_graph_rebase_drag && !disabled && rebase_plan.is_none() {
+        if let Some(node_rect) = history_graph_node_rect(content_rect, row, graph_width, lane_count)
+        {
+            let node = ui
+                .interact(
+                    node_rect,
+                    ui.id()
+                        .with(("interactive_rebase_graph_drag", commit.hash.as_str())),
+                    Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text(i18n::t(language, "interactive_rebase.graph_drag_hint"));
+            node.dnd_set_drag_payload(commit.hash.clone());
+
+            let target = ui.interact(
+                node_rect,
+                ui.id()
+                    .with(("interactive_rebase_graph_drop_target", commit.hash.as_str())),
+                Sense::hover(),
+            );
+            let accepts_payload = target
+                .dnd_hover_payload::<String>()
+                .as_ref()
+                .is_some_and(|source_hash| source_hash.as_str() != commit.hash);
+            if accepts_payload {
+                ui.painter().circle_stroke(
+                    node_rect.center(),
+                    7.0,
+                    Stroke::new(1.5, theme::accent()),
+                );
+                if let Some(source_hash) = target.dnd_release_payload::<String>() {
+                    graph_rebase_drop = Some(((*source_hash).clone(), commit.hash.clone()));
+                }
+            }
+        }
+    }
 
     let width = rect.width() - selection_width;
     let cols = history_column_widths(width, graph_width, prefs);
@@ -19829,9 +20832,236 @@ fn history_commit_table_row(
         theme::muted()
     };
     let y = rect.center().y;
+    let inline_control_width = rebase_plan
+        .as_ref()
+        .filter(|_| !disabled)
+        .map(|_| INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH)
+        .unwrap_or_default();
+    let mut rebase_drop_target = None;
+    let mut rebase_step_move = None;
+    if let Some(controls) = rebase_plan.as_mut().filter(|_| !disabled) {
+        let handle_rect = Rect::from_min_size(
+            Pos2::new(x + 4.0, rect.top() + 2.0),
+            Vec2::new(34.0, rect.height() - 4.0),
+        );
+        let handle = ui
+            .interact(
+                handle_rect,
+                ui.id()
+                    .with(("interactive_rebase_drag", commit.hash.as_str())),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text(i18n::t(language, "interactive_rebase.plan_hint"));
+        handle.dnd_set_drag_payload(commit.hash.clone());
+        let handle_color = if handle.dragged() {
+            theme::accent()
+        } else {
+            theme::muted()
+        };
+        ui.painter().text(
+            handle_rect.center(),
+            Align2::CENTER_CENTER,
+            "::",
+            FontId::monospace(12.0),
+            handle_color,
+        );
+
+        let action_rect = Rect::from_min_size(
+            Pos2::new(handle_rect.right() + 2.0, rect.center().y - 10.0),
+            Vec2::new(100.0, 20.0),
+        );
+        let action = controls
+            .actions
+            .entry(commit.hash.clone())
+            .or_insert(InteractiveRebaseTodoAction::Pick);
+        let previous_action = *action;
+        let reword_locked = *action == InteractiveRebaseTodoAction::Reword
+            && controls.confirmed_reword_hashes.contains(&commit.hash);
+        if reword_locked {
+            ui.painter()
+                .rect_filled(action_rect, CornerRadius::same(3), theme::accent_soft());
+            ui.painter().text(
+                action_rect.center(),
+                Align2::CENTER_CENTER,
+                interactive_rebase_action_label(language, InteractiveRebaseTodoAction::Reword),
+                FontId::proportional(11.0),
+                theme::accent_deep(),
+            );
+        } else {
+            interactive_rebase_action_dropdown(
+                ui,
+                action_rect,
+                commit.hash.as_str(),
+                language,
+                action,
+            );
+        }
+        if *action == InteractiveRebaseTodoAction::Reword
+            && previous_action != InteractiveRebaseTodoAction::Reword
+        {
+            controls
+                .reword_messages
+                .entry(commit.hash.clone())
+                .or_insert_with(|| commit.subject.clone());
+            controls
+                .reword_authors
+                .entry(commit.hash.clone())
+                .or_insert_with(|| InteractiveRebaseAuthor {
+                    name: commit.author.clone(),
+                    email: commit.author_email.clone(),
+                });
+            controls.confirmed_reword_hashes.remove(&commit.hash);
+            *controls.editing_reword_hash = Some(commit.hash.clone());
+        } else if previous_action == InteractiveRebaseTodoAction::Reword
+            && *action != InteractiveRebaseTodoAction::Reword
+        {
+            controls.reword_messages.remove(&commit.hash);
+            controls.reword_authors.remove(&commit.hash);
+            controls.confirmed_reword_hashes.remove(&commit.hash);
+            if controls.editing_reword_hash.as_deref() == Some(commit.hash.as_str()) {
+                *controls.editing_reword_hash = None;
+            }
+        }
+
+        let move_up_rect = Rect::from_min_size(
+            Pos2::new(action_rect.right() + 2.0, rect.top() + 2.0),
+            Vec2::new(20.0, rect.height() - 4.0),
+        );
+        let move_down_rect = Rect::from_min_size(
+            Pos2::new(move_up_rect.right() + 2.0, rect.top() + 2.0),
+            Vec2::new(20.0, rect.height() - 4.0),
+        );
+        let reword_rect = Rect::from_min_size(
+            Pos2::new(move_down_rect.right() + 2.0, rect.top() + 2.0),
+            Vec2::new(20.0, rect.height() - 4.0),
+        );
+        for (button_rect, symbol, move_towards_newer, tooltip) in [
+            (
+                move_up_rect,
+                "^",
+                true,
+                i18n::t(language, "interactive_rebase.move_up"),
+            ),
+            (
+                move_down_rect,
+                "v",
+                false,
+                i18n::t(language, "interactive_rebase.move_down"),
+            ),
+        ] {
+            let button = ui
+                .interact(
+                    button_rect,
+                    ui.id().with((
+                        "interactive_rebase_step",
+                        commit.hash.as_str(),
+                        move_towards_newer,
+                    )),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tooltip);
+            if button.hovered() {
+                ui.painter()
+                    .rect_filled(button_rect, 3.0, theme::accent_soft());
+            }
+            ui.painter().text(
+                button_rect.center(),
+                Align2::CENTER_CENTER,
+                symbol,
+                FontId::proportional(12.0),
+                theme::muted(),
+            );
+            if button.clicked() {
+                rebase_step_move = Some((commit.hash.clone(), move_towards_newer));
+            }
+        }
+        if *action == InteractiveRebaseTodoAction::Reword {
+            let edit = ui
+                .interact(
+                    reword_rect,
+                    ui.id()
+                        .with(("interactive_rebase_reword", commit.hash.as_str())),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(i18n::t(language, "interactive_rebase.reword.edit"));
+            if edit.hovered() {
+                ui.painter()
+                    .rect_filled(reword_rect, 3.0, theme::accent_soft());
+            }
+            ui.painter().text(
+                reword_rect.center(),
+                Align2::CENTER_CENTER,
+                "E",
+                FontId::proportional(11.0),
+                theme::accent(),
+            );
+            if edit.clicked() {
+                *controls.editing_reword_hash = Some(commit.hash.clone());
+            }
+        }
+
+        // Keep a small gap between the two drop zones. `Rect::contains` includes
+        // the boundary, so adjacent half-row rectangles can both accept a release.
+        let drop_gap = 1.0;
+        for (target_rect, insert_above_target) in [
+            (
+                Rect::from_min_max(
+                    Pos2::new(rect.left(), rect.top() + drop_gap),
+                    Pos2::new(rect.right(), rect.center().y - drop_gap),
+                ),
+                true,
+            ),
+            (
+                Rect::from_min_max(
+                    Pos2::new(rect.left(), rect.center().y + drop_gap),
+                    Pos2::new(rect.right(), rect.bottom() - drop_gap),
+                ),
+                false,
+            ),
+        ] {
+            let target = ui.interact(
+                target_rect,
+                ui.id().with((
+                    "interactive_rebase_drop_target",
+                    commit.hash.as_str(),
+                    insert_above_target,
+                )),
+                Sense::hover(),
+            );
+            let payload = target.dnd_hover_payload::<String>();
+            let accepts_payload = payload
+                .as_ref()
+                .is_some_and(|source_hash| source_hash.as_str() != commit.hash);
+            if accepts_payload {
+                let y = if insert_above_target {
+                    rect.top()
+                } else {
+                    rect.bottom()
+                };
+                ui.painter().line_segment(
+                    [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                    Stroke::new(2.0, theme::accent()),
+                );
+                if let Some(source_hash) = target.dnd_release_payload::<String>() {
+                    rebase_drop_target = Some((
+                        (*source_hash).clone(),
+                        commit.hash.clone(),
+                        insert_above_target,
+                    ));
+                }
+            }
+        }
+    }
+
     let desc_rect = Rect::from_min_size(
-        Pos2::new(x + 4.0, rect.top()),
-        Vec2::new(cols.desc - 8.0, rect.height()),
+        Pos2::new(x + inline_control_width + 4.0, rect.top()),
+        Vec2::new(
+            (cols.desc - inline_control_width - 8.0).max(12.0),
+            rect.height(),
+        ),
     );
     draw_history_description(
         ui,
@@ -19891,7 +21121,123 @@ fn history_commit_table_row(
     if hash_copied {
         ui.ctx().copy_text(commit.hash.clone());
     }
-    (response, hash_copied, cherry_pick_clicked)
+    (
+        response,
+        hash_copied,
+        cherry_pick_clicked,
+        rebase_drop_target,
+        rebase_step_move,
+        graph_rebase_drop,
+    )
+}
+
+fn interactive_rebase_action_dropdown(
+    ui: &mut Ui,
+    rect: Rect,
+    hash: &str,
+    language: Language,
+    action: &mut InteractiveRebaseTodoAction,
+) {
+    let popup_id = ui.make_persistent_id(("interactive_rebase_table_action_popup", hash));
+    let button_id = ui.make_persistent_id(("interactive_rebase_table_action_button", hash));
+    let popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+    let response = pointing_hand_cursor(ui.interact(rect, button_id, Sense::click()));
+    if response.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
+
+    let fill = if popup_open {
+        theme::accent_soft()
+    } else if response.hovered() {
+        theme::hover()
+    } else {
+        theme::panel_soft()
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(3), fill);
+    ui.painter().text(
+        Pos2::new(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        interactive_rebase_action_label(language, *action),
+        FontId::proportional(11.0),
+        theme::text(),
+    );
+    let arrow = Pos2::new(rect.right() - 10.0, rect.center().y + 1.0);
+    ui.painter().line_segment(
+        [Pos2::new(arrow.x - 3.0, arrow.y - 2.0), arrow],
+        Stroke::new(1.2, theme::text()),
+    );
+    ui.painter().line_segment(
+        [arrow, Pos2::new(arrow.x + 3.0, arrow.y - 2.0)],
+        Stroke::new(1.2, theme::text()),
+    );
+
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(rect.width());
+            for todo_action in [
+                InteractiveRebaseTodoAction::Pick,
+                InteractiveRebaseTodoAction::Reword,
+                InteractiveRebaseTodoAction::Edit,
+                InteractiveRebaseTodoAction::Squash,
+                InteractiveRebaseTodoAction::Fixup,
+                InteractiveRebaseTodoAction::Drop,
+            ] {
+                let (option_rect, option_response) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::click());
+                let selected = *action == todo_action;
+                let option_fill = if selected {
+                    theme::accent_deep()
+                } else if option_response.hovered() {
+                    theme::hover()
+                } else {
+                    Color32::TRANSPARENT
+                };
+                if option_fill != Color32::TRANSPARENT {
+                    ui.painter()
+                        .rect_filled(option_rect, CornerRadius::same(3), option_fill);
+                }
+                ui.painter().text(
+                    Pos2::new(option_rect.left() + 8.0, option_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    interactive_rebase_action_label(language, todo_action),
+                    FontId::proportional(11.0),
+                    if selected {
+                        Color32::WHITE
+                    } else {
+                        theme::text()
+                    },
+                );
+                if option_response.clicked() {
+                    *action = todo_action;
+                    ui.memory_mut(|memory| memory.close_popup());
+                }
+            }
+        },
+    );
+}
+
+fn history_graph_node_rect(
+    rect: Rect,
+    row: Option<&graph::GraphRow>,
+    graph_width: f32,
+    lane_count: usize,
+) -> Option<Rect> {
+    let row = row?;
+    let graph_rect = Rect::from_min_max(
+        rect.left_top(),
+        Pos2::new(rect.left() + graph_width, rect.bottom()),
+    );
+    let left_pad = if graph_width < 48.0 { 6.0 } else { 14.0 };
+    let lane_spacing = ((graph_width - left_pad - 4.0) / lane_count.max(1) as f32).clamp(7.0, 22.0);
+    let node = Pos2::new(
+        graph_rect.left() + left_pad + row.lane as f32 * lane_spacing,
+        graph_rect.center().y,
+    );
+    Some(Rect::from_center_size(node, Vec2::splat(18.0)))
 }
 
 fn draw_history_graph_cell(
@@ -20040,6 +21386,16 @@ fn draw_history_description(
         painter
             .with_clip_rect(text_clip)
             .galley(text_pos, galley, badge_text_color);
+        ui.interact(
+            badge_rect,
+            ui.id().with((
+                "history_ref_badge",
+                commit.hash.as_str(),
+                ref_label.name.as_str(),
+            )),
+            Sense::hover(),
+        )
+        .on_hover_text(ref_label.name.as_str());
         x += width + HISTORY_REF_BADGE_GAP;
     }
 
@@ -20115,20 +21471,7 @@ fn history_ref_badge_label_for_width(
     color: Color32,
     max_width: f32,
 ) -> String {
-    let original_chars = value.chars().count();
-    let mut max_chars = original_chars.min(22);
-    loop {
-        let label = truncate_middle(value, max_chars);
-        let width = ui
-            .painter()
-            .layout_no_wrap(label.clone(), font.clone(), color)
-            .size()
-            .x;
-        if width <= max_width || max_chars <= 3 {
-            return label;
-        }
-        max_chars -= 1;
-    }
+    elide_end_to_width(ui, value, max_width, font, color)
 }
 
 fn commit_refs_for_display(
@@ -23355,17 +24698,26 @@ fn branch_row(
         Pos2::new(name_left, rect.top()),
         Pos2::new(name_right, rect.bottom()),
     );
-    let mut name_text = RichText::new(display_name).color(if current {
+    let name_color = if current {
         theme::text()
     } else {
         theme::muted()
-    });
+    };
+    let display_name = elide_end_to_width(
+        ui,
+        display_name,
+        name_rect.width(),
+        FontId::proportional(12.0),
+        name_color,
+    );
+    let mut name_text = RichText::new(display_name).color(name_color);
     if current {
         name_text = name_text.strong();
     }
     paint_branch_name(ui, name_rect, name_text);
 
-    let response = full_row_click_response_enabled(ui, rect, ("branch_row", remote, name), enabled);
+    let response = full_row_click_response_enabled(ui, rect, ("branch_row", remote, name), enabled)
+        .on_hover_text(name);
     if enabled && response.double_clicked() {
         if remote {
             *action = Some(BranchMenuAction::CheckoutRemote {
@@ -23413,7 +24765,7 @@ fn paint_branch_name(ui: &mut Ui, name_rect: Rect, name_text: RichText) {
     );
     layout_job.wrap.max_width = name_rect.width();
     layout_job.wrap.max_rows = 1;
-    layout_job.wrap.break_anywhere = true;
+    layout_job.wrap.break_anywhere = false;
     let galley = ui.painter().layout_job(layout_job);
     let text_pos = Align2::LEFT_CENTER
         .anchor_size(name_rect.left_center(), galley.size())
@@ -23805,7 +25157,8 @@ fn remote_branch_row(
     );
 
     let response =
-        full_row_click_response_enabled(ui, rect, ("remote_branch_row", full_name), enabled);
+        full_row_click_response_enabled(ui, rect, ("remote_branch_row", full_name), enabled)
+            .on_hover_text(full_name);
     if enabled && response.double_clicked() {
         *action = Some(BranchMenuAction::CheckoutRemote {
             remote_branch: full_name.to_owned(),
@@ -24630,6 +25983,7 @@ enum DiffRenderItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiffLine {
+    hunk_index: usize,
     left_no: String,
     right_no: String,
     body: String,
@@ -24638,6 +25992,7 @@ struct DiffLine {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiffLineKey {
+    hunk_index: usize,
     left_no: String,
     right_no: String,
     body: String,
@@ -24647,6 +26002,7 @@ struct DiffLineKey {
 impl DiffLine {
     fn key(&self) -> DiffLineKey {
         DiffLineKey {
+            hunk_index: self.hunk_index,
             left_no: self.left_no.clone(),
             right_no: self.right_no.clone(),
             body: self.body.clone(),
@@ -24660,6 +26016,7 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
     let mut hunk_lines = Vec::new();
     let mut old_line: Option<usize> = None;
     let mut new_line: Option<usize> = None;
+    let mut hunk_index = 0usize;
 
     for line in text.lines().take(1_200) {
         if line.starts_with("diff --git")
@@ -24686,6 +26043,7 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             push_diff_hunk_items(&mut items, &hunk_lines, mode);
             hunk_lines.clear();
             let (old_start, new_start) = parse_hunk_header(line);
+            hunk_index += 1;
             old_line = old_start;
             new_line = new_start;
             continue;
@@ -24713,6 +26071,7 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
             .unwrap_or(line);
 
         hunk_lines.push(DiffLine {
+            hunk_index,
             left_no,
             right_no,
             body: body.to_owned(),
@@ -24731,6 +26090,113 @@ fn collect_unified_diff_items(text: &str, mode: DiffDisplayMode) -> Vec<DiffRend
 
     push_diff_hunk_items(&mut items, &hunk_lines, mode);
     items
+}
+
+/// Return the complete unified hunk containing a selected rendered diff line.
+/// Git needs the file preamble and every context line to reverse-apply it.
+fn selected_diff_hunk_patch(text: &str, selected_rows: &[DiffLineKey]) -> Option<String> {
+    if selected_rows.is_empty() {
+        return None;
+    }
+
+    let mut preamble = Vec::<String>::new();
+    let mut hunks = Vec::<(Vec<DiffLineKey>, String)>::new();
+    let mut current: Option<(String, Vec<String>, Vec<DiffLineKey>)> = None;
+    let mut old_line: Option<usize> = None;
+    let mut new_line: Option<usize> = None;
+    let mut hunk_index = 0usize;
+
+    for raw_line in text.lines() {
+        if raw_line.starts_with("diff --git") {
+            push_selected_diff_hunk(&mut hunks, &preamble, &mut current);
+            preamble.clear();
+            preamble.push(raw_line.to_owned());
+            old_line = None;
+            new_line = None;
+            continue;
+        }
+        if raw_line.starts_with("@@") {
+            push_selected_diff_hunk(&mut hunks, &preamble, &mut current);
+            hunk_index += 1;
+            let (old_start, new_start) = parse_hunk_header(raw_line);
+            old_line = old_start;
+            new_line = new_start;
+            current = Some((raw_line.to_owned(), Vec::new(), Vec::new()));
+            continue;
+        }
+
+        let Some((_, lines, keys)) = current.as_mut() else {
+            preamble.push(raw_line.to_owned());
+            continue;
+        };
+        lines.push(raw_line.to_owned());
+        if raw_line.starts_with("\\ No newline at end of file") {
+            continue;
+        }
+
+        let kind = if raw_line.starts_with('+') {
+            DiffKind::Added
+        } else if raw_line.starts_with('-') {
+            DiffKind::Removed
+        } else {
+            DiffKind::Context
+        };
+        let left_no = match kind {
+            DiffKind::Added => String::new(),
+            _ => old_line.map(|line| line.to_string()).unwrap_or_default(),
+        };
+        let right_no = match kind {
+            DiffKind::Removed => String::new(),
+            _ => new_line.map(|line| line.to_string()).unwrap_or_default(),
+        };
+        let body = raw_line
+            .strip_prefix('+')
+            .or_else(|| raw_line.strip_prefix('-'))
+            .unwrap_or(raw_line);
+        keys.push(DiffLineKey {
+            hunk_index,
+            left_no,
+            right_no,
+            body: body.to_owned(),
+            kind,
+        });
+        match kind {
+            DiffKind::Added => new_line = new_line.map(|line| line + 1),
+            DiffKind::Removed => old_line = old_line.map(|line| line + 1),
+            DiffKind::Context => {
+                old_line = old_line.map(|line| line + 1);
+                new_line = new_line.map(|line| line + 1);
+            }
+        }
+    }
+    push_selected_diff_hunk(&mut hunks, &preamble, &mut current);
+
+    hunks.into_iter().find_map(|(keys, patch)| {
+        keys.iter()
+            .any(|key| selected_rows.iter().any(|selected| selected == key))
+            .then_some(patch)
+    })
+}
+
+fn push_selected_diff_hunk(
+    hunks: &mut Vec<(Vec<DiffLineKey>, String)>,
+    preamble: &[String],
+    current: &mut Option<(String, Vec<String>, Vec<DiffLineKey>)>,
+) {
+    let Some((header, lines, keys)) = current.take() else {
+        return;
+    };
+    let mut patch = preamble.join("\n");
+    if !patch.is_empty() {
+        patch.push('\n');
+    }
+    patch.push_str(&header);
+    for line in lines {
+        patch.push('\n');
+        patch.push_str(&line);
+    }
+    patch.push('\n');
+    hunks.push((keys, patch));
 }
 
 fn push_diff_hunk_items(
@@ -26138,6 +27604,28 @@ fn interactive_rebase_first_parent_hashes_after_base(
     }
 }
 
+fn interactive_rebase_graph_drop_is_valid(
+    snapshot: &RepositorySnapshot,
+    source_hash: &str,
+    target_hash: &str,
+) -> bool {
+    if source_hash.trim().is_empty() || target_hash.trim().is_empty() || source_hash == target_hash
+    {
+        return false;
+    }
+    let topology = history_dialog_commits(
+        snapshot,
+        HistoryBranchScope::Current,
+        HistorySortOrder::Topology,
+    );
+    let source_is_editable = topology
+        .iter()
+        .any(|commit| commit.hash == source_hash && !interactive_rebase_commit_is_merge(commit));
+    source_is_editable
+        && interactive_rebase_first_parent_hashes_after_base(snapshot, target_hash)
+            .contains(source_hash)
+}
+
 fn interactive_rebase_first_parent_hashes(snapshot: &RepositorySnapshot) -> HashSet<String> {
     let topology = history_dialog_commits(
         snapshot,
@@ -26258,6 +27746,177 @@ fn interactive_rebase_disabled_hashes(commits: &[Commit]) -> HashSet<String> {
         .collect()
 }
 
+fn interactive_rebase_default_order(commits: &[Commit]) -> Vec<String> {
+    commits
+        .iter()
+        .rev()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| commit.hash.clone())
+        .collect()
+}
+
+fn interactive_rebase_synchronize_plan(
+    dialog: &mut InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) {
+    let available = commits
+        .iter()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| commit.hash.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    dialog
+        .ordered_hashes
+        .retain(|hash| available.contains(hash.as_str()) && seen.insert(hash.clone()));
+    for hash in interactive_rebase_default_order(commits) {
+        if seen.insert(hash.clone()) {
+            dialog.ordered_hashes.push(hash);
+        }
+    }
+    dialog
+        .actions
+        .retain(|hash, _| available.contains(hash.as_str()));
+    dialog
+        .reword_messages
+        .retain(|hash, _| dialog.actions.get(hash) == Some(&InteractiveRebaseTodoAction::Reword));
+    dialog
+        .reword_authors
+        .retain(|hash, _| dialog.actions.get(hash) == Some(&InteractiveRebaseTodoAction::Reword));
+    dialog
+        .confirmed_reword_hashes
+        .retain(|hash| dialog.actions.get(hash) == Some(&InteractiveRebaseTodoAction::Reword));
+    if dialog
+        .editing_reword_hash
+        .as_ref()
+        .is_some_and(|hash| dialog.actions.get(hash) != Some(&InteractiveRebaseTodoAction::Reword))
+    {
+        dialog.editing_reword_hash = None;
+    }
+    if dialog
+        .dragged_hash
+        .as_ref()
+        .is_some_and(|hash| !available.contains(hash.as_str()))
+    {
+        dialog.dragged_hash = None;
+    }
+}
+
+fn interactive_rebase_ordered_commits(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<Commit> {
+    let by_hash = commits
+        .iter()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    dialog
+        .ordered_hashes
+        .iter()
+        .filter_map(|hash| by_hash.get(hash.as_str()).copied())
+        .cloned()
+        .collect()
+}
+
+fn interactive_rebase_display_commits(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> Vec<Commit> {
+    let mut planned = interactive_rebase_ordered_commits(dialog, commits)
+        .into_iter()
+        .rev();
+
+    commits
+        .iter()
+        .cloned()
+        .map(|commit| {
+            if interactive_rebase_commit_is_merge(&commit) {
+                commit
+            } else {
+                planned.next().unwrap_or(commit)
+            }
+        })
+        .collect()
+}
+
+fn interactive_rebase_move_hash(
+    ordered_hashes: &mut Vec<String>,
+    dragged_hash: &str,
+    target_hash: &str,
+    insert_before: bool,
+) -> bool {
+    if dragged_hash == target_hash {
+        return false;
+    }
+    let Some(source_index) = ordered_hashes.iter().position(|hash| hash == dragged_hash) else {
+        return false;
+    };
+    let dragged = ordered_hashes.remove(source_index);
+    let Some(mut target_index) = ordered_hashes.iter().position(|hash| hash == target_hash) else {
+        ordered_hashes.insert(source_index, dragged);
+        return false;
+    };
+    if !insert_before {
+        target_index += 1;
+    }
+    ordered_hashes.insert(target_index, dragged);
+    true
+}
+
+fn interactive_rebase_move_hash_from_display(
+    ordered_hashes: &mut Vec<String>,
+    dragged_hash: &str,
+    target_hash: &str,
+    insert_above_target: bool,
+) -> bool {
+    // The interactive-rebase table is rendered newest-first, unlike git's todo.
+    interactive_rebase_move_hash(
+        ordered_hashes,
+        dragged_hash,
+        target_hash,
+        !insert_above_target,
+    )
+}
+
+fn interactive_rebase_step_hash(
+    ordered_hashes: &mut [String],
+    hash: &str,
+    move_towards_newer: bool,
+) -> bool {
+    let Some(index) = ordered_hashes
+        .iter()
+        .position(|candidate| candidate == hash)
+    else {
+        return false;
+    };
+    let target = if move_towards_newer {
+        index
+            .checked_add(1)
+            .filter(|target| *target < ordered_hashes.len())
+    } else {
+        index.checked_sub(1)
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    ordered_hashes.swap(index, target);
+    true
+}
+
+fn interactive_rebase_action_label(
+    language: Language,
+    action: InteractiveRebaseTodoAction,
+) -> &'static str {
+    match action {
+        InteractiveRebaseTodoAction::Pick => i18n::t(language, "interactive_rebase.todo.pick"),
+        InteractiveRebaseTodoAction::Reword => i18n::t(language, "interactive_rebase.todo.reword"),
+        InteractiveRebaseTodoAction::Edit => i18n::t(language, "interactive_rebase.todo.edit"),
+        InteractiveRebaseTodoAction::Squash => i18n::t(language, "interactive_rebase.todo.squash"),
+        InteractiveRebaseTodoAction::Fixup => i18n::t(language, "interactive_rebase.todo.fixup"),
+        InteractiveRebaseTodoAction::Drop => i18n::t(language, "interactive_rebase.todo.drop"),
+    }
+}
+
 fn interactive_rebase_selected_actionable_hashes(
     dialog: &InteractiveRebaseActionDialog,
     commits: &[Commit],
@@ -26343,6 +28002,7 @@ fn interactive_rebase_dialog_has_changes(dialog: &InteractiveRebaseActionDialog)
         .actions
         .values()
         .any(|action| *action != InteractiveRebaseTodoAction::Pick)
+        || dialog.ordered_hashes != dialog.original_ordered_hashes
         || dialog.squash_target_hash.is_some() && dialog.squash_range_hashes.len() > 1
 }
 
@@ -26398,11 +28058,7 @@ fn interactive_rebase_todo_items(
     dialog: &InteractiveRebaseActionDialog,
     commits: &[Commit],
 ) -> Vec<git::InteractiveRebaseTodoItem> {
-    let chronological_commits = commits
-        .iter()
-        .rev()
-        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
-        .collect::<Vec<_>>();
+    let chronological_commits = interactive_rebase_ordered_commits(dialog, commits);
 
     let squash_target = dialog.squash_target_hash.as_deref();
     let squash_range = dialog
@@ -26432,6 +28088,9 @@ fn interactive_rebase_todo_items(
                     action: git::InteractiveRebaseAction::Pick,
                     hash: target_commit.hash.clone(),
                     subject: target_commit.subject.clone(),
+                    message: None,
+                    author_name: None,
+                    author_email: None,
                 });
                 for candidate in &chronological_commits {
                     if squash_range.contains(candidate.hash.as_str())
@@ -26441,6 +28100,9 @@ fn interactive_rebase_todo_items(
                             action: git::InteractiveRebaseAction::Squash,
                             hash: candidate.hash.clone(),
                             subject: candidate.subject.clone(),
+                            message: None,
+                            author_name: None,
+                            author_email: None,
                         });
                     }
                 }
@@ -26458,6 +28120,27 @@ fn interactive_rebase_todo_items(
             action: action.to_git_action(),
             hash: commit.hash.clone(),
             subject: commit.subject.clone(),
+            message: (action == InteractiveRebaseTodoAction::Reword).then(|| {
+                dialog
+                    .reword_messages
+                    .get(&commit.hash)
+                    .cloned()
+                    .unwrap_or_else(|| commit.subject.clone())
+            }),
+            author_name: (action == InteractiveRebaseTodoAction::Reword).then(|| {
+                dialog
+                    .reword_authors
+                    .get(&commit.hash)
+                    .map(|author| author.name.clone())
+                    .unwrap_or_else(|| commit.author.clone())
+            }),
+            author_email: (action == InteractiveRebaseTodoAction::Reword).then(|| {
+                dialog
+                    .reword_authors
+                    .get(&commit.hash)
+                    .map(|author| author.email.clone())
+                    .unwrap_or_else(|| commit.author_email.clone())
+            }),
         });
     }
     items
@@ -26475,9 +28158,28 @@ fn validate_interactive_rebase_dialog(
     if !interactive_rebase_dialog_has_changes(dialog) {
         return Some(i18n::t(language, "interactive_rebase.error.no_changes").to_owned());
     }
+    let has_unsaved_reword = dialog.actions.iter().any(|(hash, action)| {
+        *action == InteractiveRebaseTodoAction::Reword
+            && (!dialog.confirmed_reword_hashes.contains(hash)
+                || dialog
+                    .reword_messages
+                    .get(hash)
+                    .is_none_or(|message| message.trim().is_empty())
+                || dialog.reword_authors.get(hash).is_none_or(|author| {
+                    author.name.trim().is_empty() || author.email.trim().is_empty()
+                }))
+    });
+    if has_unsaved_reword {
+        return Some(i18n::t(language, "interactive_rebase.error.reword_unconfirmed").to_owned());
+    }
     if interactive_rebase_todo_items(dialog, commits)
         .first()
-        .is_some_and(|item| item.action == git::InteractiveRebaseAction::Squash)
+        .is_some_and(|item| {
+            matches!(
+                item.action,
+                git::InteractiveRebaseAction::Squash | git::InteractiveRebaseAction::Fixup
+            )
+        })
     {
         return Some(i18n::t(language, "interactive_rebase.error.first_squash").to_owned());
     }
@@ -26821,8 +28523,146 @@ fn git_flow_config_field(ui: &mut Ui, language: Language, label: &str, value: &m
     });
 }
 
+fn searchable_branch_dropdown(
+    ui: &mut Ui,
+    id: egui::Id,
+    selected: &mut String,
+    choices: &[(String, String)],
+    width: f32,
+    empty_label: &str,
+    search_placeholder: &str,
+) -> bool {
+    let selected_text = choices
+        .iter()
+        .find(|(value, _)| value == selected)
+        .map(|(_, label)| label.clone())
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| {
+            if selected.is_empty() {
+                empty_label.to_owned()
+            } else {
+                selected.clone()
+            }
+        });
+    let filter_id = id.with("branch_filter");
+    let filter_input_id = filter_id.with("input");
+    let popup_was_open = egui::ComboBox::is_open(ui.ctx(), id);
+    let mut changed = false;
+    let mut selected_option = false;
+
+    let combo_response = egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .selected_text(selected_text)
+        .close_behavior(egui::popup::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            let mut filter = ui
+                .ctx()
+                .data(|data| data.get_temp::<String>(filter_id).unwrap_or_default());
+            let search_frame = egui::Frame::new()
+                .fill(theme::panel_recessed())
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(4, 2))
+                .show(ui, |ui| {
+                    themed_text_edit_selection(ui);
+                    ui.add_sized(
+                        [ui.available_width(), 20.0],
+                        themed_singleline_text_edit(&mut filter, search_placeholder)
+                            .id(filter_input_id)
+                            .frame(false),
+                    )
+                });
+            paint_branch_dropdown_search_inset_shadow(ui, search_frame.response.rect);
+            let filter_response = search_frame.inner;
+            if filter_response.changed() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(filter_id, filter.clone()));
+            }
+            let filter = filter.trim().to_lowercase();
+            ui.add_space(4.0);
+
+            ScrollArea::vertical()
+                .id_salt(filter_id.with("choices"))
+                .max_height(216.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut has_match = false;
+                    for (value, label) in choices {
+                        let matches_filter = filter.is_empty()
+                            || value.to_lowercase().contains(&filter)
+                            || label.to_lowercase().contains(&filter);
+                        if !matches_filter {
+                            continue;
+                        }
+                        has_match = true;
+                        if ui
+                            .selectable_value(selected, value.clone(), label)
+                            .clicked()
+                        {
+                            changed = true;
+                            selected_option = true;
+                            ui.ctx()
+                                .data_mut(|data| data.insert_temp(filter_id, String::new()));
+                        }
+                    }
+                    if !has_match {
+                        ui.label(
+                            RichText::new(search_placeholder)
+                                .small()
+                                .color(theme::muted()),
+                        );
+                    }
+                });
+        });
+    if combo_response.response.clicked() && !popup_was_open {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(filter_id, String::new()));
+        ui.memory_mut(|memory| memory.request_focus(filter_input_id));
+    }
+    if selected_option {
+        ui.memory_mut(|memory| memory.close_popup());
+    }
+    changed
+}
+
+fn paint_branch_dropdown_search_inset_shadow(ui: &Ui, rect: Rect) {
+    let rect = rect.shrink(0.5);
+    let dark = theme::inset_shadow().gamma_multiply(0.3);
+    let light = theme::inset_highlight().gamma_multiply(0.22);
+    let radius = 4.0;
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + radius, rect.top()),
+            Pos2::new(rect.right() - radius, rect.top()),
+        ],
+        Stroke::new(1.0, dark),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left(), rect.top() + radius),
+            Pos2::new(rect.left(), rect.bottom() - radius),
+        ],
+        Stroke::new(1.0, dark),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + radius, rect.bottom()),
+            Pos2::new(rect.right() - radius, rect.bottom()),
+        ],
+        Stroke::new(1.0, light),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.right(), rect.top() + radius),
+            Pos2::new(rect.right(), rect.bottom() - radius),
+        ],
+        Stroke::new(1.0, light),
+    );
+}
+
 fn git_flow_start_point_row(
     ui: &mut Ui,
+    language: Language,
     label: &str,
     start_point: &mut String,
     options: &[GitFlowStartPointOption],
@@ -26832,45 +28672,47 @@ fn git_flow_start_point_row(
             [132.0, 24.0],
             egui::Label::new(RichText::new(label).small().color(theme::muted())),
         );
-        egui::ComboBox::from_id_salt("git_flow_start_point")
-            .selected_text(start_point.as_str())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for option in options {
-                    ui.selectable_value(start_point, option.name.clone(), &option.name);
-                }
-            });
+        let choices = options
+            .iter()
+            .map(|option| (option.name.clone(), option.name.clone()))
+            .collect::<Vec<_>>();
+        searchable_branch_dropdown(
+            ui,
+            egui::Id::new("git_flow_start_point"),
+            start_point,
+            &choices,
+            ui.available_width(),
+            label,
+            i18n::t(language, "repo.source.search"),
+        );
     });
 }
 
 fn git_flow_finish_branch_row(
     ui: &mut Ui,
+    language: Language,
     label: &str,
     branch_name: &mut String,
     options: &[GitFlowFinishBranchOption],
 ) {
-    let selected_text = options
-        .iter()
-        .find(|option| option.branch_name == *branch_name)
-        .map(|option| option.display_name.clone())
-        .unwrap_or_else(|| branch_name.clone());
     ui.horizontal(|ui| {
         ui.add_sized(
             [132.0, 24.0],
             egui::Label::new(RichText::new(label).small().color(theme::muted())),
         );
-        egui::ComboBox::from_id_salt("git_flow_finish_branch")
-            .selected_text(selected_text)
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for option in options {
-                    ui.selectable_value(
-                        branch_name,
-                        option.branch_name.clone(),
-                        &option.display_name,
-                    );
-                }
-            });
+        let choices = options
+            .iter()
+            .map(|option| (option.branch_name.clone(), option.display_name.clone()))
+            .collect::<Vec<_>>();
+        searchable_branch_dropdown(
+            ui,
+            egui::Id::new("git_flow_finish_branch"),
+            branch_name,
+            &choices,
+            ui.available_width(),
+            label,
+            i18n::t(language, "repo.source.search"),
+        );
     });
 }
 
@@ -27853,6 +29695,7 @@ fn paint_push_branch_body_text_cell(
 
 fn push_branch_table_row(
     ui: &mut Ui,
+    language: Language,
     table_width: f32,
     row: &mut PushBranchRow,
     remote_branches: &[String],
@@ -27892,15 +29735,18 @@ fn push_branch_table_row(
     );
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
         ui.set_width(remote_rect.width());
-        egui::ComboBox::from_id_salt(("push_remote_branch_selector", row.local_branch.as_str()))
-            .width(remote_rect.width())
-            .selected_text(row.remote_branch.as_str())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut row.remote_branch, String::new(), "");
-                for branch in choices {
-                    ui.selectable_value(&mut row.remote_branch, branch.clone(), branch);
-                }
-            });
+        let branch_choices = std::iter::once((String::new(), String::new()))
+            .chain(choices.into_iter().map(|branch| (branch.clone(), branch)))
+            .collect::<Vec<_>>();
+        searchable_branch_dropdown(
+            ui,
+            egui::Id::new(("push_remote_branch_selector", row.local_branch.as_str())),
+            &mut row.remote_branch,
+            &branch_choices,
+            remote_rect.width(),
+            "",
+            i18n::t(language, "repo.source.search"),
+        );
     });
 
     action_icon_checkbox(
@@ -27962,6 +29808,7 @@ mod ui_tests {
             short_hash: hash.to_owned(),
             parents: parents.iter().map(|parent| (*parent).to_owned()).collect(),
             author: "Test Author".to_owned(),
+            author_email: "test-author@example.com".to_owned(),
             date: "2026-07-01 10:00".to_owned(),
             relative_time: "now".to_owned(),
             subject: subject.to_owned(),
@@ -27976,6 +29823,28 @@ mod ui_tests {
             remote: false,
             upstream: None,
         }
+    }
+
+    #[test]
+    fn repository_undo_redo_are_wired_to_safe_local_actions() {
+        let source = include_str!("app.rs");
+        let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
+
+        assert!(implementation.contains("struct RepositoryUndoEntry"));
+        assert!(implementation.contains("fn start_undoable_git_action("));
+        assert!(implementation.contains("fn undo_repository_action("));
+        assert!(implementation.contains("fn redo_repository_action("));
+        assert!(implementation.contains("RepositoryUndoKind::Position"));
+        assert!(implementation.contains("RepositoryUndoKind::Commit"));
+        assert!(implementation.contains("shortcut_pressed(ctx, egui::Key::Z, false)"));
+        assert!(implementation.contains("shortcut_pressed(ctx, egui::Key::Y, false)"));
+        assert!(implementation.contains("toolbar_button(\n                                    ui,\n                                    \"undo\""));
+        assert!(implementation.contains("toolbar_button(\n                                    ui,\n                                    \"redo\""));
+        assert!(implementation.contains("git::restore_repository_undo_position"));
+        assert!(
+            implementation
+                .contains("git::reset_to_commit(&root, &entry.before.head, ResetMode::Soft)")
+        );
     }
 
     #[test]
@@ -27998,7 +29867,10 @@ mod ui_tests {
         assert_eq!(repository_source_panel_y_margin(), 0);
         assert!(top_bar_source.contains("let top_island_rect = top_island_rect("));
         assert!(top_bar_source.contains("let tab_strip_row = repo_tab_strip_rect("));
-        assert!(top_bar_source.contains(".rect_filled(full, CornerRadius::ZERO, theme::bg())"));
+        assert!(
+            top_bar_source
+                .contains(".rect_filled(full, window_top_corner_radius(ui.ctx()), theme::bg())")
+        );
         assert!(top_bar_source.contains(".fill(theme::chrome_bg())"));
         assert!(top_bar_source.contains(".shadow(panel_shadow())"));
         assert!(top_bar_source.contains(".paint(top_island_rect)"));
@@ -28016,6 +29888,7 @@ mod ui_tests {
         assert!(title_bar_source.contains("app_title_logo(ui);"));
         assert!(title_bar_source.contains("self.desktop_menu_bar(ui, has_repo, has_remote);"));
         assert!(title_bar_source.contains("custom_title_drag_rect(rect, controls_width)"));
+        assert!(title_bar_source.contains("window_top_corner_radius(ctx)"));
         assert!(source.contains("TITLE_MENU_RESERVED_WIDTH"));
         assert!(!title_bar_source.contains("RichText::new(\"Git Agent\")"));
         assert!(top_bar_source.contains("let tool_row_panel_rect = (!source_active).then(|| {"));
@@ -29142,6 +31015,8 @@ mod ui_tests {
         assert!(compact_branch_row_source.contains("let badge_left = paint_branch_row_badges("));
         assert!(branch_row_source.contains("let name_right = (badge_left - 6.0).max(name_left);"));
         assert!(branch_row_source.contains("paint_branch_name(ui, name_rect, name_text);"));
+        assert!(branch_row_source.contains("let display_name = elide_end_to_width("));
+        assert!(branch_row_source.contains(".on_hover_text(name);"));
         assert!(!branch_row_source.contains("egui::Label::new(name_text).truncate()"));
         assert!(!branch_row_source.contains("branch_sync_badges(ui, sync_counts)"));
         assert!(
@@ -29188,13 +31063,21 @@ mod ui_tests {
             .join(" ");
         assert!(paint_name_source.contains("layout_job.wrap.max_width = name_rect.width();"));
         assert!(paint_name_source.contains("layout_job.wrap.max_rows = 1;"));
-        assert!(paint_name_source.contains("layout_job.wrap.break_anywhere = true;"));
+        assert!(paint_name_source.contains("layout_job.wrap.break_anywhere = false;"));
         assert!(paint_name_source.contains("Align::Min"));
         assert!(!paint_name_source.contains("Align::Center"));
         assert!(paint_name_source.contains("Align2::LEFT_CENTER"));
         assert!(paint_name_source.contains("anchor_size(name_rect.left_center(), galley.size())"));
         assert!(compact_paint_name_source.contains(".min;"));
         assert!(paint_name_source.contains("with_clip_rect(name_rect)"));
+
+        let remote_row_start = implementation_source.find("fn remote_branch_row(").unwrap();
+        let remote_row_end = implementation_source[remote_row_start..]
+            .find("fn remote_empty_label(")
+            .unwrap();
+        let remote_row_source =
+            &implementation_source[remote_row_start..remote_row_start + remote_row_end];
+        assert!(remote_row_source.contains(".on_hover_text(full_name);"));
     }
 
     #[test]
@@ -29659,8 +31542,19 @@ mod ui_tests {
         assert!(desc_source.contains("layout_no_wrap("));
         assert!(desc_source.contains("galley.size().x"));
         assert!(desc_source.contains("with_clip_rect(text_clip"));
+        assert!(desc_source.contains(".on_hover_text(ref_label.name.as_str())"));
         assert!(!desc_source.contains("label.chars().count() as f32 * 6.6"));
         assert!(!desc_source.contains("Align2::CENTER_CENTER"));
+
+        let label_start = implementation_source
+            .find("fn history_ref_badge_label_for_width(")
+            .unwrap();
+        let label_end = implementation_source[label_start..]
+            .find("fn commit_refs_for_display(")
+            .unwrap();
+        let label_source = &implementation_source[label_start..label_start + label_end];
+        assert!(label_source.contains("elide_end_to_width(ui, value, max_width, font, color)"));
+        assert!(!label_source.contains("truncate_middle(value"));
     }
 
     #[test]
@@ -29918,6 +31812,7 @@ mod ui_tests {
             .unwrap();
         let fields_source = &implementation_source[fields_start..fields_start + fields_end];
         assert!(fields_source.contains("commit_message_drafts: HashMap<String, String>"));
+        assert!(implementation_source.contains("draft_message: String"));
         assert!(implementation_source.contains("fn save_commit_message_draft_for_active_repo("));
         assert!(implementation_source.contains("fn load_commit_message_draft_for_active_repo("));
 
@@ -29952,14 +31847,11 @@ mod ui_tests {
             .find("fn switch_to_next_tab(")
             .unwrap();
         let switch_source = &implementation_source[switch_start..switch_start + switch_end];
-        assert!(switch_source.contains("self.save_commit_message_draft_for_active_repo();"));
+        assert!(switch_source.contains("self.load_repository(tab.root);"));
+        assert!(!switch_source.contains("self.active_repo_tab = Some(index);"));
         assert!(
-            switch_source
-                .find("self.save_commit_message_draft_for_active_repo();")
-                .unwrap()
-                < switch_source
-                    .find("self.active_repo_tab = Some(index);")
-                    .unwrap()
+            load_source.contains("if !self.active_repo_root_matches(&path)"),
+            "the common loader must not overwrite a target draft after callers activate it"
         );
 
         let commit_start = implementation_source
@@ -31303,6 +33195,16 @@ mod ui_tests {
         assert!(stage_toggle_source.contains("self.handle_worktree_action(action);"));
         assert!(stage_toggle_source.contains("self.focus_commit_message = true;"));
 
+        let remote_action_start = implementation_source
+            .find("fn start_remote_git_action(")
+            .unwrap();
+        let remote_action_end = implementation_source[remote_action_start..]
+            .find("fn start_create_patch_task(")
+            .unwrap();
+        let remote_action_source =
+            &implementation_source[remote_action_start..remote_action_start + remote_action_end];
+        assert!(remote_action_source.contains("self.save_commit_message_draft_for_active_repo();"));
+
         let pr_start = implementation_source
             .find("fn create_pull_request_current_branch(")
             .unwrap();
@@ -32262,6 +34164,15 @@ mod ui_tests {
         assert!(interactive_rebase_commit_is_merge(&merge));
         assert!(!interactive_rebase_commit_is_merge(&linear));
         assert!(!interactive_rebase_first_parent_hashes(&snapshot).contains("side"));
+        assert!(interactive_rebase_graph_drop_is_valid(
+            &snapshot, "linear", "base"
+        ));
+        assert!(!interactive_rebase_graph_drop_is_valid(
+            &snapshot, "side", "base"
+        ));
+        assert!(!interactive_rebase_graph_drop_is_valid(
+            &snapshot, "merge", "base"
+        ));
         assert_eq!(
             interactive_rebase_actionable_commits(&interactive_rebase_dialog_commits(
                 &snapshot,
@@ -32407,6 +34318,13 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
             selected_hashes: HashSet::new(),
             squash_target_hash: None,
             squash_range_hashes: Vec::new(),
@@ -32463,6 +34381,13 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
             selected_hashes: HashSet::new(),
             squash_target_hash: None,
             squash_range_hashes: Vec::new(),
@@ -32482,6 +34407,146 @@ mod ui_tests {
         assert_eq!(
             validate_interactive_rebase_dialog(Language::Chinese, &dialog, &commits),
             None
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_plan_reorders_todo_and_supports_fixup() {
+        let a = sample_commit("a", &["base"], "a");
+        let b = sample_commit("b", &["a"], "b");
+        let c = sample_commit("c", &["b"], "c");
+        let commits = vec![c.clone(), b.clone(), a.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: c.hash.clone(),
+            selected_short_hash: c.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::from([(b.hash.clone(), InteractiveRebaseTodoAction::Fixup)]),
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
+            selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        assert!(interactive_rebase_move_hash(
+            &mut dialog.ordered_hashes,
+            &c.hash,
+            &a.hash,
+            true,
+        ));
+        assert_eq!(dialog.ordered_hashes, vec!["c", "a", "b"]);
+        dialog.ordered_hashes = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        // The displayed table is c, b, a. Dropping b above c must make b newest,
+        // which means placing it after c in git's oldest-first todo sequence.
+        assert!(interactive_rebase_move_hash_from_display(
+            &mut dialog.ordered_hashes,
+            &b.hash,
+            &c.hash,
+            true,
+        ));
+        assert_eq!(dialog.ordered_hashes, vec!["a", "c", "b"]);
+        dialog.ordered_hashes = vec!["c".to_owned(), "a".to_owned(), "b".to_owned()];
+        assert!(interactive_rebase_step_hash(
+            &mut dialog.ordered_hashes,
+            &a.hash,
+            true,
+        ));
+        assert_eq!(dialog.ordered_hashes, vec!["c", "b", "a"]);
+        assert!(interactive_rebase_dialog_has_changes(&dialog));
+        assert_eq!(
+            interactive_rebase_todo_items(&dialog, &commits)
+                .iter()
+                .map(|item| (item.hash.as_str(), item.action))
+                .collect::<Vec<_>>(),
+            vec![
+                ("c", git::InteractiveRebaseAction::Pick),
+                ("b", git::InteractiveRebaseAction::Fixup),
+                ("a", git::InteractiveRebaseAction::Pick),
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_rebase_plan_emits_reword_message() {
+        let old = sample_commit("old", &["base"], "old subject");
+        let new = sample_commit("new", &["old"], "new subject");
+        let commits = vec![new.clone(), old.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: new.hash.clone(),
+            selected_short_hash: new.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            actions: BTreeMap::from([(new.hash.clone(), InteractiveRebaseTodoAction::Reword)]),
+            reword_messages: BTreeMap::from([(
+                new.hash.clone(),
+                "new subject rewritten\n\nbody".to_owned(),
+            )]),
+            reword_authors: BTreeMap::from([(
+                new.hash.clone(),
+                InteractiveRebaseAuthor {
+                    name: "Renamed Author".to_owned(),
+                    email: "renamed@example.com".to_owned(),
+                },
+            )]),
+            confirmed_reword_hashes: HashSet::from([new.hash.clone()]),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
+            selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        let todo = interactive_rebase_todo_items(&dialog, &commits);
+        assert_eq!(todo[0].action, git::InteractiveRebaseAction::Pick);
+        assert_eq!(todo[1].action, git::InteractiveRebaseAction::Reword);
+        assert_eq!(
+            todo[1].message.as_deref(),
+            Some("new subject rewritten\n\nbody")
+        );
+        assert_eq!(todo[1].author_name.as_deref(), Some("Renamed Author"));
+        assert_eq!(todo[1].author_email.as_deref(), Some("renamed@example.com"));
+        assert!(interactive_rebase_dialog_has_changes(&dialog));
+        assert_eq!(
+            validate_interactive_rebase_dialog(Language::Chinese, &dialog, &commits),
+            None
+        );
+
+        dialog.confirmed_reword_hashes.clear();
+        assert_eq!(
+            validate_interactive_rebase_dialog(Language::Chinese, &dialog, &commits),
+            Some(
+                i18n::t(
+                    Language::Chinese,
+                    "interactive_rebase.error.reword_unconfirmed"
+                )
+                .to_owned()
+            )
         );
     }
 
@@ -32507,6 +34572,13 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
             selected_hashes: HashSet::from([d.hash.clone(), b.hash.clone(), a.hash.clone()]),
             squash_target_hash: None,
             squash_range_hashes: Vec::new(),
@@ -32571,6 +34643,13 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            reword_messages: BTreeMap::new(),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::new(),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
             selected_hashes: HashSet::from([new.hash.clone(), old.hash.clone()]),
             squash_target_hash: Some(new.hash.clone()),
             squash_range_hashes: Vec::new(),
@@ -32641,6 +34720,63 @@ mod ui_tests {
             "interactive_rebase_squash_target_button_label",
             "interactive_rebase.reset_selected",
             "interactive_rebase_dialog_has_changes(&dialog)",
+        ] {
+            assert!(modal_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn interactive_rebase_action_selector_stays_within_the_history_row() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let row_start = implementation_source
+            .find("let action_rect = Rect::from_min_size(")
+            .unwrap();
+        let row_end = implementation_source[row_start..]
+            .find("let move_up_rect = Rect::from_min_size(")
+            .unwrap();
+        let row_source = &implementation_source[row_start..row_start + row_end];
+        let selector_start = implementation_source
+            .find("fn interactive_rebase_action_dropdown(")
+            .unwrap();
+        let selector_end = implementation_source[selector_start..]
+            .find("fn draw_history_graph_cell(")
+            .unwrap();
+        let selector_source = &implementation_source[selector_start..selector_start + selector_end];
+
+        for required in ["rect.center().y - 10.0", "Vec2::new(100.0, 20.0)"] {
+            assert!(row_source.contains(required), "{required}");
+        }
+        for required in [
+            "popup_below_widget(",
+            "PopupCloseBehavior::CloseOnClickOutside",
+            "Vec2::new(ui.available_width(), 20.0)",
+            "FontId::proportional(11.0)",
+            "memory.close_popup()",
+        ] {
+            assert!(selector_source.contains(required), "{required}");
+        }
+    }
+
+    #[test]
+    fn interactive_rebase_reword_modal_uses_a_self_contained_nested_surface() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let modal_start = implementation_source
+            .find("fn interactive_rebase_reword_modal(")
+            .unwrap();
+        let modal_end = implementation_source[modal_start..]
+            .find("fn rebase_control_modal(")
+            .unwrap();
+        let modal_source = &implementation_source[modal_start..modal_start + modal_end];
+
+        for required in [
+            "Color32::from_black_alpha(136)",
+            ".fill(theme::panel())",
+            ".shadow(panel_shadow())",
+            ".fill(theme::panel_recessed())",
+            "TextEdit::multiline(message)\n                                                .frame(false)",
+            "dialog_cancel_button(",
         ] {
             assert!(modal_source.contains(required), "{required}");
         }
@@ -34571,6 +36707,7 @@ index 1111111,2222222..3333333
     #[test]
     fn diff_selection_supports_copyable_selected_rows() {
         let line = DiffLine {
+            hunk_index: 1,
             left_no: String::new(),
             right_no: "12".to_owned(),
             body: "    let value = 1;".to_owned(),
@@ -34591,6 +36728,38 @@ index 1111111,2222222..3333333
         assert!(diff_row_source.contains("PointerButton::Secondary"));
         assert!(diff_row_source.contains("Color32::from_rgb(82, 168, 236)"));
         assert!(diff_row_source.contains("copy_text(selected_diff_rows_text(selected_rows))"));
+    }
+
+    #[test]
+    fn selected_diff_hunk_patch_keeps_the_file_preamble_and_only_the_selected_hunk() {
+        let diff = "\
+diff --git a/example.txt b/example.txt
+index 1111111..2222222 100644
+--- a/example.txt
++++ b/example.txt
+@@ -1,2 +1,2 @@
+-before
++after
+ context
+@@ -20,2 +20,2 @@
+-old tail
++new tail
+ context tail
+";
+        let selected = collect_unified_diff_items(diff, DiffDisplayMode::Full)
+            .into_iter()
+            .find_map(|item| match item {
+                DiffRenderItem::Line(line) if line.body == "after" => Some(line.key()),
+                _ => None,
+            })
+            .unwrap();
+
+        let patch = selected_diff_hunk_patch(diff, &[selected]).unwrap();
+        assert!(patch.contains("diff --git a/example.txt b/example.txt"));
+        assert!(patch.contains("@@ -1,2 +1,2 @@"));
+        assert!(patch.contains("+after"));
+        assert!(!patch.contains("@@ -20,2 +20,2 @@"));
+        assert!(!patch.contains("+new tail"));
     }
 
     #[test]
@@ -35652,10 +37821,8 @@ diff --git a/file.txt b/file.txt
             .find("fn tag_action_modal(")
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
-        assert!(
-            dialog_source
-                .contains("egui::ComboBox::from_id_salt(\"checkout_remote_branch_selector\")")
-        );
+        assert!(dialog_source.contains("searchable_branch_dropdown("));
+        assert!(dialog_source.contains("checkout_remote_branch_selector"));
         assert!(dialog_source.contains("placeholder_for_label("));
         assert!(dialog_source.contains("themed_singleline_text_edit("));
         assert!(dialog_source.contains("local_branch,"));
@@ -35663,6 +37830,22 @@ diff --git a/file.txt b/file.txt
         assert!(dialog_source.contains("track_remote,"));
         assert!(dialog_source.contains("validate_checkout_new_branch("));
         assert!(dialog_source.contains("checkout.track_remote"));
+
+        let dropdown_start = implementation_source
+            .find("fn searchable_branch_dropdown(")
+            .unwrap();
+        let dropdown_end = implementation_source[dropdown_start..]
+            .find("fn git_flow_start_point_row(")
+            .unwrap();
+        let dropdown_source = &implementation_source[dropdown_start..dropdown_start + dropdown_end];
+        for required in [
+            "PopupCloseBehavior::CloseOnClickOutside",
+            "memory.request_focus(filter_input_id)",
+            "memory.close_popup()",
+            "paint_branch_dropdown_search_inset_shadow",
+        ] {
+            assert!(dropdown_source.contains(required), "{required}");
+        }
     }
 
     #[test]

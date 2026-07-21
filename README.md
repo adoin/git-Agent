@@ -10,6 +10,14 @@ cargo build --release
 
 Release binaries are produced in `target/release/`.
 
+## Local Development
+
+Start the local watcher and desktop app from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
+```
+
 ## GitHub Actions
 
 Pushing a `v*` tag runs the `Build` workflow for Linux, macOS, and Windows. Each job runs tests, builds release binaries, and uploads one installer package for that platform.

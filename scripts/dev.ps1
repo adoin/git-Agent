@@ -6,7 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
 Set-Location $root
 
 $stateDir = Join-Path $root "target\dev-watch"
@@ -58,13 +59,13 @@ function Stop-ExistingRunner {
 function Stop-MainWindow {
     if ($script:mainProcess -and -not $script:mainProcess.HasExited) {
         Write-DevLog "stop git-agent pid=$($script:mainProcess.Id)"
-        Stop-Process -Id $script:mainProcess.Id -Force -ErrorAction SilentlyContinue
+        Stop-ProcessTree -ProcessId $script:mainProcess.Id
     }
 
     Get-Process -Name "git-agent" -ErrorAction SilentlyContinue |
         ForEach-Object {
             Write-DevLog "stop stray git-agent pid=$($_.Id)"
-            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree -ProcessId $_.Id
         }
 }
 

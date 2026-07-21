@@ -2,7 +2,7 @@ use std::fs;
 
 #[test]
 fn dev_script_stops_running_app_before_building_bins() {
-    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.ps1");
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
     let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
     let restart_start = script
         .find("function Restart-DevApp")
@@ -45,11 +45,18 @@ fn dev_script_stops_running_app_before_building_bins() {
         stop_main_body.contains("Write-DevLog \"stop git-agent pid=$($script:mainProcess.Id)\"")
     );
     assert!(stop_main_body.contains("Write-DevLog \"stop stray git-agent pid=$($_.Id)\""));
+    assert_eq!(
+        stop_main_body
+            .matches("Stop-ProcessTree -ProcessId")
+            .count(),
+        2,
+        "hot reload must stop git-agent and every child Git process before rebuilding"
+    );
 }
 
 #[test]
 fn dev_script_logs_started_app_pid_and_exit_code() {
-    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.ps1");
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
     let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
 
     assert!(script.contains("function Test-MainWindowExit"));

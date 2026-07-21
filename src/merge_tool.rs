@@ -193,6 +193,8 @@ struct MergeScrollOffsets {
 struct MergeEditSnapshot {
     document: MergeDocument,
     result_text: String,
+    manual_result_lines: Vec<String>,
+    manual_result_override: bool,
     local_conflict_cursor: usize,
     remote_conflict_cursor: usize,
 }
@@ -390,12 +392,10 @@ fn push_merge_region(
 ) {
     let local_start =
         side_position_for_base_position(local_changes, base_start, MergeBoundaryBias::Before);
-    let local_end =
-        side_position_for_base_position(local_changes, base_end, MergeBoundaryBias::After);
+    let local_end = side_end_position_for_merge_region(local_changes, base_start, base_end);
     let remote_start =
         side_position_for_base_position(remote_changes, base_start, MergeBoundaryBias::Before);
-    let remote_end =
-        side_position_for_base_position(remote_changes, base_end, MergeBoundaryBias::After);
+    let remote_end = side_end_position_for_merge_region(remote_changes, base_start, base_end);
     let base_slice = &base_lines[base_start..base_end];
     let local_slice = &local_lines[local_start..local_end];
     let remote_slice = &remote_lines[remote_start..remote_end];
@@ -414,6 +414,29 @@ fn push_merge_region(
     }
 
     push_conflict_region(lines, conflicts, base_slice, local_slice, remote_slice);
+}
+
+/// A zero-width insertion at a non-empty region's trailing boundary belongs to
+/// the next merge region. Including it here turns an independent delete plus
+/// insertion into a false conflict.
+fn side_end_position_for_merge_region(
+    changes: &[MergeChange],
+    base_start: usize,
+    base_end: usize,
+) -> usize {
+    let trailing_insertion = base_start < base_end
+        && changes
+            .iter()
+            .any(|change| change.base_start == base_end && change.base_start == change.base_end);
+    side_position_for_base_position(
+        changes,
+        base_end,
+        if trailing_insertion {
+            MergeBoundaryBias::Before
+        } else {
+            MergeBoundaryBias::After
+        },
+    )
 }
 
 fn push_resolved_lines(lines: &mut Vec<MergeLine>, result_lines: &[String]) {
@@ -876,6 +899,8 @@ pub struct MergeToolApp {
     initial_document: MergeDocument,
     document: MergeDocument,
     result_text: String,
+    manual_result_lines: Vec<String>,
+    manual_result_override: bool,
     shared_scroll_y: f32,
     local_conflict_cursor: usize,
     remote_conflict_cursor: usize,
@@ -900,6 +925,10 @@ impl MergeToolApp {
 
     pub fn new(args: MergeArgs, document: MergeDocument) -> Self {
         let result_text = document.result_text();
+        let manual_result_lines = merge_result_display_rows(&document)
+            .into_iter()
+            .map(|row| row.text.to_owned())
+            .collect();
         let initial_document = document.clone();
         Self {
             theme: args.theme,
@@ -908,6 +937,8 @@ impl MergeToolApp {
             initial_document,
             document,
             result_text,
+            manual_result_lines,
+            manual_result_override: false,
             shared_scroll_y: 0.0,
             local_conflict_cursor: 0,
             remote_conflict_cursor: 0,
@@ -968,6 +999,8 @@ impl MergeToolApp {
         MergeEditSnapshot {
             document: self.document.clone(),
             result_text: self.result_text.clone(),
+            manual_result_lines: self.manual_result_lines.clone(),
+            manual_result_override: self.manual_result_override,
             local_conflict_cursor: self.local_conflict_cursor,
             remote_conflict_cursor: self.remote_conflict_cursor,
         }
@@ -976,6 +1009,8 @@ impl MergeToolApp {
     fn restore_snapshot(&mut self, snapshot: MergeEditSnapshot) {
         self.document = snapshot.document;
         self.result_text = snapshot.result_text;
+        self.manual_result_lines = snapshot.manual_result_lines;
+        self.manual_result_override = snapshot.manual_result_override;
         self.local_conflict_cursor = snapshot.local_conflict_cursor;
         self.remote_conflict_cursor = snapshot.remote_conflict_cursor;
     }
@@ -989,6 +1024,23 @@ impl MergeToolApp {
 
     fn has_unsaved_edits(&self) -> bool {
         self.document != self.initial_document
+            || self.result_text != self.initial_document.result_text()
+    }
+
+    fn unresolved_conflict_count(&self) -> usize {
+        if self.manual_result_override {
+            0
+        } else {
+            self.document.unresolved_conflict_count()
+        }
+    }
+
+    fn unresolved_conflict_count_for_side(&self, side: MergeSide) -> usize {
+        if self.manual_result_override {
+            0
+        } else {
+            self.document.unresolved_conflict_count_for_side(side)
+        }
     }
 
     fn can_undo(&self) -> bool {
@@ -1000,7 +1052,7 @@ impl MergeToolApp {
     }
 
     fn can_apply_result(&self) -> bool {
-        self.write_task.is_none() && self.document.unresolved_conflict_count() == 0
+        self.write_task.is_none() && self.unresolved_conflict_count() == 0
     }
 
     fn undo(&mut self) -> bool {
@@ -1064,6 +1116,9 @@ impl MergeToolApp {
     }
 
     fn accept_conflict(&mut self, side: MergeSide) {
+        if self.manual_result_override {
+            return;
+        }
         let before = self.snapshot();
         let index = match side {
             MergeSide::Local => self.local_conflict_cursor,
@@ -1071,6 +1126,7 @@ impl MergeToolApp {
         };
         self.document.apply_conflict(index, side);
         self.result_text = self.document.result_text();
+        self.reset_manual_result_lines();
         let conflict_count = self.document.conflicts().len();
         if conflict_count > 0 {
             self.local_conflict_cursor = (self.local_conflict_cursor + 1).min(conflict_count - 1);
@@ -1085,6 +1141,9 @@ impl MergeToolApp {
         side: MergeSide,
         action: MergeLineAction,
     ) {
+        if self.manual_result_override {
+            return;
+        }
         let before = self.snapshot();
         match (target, action) {
             (MergeLineActionTarget::Conflict(index), MergeLineAction::Take) => {
@@ -1101,6 +1160,26 @@ impl MergeToolApp {
             }
         }
         self.result_text = self.document.result_text();
+        self.reset_manual_result_lines();
+        self.finish_document_edit(before);
+    }
+
+    fn reset_manual_result_lines(&mut self) {
+        if self.manual_result_override {
+            return;
+        }
+        self.manual_result_lines = merge_result_display_rows(&self.document)
+            .into_iter()
+            .map(|row| row.text.to_owned())
+            .collect();
+    }
+
+    fn finish_manual_result_edit(&mut self, before: MergeEditSnapshot) {
+        self.manual_result_override = true;
+        self.result_text = self.manual_result_lines.join("\n");
+        if !self.result_text.is_empty() {
+            self.result_text.push('\n');
+        }
         self.finish_document_edit(before);
     }
 
@@ -1123,7 +1202,7 @@ impl MergeToolApp {
         if self.write_task.is_some() {
             return;
         }
-        if self.document.unresolved_conflict_count() > 0 {
+        if self.unresolved_conflict_count() > 0 {
             self.status = Some(mt(self.language, "resolve_all_conflicts").to_owned());
             return;
         }
@@ -1244,7 +1323,7 @@ fn parse_language(value: &str) -> anyhow::Result<MergeLanguage> {
 const MERGE_COLUMN_GAP: f32 = 12.0;
 
 fn merge_toolbar(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
-    let unresolved_conflicts = app.document.unresolved_conflict_count();
+    let unresolved_conflicts = app.unresolved_conflict_count();
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(
@@ -1307,10 +1386,22 @@ fn merge_footer(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(14.0);
-        if ui.button(mt(app.language, "accept_left")).clicked() {
+        if ui
+            .add_enabled(
+                !app.manual_result_override,
+                egui::Button::new(mt(app.language, "accept_left")),
+            )
+            .clicked()
+        {
             app.accept_conflict(MergeSide::Local);
         }
-        if ui.button(mt(app.language, "accept_right")).clicked() {
+        if ui
+            .add_enabled(
+                !app.manual_result_override,
+                egui::Button::new(mt(app.language, "accept_right")),
+            )
+            .clicked()
+        {
             app.accept_conflict(MergeSide::Remote);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1506,7 +1597,7 @@ fn merge_side_panel(
                         row.conflict_index,
                         row.side_resolved,
                         row.tone,
-                        row.show_conflict_actions,
+                        row.show_conflict_actions && !app.manual_result_override,
                         row.action_target,
                         row.base_only_gap_rows,
                         cursor,
@@ -1514,15 +1605,17 @@ fn merge_side_panel(
                         &mut pending_line_action,
                     );
                 }
-                paint_base_only_side_overlays(
-                    ui,
-                    &app.document,
-                    side,
-                    panel_rect,
-                    scroll_y,
-                    palette,
-                    &mut pending_line_action,
-                );
+                if !app.manual_result_override {
+                    paint_base_only_side_overlays(
+                        ui,
+                        &app.document,
+                        side,
+                        panel_rect,
+                        scroll_y,
+                        palette,
+                        &mut pending_line_action,
+                    );
+                }
             });
         if let Some((index, action)) = pending_line_action {
             app.apply_line_action(index, side, action);
@@ -1548,7 +1641,7 @@ fn merge_result_panel(
 ) -> f32 {
     let mut next_scroll_y = scroll_y;
     merge_panel_frame(ui, palette, |ui| {
-        side_header(ui, mt(app.language, "result"), &app.args.output, palette);
+        result_header(ui, app, palette);
         merge_result_nav_spacer(ui);
         ui.add_space(8.0);
         let output = ScrollArea::vertical()
@@ -1558,26 +1651,45 @@ fn merge_result_panel(
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_min_width(ui.available_width());
-                let rows = merge_result_display_rows(&app.document);
-                for (result_index, result_line) in rows.iter().enumerate() {
-                    merge_result_row(ui, result_index, result_line, palette);
+                let before = app.snapshot();
+                let mut changed = false;
+                if app.manual_result_lines.is_empty() {
+                    app.manual_result_lines
+                        .push(mt(app.language, "result_placeholder").to_owned());
                 }
-                if rows.is_empty() {
-                    merge_result_row(
-                        ui,
-                        0,
-                        &MergeResultDisplayRow {
-                            text: mt(app.language, "result_placeholder"),
-                            conflict_index: None,
-                            tone: MergeSideLineTone::Unchanged,
-                        },
-                        palette,
-                    );
+                for (result_index, result_line) in app.manual_result_lines.iter_mut().enumerate() {
+                    changed |= merge_editable_result_row(ui, result_index, result_line, palette);
+                }
+                if changed {
+                    app.finish_manual_result_edit(before);
                 }
             });
         next_scroll_y = output.state.offset.y;
     });
     next_scroll_y
+}
+
+fn result_header(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalette) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let title_w = 118.0;
+    ui.painter().text(
+        Pos2::new(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        mt(app.language, "result"),
+        FontId::proportional(13.0),
+        palette.text,
+    );
+    let path_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + title_w, rect.top()),
+        rect.right_bottom(),
+    );
+    ui.painter().with_clip_rect(path_rect).text(
+        path_rect.left_center(),
+        Align2::LEFT_CENTER,
+        app.args.output.display().to_string(),
+        FontId::monospace(12.0),
+        palette.muted,
+    );
 }
 
 fn merge_result_nav_spacer(ui: &mut Ui) {
@@ -1612,7 +1724,7 @@ fn side_header(ui: &mut Ui, title: &str, path: &Path, palette: MergePalette) {
 
 fn side_conflict_nav(ui: &mut Ui, app: &mut MergeToolApp, side: MergeSide, palette: MergePalette) {
     ui.horizontal(|ui| {
-        let conflict_count = app.document.unresolved_conflict_count_for_side(side);
+        let conflict_count = app.unresolved_conflict_count_for_side(side);
         let mut cursor = match side {
             MergeSide::Local => app.local_conflict_cursor,
             MergeSide::Remote => app.remote_conflict_cursor,
@@ -1628,14 +1740,12 @@ fn side_conflict_nav(ui: &mut Ui, app: &mut MergeToolApp, side: MergeSide, palet
             MergeSide::Local => app.local_conflict_cursor = cursor,
             MergeSide::Remote => app.remote_conflict_cursor = cursor,
         }
-        ui.label(
-            RichText::new(format!(
-                "{} / {}",
-                unresolved_position(&app.document, side, cursor),
-                conflict_count
-            ))
-            .color(palette.muted),
-        );
+        let position = if app.manual_result_override {
+            0
+        } else {
+            unresolved_position(&app.document, side, cursor)
+        };
+        ui.label(RichText::new(format!("{} / {}", position, conflict_count)).color(palette.muted));
     });
 }
 
@@ -2158,24 +2268,18 @@ fn collapse_replacement_rows<'a>(rows: Vec<MergeSideDiffRow<'a>>) -> Vec<MergeSi
     collapsed
 }
 
-fn merge_result_row(
+fn merge_editable_result_row(
     ui: &mut Ui,
     index: usize,
-    row: &MergeResultDisplayRow<'_>,
+    text: &mut String,
     palette: MergePalette,
-) {
+) -> bool {
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), MERGE_CODE_ROW_HEIGHT),
         Sense::hover(),
     );
-    let fill = match row.tone {
-        MergeSideLineTone::Unchanged => palette.result_fill,
-        MergeSideLineTone::Added => palette.added_fill,
-        MergeSideLineTone::BaseOnly => palette.base_only_fill,
-        MergeSideLineTone::Deleted | MergeSideLineTone::Replaced => palette.conflict_fill,
-    };
     ui.painter()
-        .rect_filled(rect, egui::CornerRadius::ZERO, fill);
+        .rect_filled(rect, egui::CornerRadius::ZERO, palette.result_fill);
     ui.painter().text(
         Pos2::new(rect.left() + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -2187,23 +2291,16 @@ fn merge_result_row(
         Pos2::new(rect.left() + 62.0, rect.top()),
         rect.right_bottom(),
     );
-    ui.painter().with_clip_rect(text_rect).text(
-        text_rect.left_center(),
-        Align2::LEFT_CENTER,
-        row.text,
-        FontId::monospace(MERGE_CODE_FONT_SIZE),
-        if row.text == mt(MergeLanguage::English, "result_placeholder")
-            || row.text == mt(MergeLanguage::Chinese, "result_placeholder")
-        {
-            palette.muted
-        } else if row.tone == MergeSideLineTone::BaseOnly {
-            palette.base_only_text
-        } else if row.conflict_index.is_some() && row.tone != MergeSideLineTone::Unchanged {
-            palette.conflict_text
-        } else {
-            palette.text
-        },
-    );
+    ui.put(
+        text_rect,
+        egui::TextEdit::singleline(text)
+            .id_salt(("merge_result_line", index))
+            .frame(false)
+            .font(FontId::monospace(MERGE_CODE_FONT_SIZE))
+            .text_color(palette.text)
+            .desired_width(text_rect.width()),
+    )
+    .changed()
 }
 
 #[cfg(test)]
@@ -3215,6 +3312,11 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
             "\u{4e22}\u{5f03}\u{66f4}\u{6539}\u{5e76}\u{53d6}\u{6d88}\u{5408}\u{5e76}"
         }
         (MergeLanguage::Chinese, "cancel_merge_continue") => "\u{7ee7}\u{7eed}\u{5408}\u{5e76}",
+        (MergeLanguage::Chinese, "edit_result") => "\u{7f16}\u{8f91}\u{7ed3}\u{679c}",
+        (MergeLanguage::Chinese, "editing_result") => "\u{6b63}\u{5728}\u{7f16}\u{8f91}",
+        (MergeLanguage::Chinese, "manual_result_hint") => {
+            "\u{624b}\u{52a8}\u{7f16}\u{8f91}\u{540e}\u{5c06}\u{4ee5}\u{4e2d}\u{95f4}\u{7ed3}\u{679c}\u{4e3a}\u{51c6}"
+        }
         (_, "title") => "Merge Revisions",
         (_, "conflicts") => "conflict(s)",
         (_, "auto_applied") => "Non-conflicting changes auto-applied",
@@ -3240,6 +3342,11 @@ fn mt(language: MergeLanguage, key: &str) -> &'static str {
         }
         (_, "cancel_merge_discard") => "Discard Changes and Cancel Merge",
         (_, "cancel_merge_continue") => "Continue Merge",
+        (_, "edit_result") => "Edit Result",
+        (_, "editing_result") => "Editing",
+        (_, "manual_result_hint") => {
+            "Manual edits resolve the remaining conflicts from this result."
+        }
         _ => "",
     }
 }
@@ -3266,6 +3373,9 @@ mod tests {
         let source = include_str!("merge_tool.rs");
 
         assert!(source.contains("mt(app.language, \"result_placeholder\")"));
+        assert!(source.contains("TextEdit::singleline(text)"));
+        assert!(source.contains("merge_editable_result_row"));
+        assert!(source.contains("manual_result_override"));
         assert_eq!(
             mt(MergeLanguage::Chinese, "result_placeholder"),
             "\u{8bf7}\u{8f93}\u{5165}\u{5408}\u{5e76}\u{7ed3}\u{679c}"
@@ -3274,6 +3384,53 @@ mod tests {
             mt(MergeLanguage::English, "result_placeholder"),
             "Enter merge result"
         );
+    }
+
+    #[test]
+    fn manual_result_edit_resolves_conflicts_and_is_undoable() {
+        let document = three_way_merge(
+            "keep\nbase\nend\n",
+            "keep\nlocal\nend\n",
+            "keep\nremote\nend\n",
+        );
+        let mut app = MergeToolApp::new(test_merge_args(), document);
+
+        assert_eq!(app.unresolved_conflict_count(), 1);
+        assert!(!app.can_apply_result());
+
+        let before = app.snapshot();
+        app.manual_result_lines = vec![
+            "keep".to_owned(),
+            "manual result".to_owned(),
+            "end".to_owned(),
+        ];
+        app.finish_manual_result_edit(before);
+
+        assert!(app.manual_result_override);
+        assert_eq!(app.unresolved_conflict_count(), 0);
+        assert!(app.can_apply_result());
+        assert_eq!(app.result_text, "keep\nmanual result\nend\n");
+
+        assert!(app.undo());
+        assert!(!app.manual_result_override);
+        assert_eq!(app.unresolved_conflict_count(), 1);
+        assert!(!app.can_apply_result());
+
+        assert!(app.redo());
+        assert!(app.manual_result_override);
+        assert_eq!(app.result_text, "keep\nmanual result\nend\n");
+    }
+
+    #[test]
+    fn deleting_a_base_line_and_adding_after_it_on_the_other_side_auto_merges() {
+        let document = three_way_merge(
+            "base\nalpha change\n",
+            "base\n",
+            "base\nalpha change\nbeta change\n",
+        );
+
+        assert_eq!(document.unresolved_conflict_count(), 0);
+        assert_eq!(document.result_text(), "base\nbeta change\n");
     }
 
     #[test]

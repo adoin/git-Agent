@@ -1351,13 +1351,16 @@ name = "git-agent"
 version = "1.0.4"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "eframe",
  "egui_extras",
+ "raw-window-handle",
  "rfd",
  "semver",
  "serde",
  "serde_json",
  "ureq",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

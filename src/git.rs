@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 
 use crate::patch::numbered_patch_paths;
@@ -64,6 +65,8 @@ pub struct Commit {
     pub short_hash: String,
     pub parents: Vec<String>,
     pub author: String,
+    #[serde(default)]
+    pub author_email: String,
     pub date: String,
     pub relative_time: String,
     pub subject: String,
@@ -204,6 +207,8 @@ pub struct RepositorySnapshot {
     pub merge_message: Option<String>,
     #[serde(default)]
     pub rebase_in_progress: bool,
+    #[serde(default)]
+    pub rebase_editing: bool,
     pub upstream: Option<UpstreamStatus>,
     pub branches: Vec<Branch>,
     pub remotes: Vec<Remote>,
@@ -220,6 +225,56 @@ pub struct RepositorySnapshot {
     pub config: RepositoryConfig,
     #[serde(default)]
     pub git_flow_config: Option<GitFlowConfig>,
+}
+
+/// A minimal repository position used by the application-level safe undo journal.
+/// It deliberately excludes remotes and uncommitted content: those need action-specific
+/// recovery rather than a destructive generic reset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryUndoPosition {
+    pub branch: Option<String>,
+    pub head: String,
+    pub status: String,
+}
+
+pub fn repository_undo_position(root: impl AsRef<Path>) -> Result<RepositoryUndoPosition> {
+    let root = root.as_ref();
+    let head = git_output(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let branch = git_output(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|branch| branch.trim().to_owned())
+        .filter(|branch| !branch.is_empty());
+    let status = git_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+
+    Ok(RepositoryUndoPosition {
+        branch,
+        head,
+        status,
+    })
+}
+
+pub fn repository_has_worktree_changes(position: &RepositoryUndoPosition) -> bool {
+    position.status.lines().any(|line| {
+        let bytes = line.as_bytes();
+        bytes.get(1).is_some_and(|status| *status != b' ')
+    })
+}
+
+pub fn restore_repository_undo_position(
+    root: impl AsRef<Path>,
+    position: &RepositoryUndoPosition,
+) -> Result<()> {
+    let root = root.as_ref();
+    if let Some(branch) = position.branch.as_deref() {
+        git_output(root, &["checkout", branch])?;
+    } else {
+        git_output(root, &["checkout", "--detach", &position.head])?;
+    }
+    git_output(root, &["reset", "--hard", &position.head]).map(|_| ())
+}
+
+pub fn cached_binary_diff(root: impl AsRef<Path>) -> Result<String> {
+    git_output(root.as_ref(), &["diff", "--cached", "--binary"])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,8 +332,9 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     let remotes = load_remotes(&root).unwrap_or_default();
     let config = load_repository_config(&root);
     let git_flow_config = read_git_flow_config(&root).unwrap_or_default();
-    let merge_message = load_merge_message(&root, &branch);
     let rebase_in_progress = rebase_in_progress(&root);
+    let rebase_editing = rebase_edit_in_progress(&root);
+    let merge_message = load_merge_message(&root, &branch);
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
@@ -313,6 +369,7 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         branch,
         merge_message,
         rebase_in_progress,
+        rebase_editing,
         upstream,
         branches,
         remotes,
@@ -1551,13 +1608,34 @@ pub fn rebase_abort(root: impl AsRef<Path>) -> Result<()> {
     rebase_control(root.as_ref(), "--abort")
 }
 
+pub fn rebase_amend(root: impl AsRef<Path>) -> Result<()> {
+    let root = root.as_ref();
+    if !rebase_edit_in_progress(root) {
+        return Err(anyhow!(
+            "interactive rebase is not paused for commit editing"
+        ));
+    }
+    git_output(root, &["commit", "--amend", "--no-edit"]).map(|_| ())
+}
+
 fn rebase_control(root: &Path, action: &str) -> Result<()> {
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(root)
-        .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
-        .args(["rebase", action])
+        .args(["rebase", action]);
+
+    if action == "--continue" {
+        command.env(
+            "GIT_EDITOR",
+            interactive_rebase_message_editor_command(root).unwrap_or_else(|| "true".to_owned()),
+        );
+    } else {
+        command.env("GIT_EDITOR", "true");
+    }
+
+    let output = command
         .output()
         .with_context(|| format!("failed to run git rebase {action}"))?;
 
@@ -1568,13 +1646,20 @@ fn rebase_control(root: &Path, action: &str) -> Result<()> {
         return Err(anyhow!("git rebase {action} failed: {detail}"));
     }
 
+    if action == "--abort" || !rebase_in_progress(root) {
+        clear_interactive_rebase_state(root);
+    }
+
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InteractiveRebaseAction {
     Pick,
+    Reword,
+    Edit,
     Squash,
+    Fixup,
     Drop,
 }
 
@@ -1582,7 +1667,12 @@ impl InteractiveRebaseAction {
     fn todo_command(self) -> &'static str {
         match self {
             Self::Pick => "pick",
+            // Reword via an explicit amend keeps intentionally empty commits editable.
+            // Git's built-in `reword` stops before opening the editor for those commits.
+            Self::Reword => "pick",
+            Self::Edit => "edit",
             Self::Squash => "squash",
+            Self::Fixup => "fixup",
             Self::Drop => "drop",
         }
     }
@@ -1593,6 +1683,9 @@ pub struct InteractiveRebaseTodoItem {
     pub action: InteractiveRebaseAction,
     pub hash: String,
     pub subject: String,
+    pub message: Option<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
 }
 
 fn interactive_rebase_todo(items: &[InteractiveRebaseTodoItem]) -> String {
@@ -1607,8 +1700,44 @@ fn interactive_rebase_todo(items: &[InteractiveRebaseTodoItem]) -> String {
             todo.push_str(subject.trim());
         }
         todo.push('\n');
+        if let Some(command) = interactive_rebase_reword_amend_command(item) {
+            todo.push_str("exec ");
+            todo.push_str(&command);
+            todo.push('\n');
+        }
     }
     todo
+}
+
+fn interactive_rebase_reword_amend_command(item: &InteractiveRebaseTodoItem) -> Option<String> {
+    if item.action != InteractiveRebaseAction::Reword {
+        return None;
+    }
+
+    match (item.author_name.as_deref(), item.author_email.as_deref()) {
+        (Some(name), Some(email)) => {
+            let name = name.trim();
+            let email = email.trim();
+            if name.is_empty()
+                || email.is_empty()
+                || name.contains(['\r', '\n'])
+                || email.contains(['\r', '\n'])
+            {
+                return None;
+            }
+            Some(format!(
+                "git -c user.name={} -c user.email={} commit --amend --allow-empty --reset-author",
+                shell_single_quote(name),
+                shell_single_quote(email),
+            ))
+        }
+        (None, None) => Some("git commit --amend --allow-empty".to_owned()),
+        _ => None,
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub fn interactive_rebase(
@@ -1630,20 +1759,50 @@ pub fn interactive_rebase(
     if items.is_empty() {
         return Err(anyhow!("interactive rebase requires at least one commit"));
     }
-    if items
-        .first()
-        .is_some_and(|item| item.action == InteractiveRebaseAction::Squash)
-    {
-        return Err(anyhow!("first interactive rebase commit cannot be squash"));
+    if items.first().is_some_and(|item| {
+        matches!(
+            item.action,
+            InteractiveRebaseAction::Squash | InteractiveRebaseAction::Fixup
+        )
+    }) {
+        return Err(anyhow!(
+            "first interactive rebase commit cannot be squash or fixup"
+        ));
+    }
+    if items.iter().any(|item| {
+        item.action == InteractiveRebaseAction::Reword
+            && item
+                .message
+                .as_deref()
+                .is_none_or(|message| message.trim().is_empty())
+    }) {
+        return Err(anyhow!(
+            "interactive rebase reword requires a commit message"
+        ));
+    }
+    if items.iter().any(|item| {
+        let name = item.author_name.as_deref();
+        let email = item.author_email.as_deref();
+        name.is_some() != email.is_some()
+            || name.is_some_and(|value| value.trim().is_empty() || value.contains(['\r', '\n']))
+            || email.is_some_and(|value| value.trim().is_empty() || value.contains(['\r', '\n']))
+    }) {
+        return Err(anyhow!(
+            "interactive rebase author override requires a non-empty name and email"
+        ));
     }
 
-    let temp_dir = interactive_rebase_temp_dir();
-    fs::create_dir_all(&temp_dir).context("failed to create interactive rebase temp dir")?;
-    let todo_path = temp_dir.join("git-rebase-todo");
+    let state_dir = interactive_rebase_state_dir(root)?;
+    let _ = fs::remove_dir_all(&state_dir);
+    fs::create_dir_all(&state_dir)
+        .context("failed to create interactive rebase state directory")?;
+    let todo_path = state_dir.join("git-rebase-todo");
     fs::write(&todo_path, interactive_rebase_todo(items))
         .context("failed to write interactive rebase todo")?;
-    let sequence_editor = write_rebase_sequence_editor(&temp_dir, &todo_path)?;
-    let editor = write_rebase_noop_editor(&temp_dir)?;
+    let sequence_editor = write_rebase_sequence_editor(&state_dir, &todo_path)?;
+    let editor = write_rebase_message_editor(&state_dir, items)?;
+    fs::write(state_dir.join("message-editor-command"), &editor)
+        .context("failed to persist interactive rebase message editor")?;
 
     let mut command = git_command();
     command
@@ -1651,7 +1810,7 @@ pub fn interactive_rebase(
         .arg(root)
         .env("GIT_SEQUENCE_EDITOR", sequence_editor)
         .env("GIT_EDITOR", editor)
-        .args(["rebase", "-i", "--autosquash"]);
+        .args(["rebase", "-i", "--autosquash", "--empty=keep"]);
     if base == "--root" {
         command.arg("--root");
     } else {
@@ -1660,21 +1819,123 @@ pub fn interactive_rebase(
 
     let output = command
         .output()
-        .with_context(|| format!("failed to run git rebase -i --autosquash {base}"))?;
-    let _ = fs::remove_dir_all(&temp_dir);
+        .with_context(|| format!("failed to run git rebase -i --autosquash --empty=keep {base}"))?;
+    if output.status.success() || !rebase_in_progress(root) {
+        clear_interactive_rebase_state(root);
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let detail = if stderr.is_empty() { stdout } else { stderr };
         return Err(anyhow!(
-            "git rebase -i --autosquash {} failed: {}",
+            "git rebase -i --autosquash --empty=keep {} failed: {}",
             base,
             detail
         ));
     }
 
     Ok(())
+}
+
+fn rebase_reword_messages(items: &[InteractiveRebaseTodoItem]) -> Vec<(&str, &str, String)> {
+    items
+        .iter()
+        .filter(|item| item.action == InteractiveRebaseAction::Reword)
+        .filter_map(|item| {
+            item.message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(|message| {
+                    (
+                        item.hash.as_str(),
+                        item.subject.as_str(),
+                        format!("{message}\n"),
+                    )
+                })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn write_rebase_message_editor(dir: &Path, items: &[InteractiveRebaseTodoItem]) -> Result<String> {
+    let messages = rebase_reword_messages(items);
+    if messages.is_empty() {
+        return write_rebase_noop_editor(dir);
+    }
+
+    let script_path = dir.join("message-editor.ps1");
+    let map_entries = messages
+        .iter()
+        .map(|(_, subject, message)| {
+            format!(
+                "    [pscustomobject]@{{ Subject = '{}'; Message = '{}' }}",
+                BASE64.encode(subject.as_bytes()),
+                BASE64.encode(message.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    fs::write(
+        &script_path,
+        format!(
+            "$messages = @(\r\n{map_entries}\r\n)\r\n$current = [System.IO.File]::ReadAllText($args[0])\r\nforeach ($entry in $messages) {{\r\n  $subject = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entry.Subject))\r\n  if ($current.Contains($subject)) {{\r\n    $text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($entry.Message))\r\n    [System.IO.File]::WriteAllText($args[0], $text, (New-Object System.Text.UTF8Encoding($false)))\r\n    break\r\n  }}\r\n}}\r\nexit 0\r\n"
+        ),
+    )
+    .context("failed to write interactive rebase message editor")?;
+    Ok(format!(
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+        script_path.display()
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_rebase_message_editor(dir: &Path, items: &[InteractiveRebaseTodoItem]) -> Result<String> {
+    let messages = rebase_reword_messages(items);
+    if messages.is_empty() {
+        return write_rebase_noop_editor(dir);
+    }
+
+    let script_path = dir.join("message-editor.sh");
+    let cases = messages
+        .iter()
+        .map(|(_, subject, message)| {
+            format!(
+                "  *\"$(printf '%s' '{}' | base64 -d)\"*) printf '%s' '{}' | base64 -d > \"$1\" ;;",
+                BASE64.encode(subject.as_bytes()),
+                BASE64.encode(message.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncurrent=$(cat \"$1\")\ncase \"$current\" in\n{cases}\nesac\nexit 0\n"),
+    )
+    .context("failed to write interactive rebase message editor")?;
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .context("failed to mark interactive rebase message editor executable")?;
+    Ok(script_path.to_string_lossy().to_string())
+}
+
+fn interactive_rebase_state_dir(root: &Path) -> Result<PathBuf> {
+    git_path(root, "git-agent-interactive-rebase")
+        .ok_or_else(|| anyhow!("failed to resolve interactive rebase state directory"))
+}
+
+fn interactive_rebase_message_editor_command(root: &Path) -> Option<String> {
+    let state_dir = interactive_rebase_state_dir(root).ok()?;
+    fs::read_to_string(state_dir.join("message-editor-command"))
+        .ok()
+        .map(|command| command.trim().to_owned())
+        .filter(|command| !command.is_empty())
+}
+
+fn clear_interactive_rebase_state(root: &Path) {
+    if let Ok(state_dir) = interactive_rebase_state_dir(root) {
+        let _ = fs::remove_dir_all(state_dir);
+    }
 }
 
 fn interactive_rebase_temp_dir() -> PathBuf {
@@ -2444,6 +2705,40 @@ pub fn apply_patch(root: impl AsRef<Path>, patch_path: impl AsRef<Path>) -> Resu
     ))
 }
 
+/// Apply the inverse of a unified patch to the working tree. The caller keeps
+/// the patch in memory so history-diff actions do not leave patch files behind.
+pub fn revert_patch_text(root: impl AsRef<Path>, patch: &str) -> Result<()> {
+    let root = root.as_ref();
+    if patch.trim().is_empty() {
+        anyhow::bail!("cannot revert an empty patch");
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let patch_path = env::temp_dir().join(format!(
+        "git-agent-revert-hunk-{}-{nonce}.patch",
+        std::process::id()
+    ));
+    fs::write(&patch_path, patch)
+        .with_context(|| format!("write temporary patch {}", patch_path.display()))?;
+
+    let patch_arg = patch_path.to_string_lossy().to_string();
+    let result = git_output(
+        root,
+        &[
+            "apply",
+            "--reverse",
+            "--whitespace=nowarn",
+            patch_arg.as_str(),
+        ],
+    )
+    .map(|_| ());
+    let _ = fs::remove_file(&patch_path);
+    result
+}
+
 pub fn add_to_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<()> {
     let root = root.as_ref();
     let pattern = normalize_gitignore_pattern(pattern);
@@ -2969,6 +3264,11 @@ fn load_remotes(root: &Path) -> Result<Vec<Remote>> {
 }
 
 fn load_merge_message(root: &Path, current_branch: &str) -> Option<String> {
+    // MERGE_MSG can survive an old operation. It is a commit default only
+    // while Git confirms an actual merge is still in progress.
+    if !merge_in_progress(root) {
+        return None;
+    }
     let path = git_path(root, "MERGE_MSG")?;
     let message = fs::read_to_string(path).ok()?;
     let message = message.trim_end().to_owned();
@@ -3012,8 +3312,18 @@ fn rebase_in_progress(root: &Path) -> bool {
         .any(|name| git_path(root, name).is_some_and(|path| path.exists()))
 }
 
+fn rebase_edit_in_progress(root: &Path) -> bool {
+    ["rebase-merge/stopped-sha", "rebase-apply/stopped-sha"]
+        .iter()
+        .any(|name| git_path(root, name).is_some_and(|path| path.exists()))
+}
+
 pub fn repository_rebase_in_progress(root: impl AsRef<Path>) -> bool {
     rebase_in_progress(root.as_ref())
+}
+
+pub fn repository_rebase_edit_in_progress(root: impl AsRef<Path>) -> bool {
+    rebase_edit_in_progress(root.as_ref())
 }
 
 fn load_repository_config(root: &Path) -> RepositoryConfig {
@@ -3184,7 +3494,7 @@ fn load_commits(
     if scope == CommitScope::AllBranches {
         args.push("--all");
     }
-    args.push("--format=%H%x1f%P%x1f%an%x1f%cd%x1f%ar%x1f%D%x1f%s");
+    args.push("--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cd%x1f%ar%x1f%D%x1f%s");
     let output = git_output(root, &args)?;
 
     Ok(output
@@ -3199,6 +3509,7 @@ fn load_commits(
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let author = parts.next().unwrap_or_default().to_owned();
+            let author_email = parts.next().unwrap_or_default().to_owned();
             let date = parts.next().unwrap_or_default().to_owned();
             let relative_time = parts.next().unwrap_or_default().to_owned();
             let refs = parts
@@ -3218,6 +3529,7 @@ fn load_commits(
                 short_hash,
                 parents,
                 author,
+                author_email,
                 date,
                 relative_time,
                 subject,
@@ -3531,6 +3843,35 @@ mod tests {
         assert!(merge_message.starts_with("Merge branch 'feature-conflict' into main"));
         assert!(merge_message.contains("# Conflicts:"));
         assert!(merge_message.contains("story.txt"));
+    }
+
+    #[test]
+    fn stale_merge_message_is_ignored_without_active_merge() {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-stale-merge-message-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["init"])
+            .output()
+            .unwrap();
+        git_command()
+            .arg("-C")
+            .arg(&root)
+            .args(["checkout", "-b", "main"])
+            .output()
+            .unwrap();
+
+        let merge_message_path = git_path(&root, "MERGE_MSG").unwrap();
+        fs::write(&merge_message_path, "stale merge template\n").unwrap();
+        let message = load_merge_message(&root, "main");
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(message.is_none());
     }
 
     #[test]
@@ -3897,16 +4238,25 @@ mod tests {
                 action: InteractiveRebaseAction::Pick,
                 hash: "aaa111".to_owned(),
                 subject: "oldest".to_owned(),
+                message: None,
+                author_name: None,
+                author_email: None,
             },
             InteractiveRebaseTodoItem {
                 action: InteractiveRebaseAction::Squash,
                 hash: "bbb222".to_owned(),
                 subject: "middle".to_owned(),
+                message: None,
+                author_name: None,
+                author_email: None,
             },
             InteractiveRebaseTodoItem {
                 action: InteractiveRebaseAction::Drop,
                 hash: "ccc333".to_owned(),
                 subject: "newest".to_owned(),
+                message: None,
+                author_name: None,
+                author_email: None,
             },
         ];
 
@@ -3914,6 +4264,24 @@ mod tests {
             interactive_rebase_todo(&items),
             "pick aaa111 oldest\nsquash bbb222 middle\ndrop ccc333 newest\n"
         );
+    }
+
+    #[test]
+    fn interactive_rebase_todo_amends_only_the_requested_author() {
+        let item = InteractiveRebaseTodoItem {
+            action: InteractiveRebaseAction::Reword,
+            hash: "aaa111".to_owned(),
+            subject: "rewrite author".to_owned(),
+            message: Some("rewrite author".to_owned()),
+            author_name: Some("Adoin O'Neil".to_owned()),
+            author_email: Some("adoin@example.com".to_owned()),
+        };
+
+        let todo = interactive_rebase_todo(&[item]);
+        assert!(todo.starts_with("pick aaa111 rewrite author\n"));
+        assert!(todo.contains(
+            "exec git -c user.name='Adoin O'\"'\"'Neil' -c user.email='adoin@example.com' commit --amend --allow-empty --reset-author\n"
+        ));
     }
 
     #[test]
@@ -3944,6 +4312,9 @@ mod tests {
                 action: InteractiveRebaseAction::Drop,
                 hash: "abc123".to_owned(),
                 subject: "drop me".to_owned(),
+                message: None,
+                author_name: None,
+                author_email: None,
             }],
         )
         .unwrap_err()
@@ -4122,6 +4493,56 @@ mod tests {
         git_output(&root, &["add", "."])?;
         git_output(&root, &["commit", "-m", "base"])?;
         Ok(root)
+    }
+
+    #[test]
+    fn repository_undo_position_restores_clean_branch_position() -> Result<()> {
+        let root = init_patch_test_repo("undo-position")?;
+        let before = repository_undo_position(&root)?;
+
+        git_output(&root, &["checkout", "-b", "undo-target"])?;
+        fs::write(root.join("undo.txt"), "changed\n")?;
+        git_output(&root, &["add", "undo.txt"])?;
+        git_output(&root, &["commit", "-m", "undo target"])?;
+        let after = repository_undo_position(&root)?;
+        assert_ne!(before, after);
+
+        restore_repository_undo_position(&root, &before)?;
+        assert_eq!(repository_undo_position(&root)?, before);
+        assert!(!root.join("undo.txt").exists());
+
+        fs::write(root.join("tracked.txt"), "changed\n")?;
+        let dirty = repository_undo_position(&root)?;
+        assert!(repository_has_worktree_changes(&dirty));
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_commit_undo_keeps_staging_for_safe_redo() -> Result<()> {
+        let root = init_patch_test_repo("undo-commit")?;
+        fs::write(root.join("staged.txt"), "staged change\n")?;
+        git_output(&root, &["add", "staged.txt"])?;
+        let before = repository_undo_position(&root)?;
+        let staged_diff = cached_binary_diff(&root)?;
+
+        git_output(&root, &["commit", "-m", "undoable commit"])?;
+        let after = repository_undo_position(&root)?;
+        assert_ne!(before.head, after.head);
+
+        reset_to_commit(&root, &before.head, ResetMode::Soft)?;
+        let undone = repository_undo_position(&root)?;
+        assert_eq!(undone.branch, before.branch);
+        assert_eq!(undone.head, before.head);
+        assert!(!repository_has_worktree_changes(&undone));
+        assert_eq!(cached_binary_diff(&root)?, staged_diff);
+
+        reset_to_commit(&root, &after.head, ResetMode::Hard)?;
+        assert_eq!(repository_undo_position(&root)?, after);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
@@ -4333,23 +4754,137 @@ summary add second
             &base_hash,
             &[
                 InteractiveRebaseTodoItem {
-                    action: InteractiveRebaseAction::Pick,
+                    action: InteractiveRebaseAction::Reword,
                     hash: first_hash,
                     subject: "one".to_owned(),
+                    message: Some("one rewritten\n\nwith body".to_owned()),
+                    author_name: Some("Rebased Author".to_owned()),
+                    author_email: Some("rebased-author@example.com".to_owned()),
                 },
                 InteractiveRebaseTodoItem {
                     action: InteractiveRebaseAction::Drop,
                     hash: second_hash,
                     subject: "two".to_owned(),
+                    message: None,
+                    author_name: None,
+                    author_email: None,
                 },
             ],
         )?;
 
-        let log = git_output(&root, &["log", "--format=%s"])?;
+        let log = git_output(&root, &["log", "--format=%B"])?;
+        let author = git_output(&root, &["log", "-1", "--format=%an <%ae>"])?;
         let _ = fs::remove_dir_all(&root);
-        assert!(log.contains("one"));
+        assert!(log.contains("one rewritten"));
+        assert!(log.contains("with body"));
         assert!(log.contains("base"));
         assert!(!log.contains("two"));
+        assert_eq!(author.trim(), "Rebased Author <rebased-author@example.com>");
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_rebase_rewrites_author_for_an_empty_commit() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("file.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let base_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        git_output(&root, &["commit", "--allow-empty", "-m", "empty"])?;
+        let empty_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        interactive_rebase(
+            &root,
+            &base_hash,
+            &[InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Reword,
+                hash: empty_hash,
+                subject: "empty".to_owned(),
+                message: Some("empty rewritten".to_owned()),
+                author_name: Some("Empty Commit Author".to_owned()),
+                author_email: Some("empty@example.com".to_owned()),
+            }],
+        )?;
+
+        let author = git_output(&root, &["log", "-1", "--format=%an <%ae>"])?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(author.trim(), "Empty Commit Author <empty@example.com>");
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_rebase_edit_pauses_amends_and_continues() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("file.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let base_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "first\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "editable"])?;
+        let edit_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        interactive_rebase(
+            &root,
+            &base_hash,
+            &[InteractiveRebaseTodoItem {
+                action: InteractiveRebaseAction::Edit,
+                hash: edit_hash,
+                subject: "editable".to_owned(),
+                message: None,
+                author_name: None,
+                author_email: None,
+            }],
+        )?;
+
+        assert!(repository_rebase_in_progress(&root));
+        assert!(repository_rebase_edit_in_progress(&root));
+        fs::write(root.join("file.txt"), "first edited\n")?;
+        git_output(&root, &["add", "file.txt"])?;
+        rebase_amend(&root)?;
+        rebase_continue(&root)?;
+
+        let content = fs::read_to_string(root.join("file.txt"))?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(content, "first edited\n");
+        assert!(!repository_rebase_in_progress(&root));
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_rebase_message_editor_state_persists_until_cleanup() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+
+        let state_dir = interactive_rebase_state_dir(&root)?;
+        fs::create_dir_all(&state_dir)?;
+        fs::write(
+            state_dir.join("message-editor-command"),
+            "test-editor --write-message",
+        )?;
+
+        assert_eq!(
+            interactive_rebase_message_editor_command(&root).as_deref(),
+            Some("test-editor --write-message")
+        );
+
+        clear_interactive_rebase_state(&root);
+        assert!(interactive_rebase_message_editor_command(&root).is_none());
+
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 

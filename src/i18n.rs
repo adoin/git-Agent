@@ -49,6 +49,11 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ),
     ("diff.blocks", "\u{5dee}\u{5f02}\u{5757}"),
     ("diff.full_file", "\u{5b8c}\u{6574}\u{6587}\u{4ef6}"),
+    ("diff.revert_hunk", "\u{56de}\u{6eda}\u{533a}\u{5757}"),
+    (
+        "diff.revert_select_line",
+        "\u{8bf7}\u{5148}\u{9009}\u{62e9}\u{8981}\u{56de}\u{6eda}\u{7684}\u{5dee}\u{5f02}\u{884c}",
+    ),
     ("settings.appearance", "\u{5916}\u{89c2}"),
     ("settings.theme", "\u{4e3b}\u{9898}"),
     ("settings.language", "\u{8bed}\u{8a00}"),
@@ -863,6 +868,14 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("interactive_rebase.todo_action", "\u{52a8}\u{4f5c}:"),
     ("interactive_rebase.todo.pick", "\u{4fdd}\u{7559}"),
     (
+        "interactive_rebase.todo.reword",
+        "\u{6539}\u{5199}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.todo.edit",
+        "\u{7f16}\u{8f91}\u{63d0}\u{4ea4}",
+    ),
+    (
         "interactive_rebase.todo.none",
         "\u{9009}\u{62e9}\u{52a8}\u{4f5c}",
     ),
@@ -870,7 +883,67 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "interactive_rebase.todo.squash",
         "\u{5408}\u{5e76}\u{5230}\u{4e0a}\u{4e00}\u{4e2a}",
     ),
+    (
+        "interactive_rebase.todo.fixup",
+        "\u{5408}\u{5e76}\u{4e14}\u{4e22}\u{5f03}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
     ("interactive_rebase.todo.drop", "\u{5220}\u{9664}"),
+    (
+        "interactive_rebase.reword.commit",
+        "\u{6539}\u{5199}\u{63d0}\u{4ea4}:",
+    ),
+    (
+        "interactive_rebase.reword.title",
+        "\u{6539}\u{5199}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.reword.hint",
+        "\u{8bf7}\u{8f93}\u{5165}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
+    ("interactive_rebase.reword.author", "\u{4f5c}\u{8005}"),
+    ("interactive_rebase.reword.email", "\u{90ae}\u{7bb1}"),
+    (
+        "interactive_rebase.reword.author_hint",
+        "\u{8bf7}\u{8f93}\u{5165}\u{4f5c}\u{8005}\u{540d}",
+    ),
+    (
+        "interactive_rebase.reword.email_hint",
+        "\u{8bf7}\u{8f93}\u{5165}\u{90ae}\u{7bb1}",
+    ),
+    (
+        "interactive_rebase.reword.edit",
+        "\u{7f16}\u{8f91}\u{6539}\u{5199}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.reword.done",
+        "\u{4fdd}\u{5b58}\u{6539}\u{5199}",
+    ),
+    (
+        "interactive_rebase.reword.cancel",
+        "\u{53d6}\u{6d88}\u{6539}\u{5199}",
+    ),
+    (
+        "interactive_rebase.plan",
+        "\u{53d8}\u{57fa}\u{8ba1}\u{5212}",
+    ),
+    (
+        "interactive_rebase.plan_hint",
+        "\u{62d6}\u{52a8} :: \u{8c03}\u{6574}\u{63d0}\u{4ea4}\u{987a}\u{5e8f}",
+    ),
+    (
+        "interactive_rebase.graph_drag_hint",
+        "\u{62d6}\u{52a8}\u{63d0}\u{4ea4}\u{5230}\u{7956}\u{5148}\u{63d0}\u{4ea4}\u{ff0c}\u{6253}\u{5f00}\u{53d8}\u{57fa}\u{8ba1}\u{5212}",
+    ),
+    (
+        "interactive_rebase.graph_drag_started",
+        "\u{5df2}\u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{53d8}\u{57fa}\u{8ba1}\u{5212}",
+    ),
+    (
+        "interactive_rebase.graph_drag_invalid",
+        "\u{53ea}\u{80fd}\u{5c06}\u{975e}\u{5408}\u{5e76}\u{63d0}\u{4ea4}\u{62d6}\u{5230}\u{5176}\u{7956}\u{5148}\u{63d0}\u{4ea4}\u{4e0a}",
+    ),
+    ("interactive_rebase.move_up", "\u{4e0a}\u{79fb}"),
+    ("interactive_rebase.move_down", "\u{4e0b}\u{79fb}"),
     ("interactive_rebase.reset", "\u{91cd}\u{7f6e}"),
     ("interactive_rebase.selected_count", "\u{5df2}\u{9009}"),
     (
@@ -943,6 +1016,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{8bf7}\u{5148}\u{9009}\u{62e9}\u{8981}\u{6267}\u{884c}\u{7684}\u{53d8}\u{57fa}\u{52a8}\u{4f5c}",
     ),
     (
+        "interactive_rebase.error.reword_unconfirmed",
+        "\u{8bf7}\u{5148}\u{4fdd}\u{5b58}\u{6539}\u{5199}\u{4fe1}\u{606f}",
+    ),
+    (
         "interactive_rebase.in_progress.title",
         "\u{53d8}\u{57fa}\u{8fdb}\u{884c}\u{4e2d}",
     ),
@@ -959,6 +1036,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{51b2}\u{7a81}\u{5df2}\u{89e3}\u{51b3}\u{ff0c}\u{53ef}\u{4ee5}\u{7ee7}\u{7eed}\u{53d8}\u{57fa}\u{3002}",
     ),
     (
+        "interactive_rebase.in_progress.edit_ready",
+        "\u{5df2}\u{6682}\u{505c}\u{5728}\u{7f16}\u{8f91}\u{6b65}\u{9aa4}\u{3002}\u{6682}\u{5b58}\u{6539}\u{52a8}\u{540e}\u{4fee}\u{8ba2}\u{5f53}\u{524d}\u{63d0}\u{4ea4}\u{ff0c}\u{518d}\u{7ee7}\u{7eed}\u{53d8}\u{57fa}\u{3002}",
+    ),
+    (
         "interactive_rebase.in_progress.continue",
         "\u{7ee7}\u{7eed}",
     ),
@@ -969,6 +1050,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     (
         "interactive_rebase.in_progress.abort",
         "\u{4e2d}\u{6b62}\u{53d8}\u{57fa}",
+    ),
+    (
+        "interactive_rebase.in_progress.amend",
+        "\u{4fee}\u{8ba2}\u{5f53}\u{524d}\u{63d0}\u{4ea4}",
     ),
     (
         "submodule.title",
@@ -1427,6 +1512,18 @@ const ZH_SOURCE: &[(&str, &str)] = &[
     ("blame.author", "\u{4f5c}\u{8005}"),
     ("blame.summary", "\u{4fe1}\u{606f}"),
     ("blame.content", "\u{5185}\u{5bb9}"),
+    (
+        "undo.toast.ready",
+        "\u{5df2}\u{5b8c}\u{6210} {action}\u{ff0c}\u{53ef}\u{64a4}\u{9500}",
+    ),
+    (
+        "undo.toast.completed",
+        "\u{5df2}\u{64a4}\u{9500} {action}\u{ff0c}\u{53ef}\u{91cd}\u{505a}",
+    ),
+    (
+        "redo.toast.completed",
+        "\u{5df2}\u{91cd}\u{505a} {action}\u{ff0c}\u{53ef}\u{518d}\u{6b21}\u{64a4}\u{9500}",
+    ),
 ];
 
 const EN: &[(&str, &str)] = &[
@@ -1438,6 +1535,9 @@ const EN: &[(&str, &str)] = &[
     ("action.fetch", "Fetch"),
     ("action.pull", "Pull"),
     ("action.push", "Push"),
+    ("undo.toast.ready", "{action} completed. Undo is available."),
+    ("undo.toast.completed", "Undid {action}. Redo is available."),
+    ("redo.toast.completed", "Redid {action}. Undo is available."),
     ("pull.title", "Pull"),
     ("pull.remote", "Pull from remote"),
     ("pull.remote_branch", "Remote branch"),
@@ -1739,6 +1839,11 @@ const EN: &[(&str, &str)] = &[
     ("diff.truncated", "Diff truncated at 1200 lines"),
     ("diff.blocks", "Diff blocks"),
     ("diff.full_file", "Full file"),
+    ("diff.revert_hunk", "Revert hunk"),
+    (
+        "diff.revert_select_line",
+        "Select a diff line to revert its hunk",
+    ),
     ("repo.title", "Repository"),
     ("repo.none", "No repository loaded"),
     ("repo.source.new_tab", "New tab"),
@@ -1958,9 +2063,38 @@ const EN: &[(&str, &str)] = &[
     ),
     ("interactive_rebase.todo_action", "Action:"),
     ("interactive_rebase.todo.pick", "Pick"),
+    ("interactive_rebase.todo.reword", "Reword message"),
+    ("interactive_rebase.todo.edit", "Edit commit"),
     ("interactive_rebase.todo.none", "Choose action"),
     ("interactive_rebase.todo.squash", "Squash into previous"),
+    ("interactive_rebase.todo.fixup", "Fixup (discard message)"),
     ("interactive_rebase.todo.drop", "Drop"),
+    ("interactive_rebase.reword.commit", "Reword commit:"),
+    ("interactive_rebase.reword.title", "Reword commit message"),
+    ("interactive_rebase.reword.hint", "Enter commit message"),
+    ("interactive_rebase.reword.author", "Author"),
+    ("interactive_rebase.reword.email", "Email"),
+    ("interactive_rebase.reword.author_hint", "Enter author name"),
+    ("interactive_rebase.reword.email_hint", "Enter author email"),
+    ("interactive_rebase.reword.edit", "Edit reword message"),
+    ("interactive_rebase.reword.done", "Save reword"),
+    ("interactive_rebase.reword.cancel", "Cancel reword"),
+    ("interactive_rebase.plan", "Rebase plan"),
+    ("interactive_rebase.plan_hint", "Drag :: to reorder commits"),
+    (
+        "interactive_rebase.graph_drag_hint",
+        "Drag a commit onto an ancestor to open a rebase plan",
+    ),
+    (
+        "interactive_rebase.graph_drag_started",
+        "Interactive rebase plan opened",
+    ),
+    (
+        "interactive_rebase.graph_drag_invalid",
+        "Drag a non-merge commit onto one of its ancestors",
+    ),
+    ("interactive_rebase.move_up", "Move up"),
+    ("interactive_rebase.move_down", "Move down"),
     ("interactive_rebase.reset", "Reset"),
     ("interactive_rebase.selected_count", "Selected"),
     ("interactive_rebase.drop_selected", "Drop selected"),
@@ -2020,6 +2154,10 @@ const EN: &[(&str, &str)] = &[
         "interactive_rebase.error.no_changes",
         "Choose at least one rebase action first",
     ),
+    (
+        "interactive_rebase.error.reword_unconfirmed",
+        "Save the reworded message before continuing",
+    ),
     ("interactive_rebase.in_progress.title", "Rebase in progress"),
     (
         "interactive_rebase.in_progress.detail",
@@ -2033,9 +2171,17 @@ const EN: &[(&str, &str)] = &[
         "interactive_rebase.in_progress.ready",
         "Conflicts are resolved. Continue the rebase.",
     ),
+    (
+        "interactive_rebase.in_progress.edit_ready",
+        "Paused at an edit step. Stage changes, amend the current commit, then continue.",
+    ),
     ("interactive_rebase.in_progress.continue", "Continue"),
     ("interactive_rebase.in_progress.skip", "Skip current commit"),
     ("interactive_rebase.in_progress.abort", "Abort rebase"),
+    (
+        "interactive_rebase.in_progress.amend",
+        "Amend current commit",
+    ),
     ("submodule.title", "Add Submodule..."),
     ("submodule.source", "Source path / URL:"),
     ("submodule.repo_type", "Repository type:"),
@@ -2521,6 +2667,14 @@ mod tests {
             "\u{8fd9}\u{4f1a}\u{4ece} HEAD \u{6062}\u{590d}\u{8be5}\u{8def}\u{5f84}\u{3002}"
         );
         assert_eq!(t(Language::English, "blame.title"), "Blame");
+        assert_eq!(
+            t(Language::Chinese, "undo.toast.ready"),
+            "\u{5df2}\u{5b8c}\u{6210} {action}\u{ff0c}\u{53ef}\u{64a4}\u{9500}"
+        );
+        assert_eq!(
+            t(Language::English, "undo.toast.ready"),
+            "{action} completed. Undo is available."
+        );
         assert_eq!(
             t(Language::English, "worktree.discard_untracked_warning"),
             "This will delete the untracked file or directory."
