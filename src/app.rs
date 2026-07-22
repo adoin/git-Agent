@@ -2616,31 +2616,40 @@ impl GitAgentApp {
     fn maybe_refresh_repositories(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
 
+        // A full snapshot starts many short-lived Git commands. Keep automatic refresh
+        // work to one snapshot so background tabs never build a queue ahead of the user.
+        if !self.repo_tasks.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+
         if now >= self.next_active_repo_refresh_at {
             self.next_active_repo_refresh_at = now + self.active_repo_refresh_duration();
-            let active_tabs = self
+            if let Some(tab) = self
                 .repo_tabs
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.active_repo_tab == Some(*index))
                 .map(|(_, tab)| tab.clone())
-                .collect::<Vec<_>>();
-            for tab in active_tabs {
+                .next()
+            {
                 self.start_repository_snapshot_load(tab.root.clone());
+                return;
             }
         }
 
         if now >= self.next_inactive_repo_refresh_at {
             self.next_inactive_repo_refresh_at = now + self.inactive_repo_refresh_duration();
-            let inactive_tabs = self
+            if let Some(tab) = self
                 .repo_tabs
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.active_repo_tab != Some(*index))
                 .map(|(_, tab)| tab.clone())
-                .collect::<Vec<_>>();
-            for tab in inactive_tabs {
+                .next()
+            {
                 self.start_repository_snapshot_load(tab.root.clone());
+                return;
             }
         }
 
@@ -8868,7 +8877,7 @@ impl GitAgentApp {
         repositories: &[KnownRepository],
     ) -> bool {
         let now = Instant::now();
-        if now < self.next_workspace_repo_status_load_at {
+        if now < self.next_workspace_repo_status_load_at || !self.repo_tasks.is_empty() {
             return false;
         }
         let path = repositories
@@ -38841,6 +38850,14 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
         assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
         assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
+        assert!(refresh_source.contains(".next()"));
+        assert_eq!(
+            refresh_source
+                .matches("self.start_repository_snapshot_load(tab.root.clone())")
+                .count(),
+            2,
+            "active and inactive refresh paths each start at most one snapshot"
+        );
         assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
         assert!(!refresh_source.contains("self.ensure_repo_tab"));
         assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
@@ -39636,12 +39653,29 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("self.active_repo_tab == Some(*index)"));
         assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
         assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
+        assert!(refresh_source.contains("if !self.repo_tasks.is_empty()"));
+        assert!(refresh_source.contains("ctx.request_repaint_after(Duration::from_millis(80))"));
         assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.restart_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.loading_repo = true"));
         assert!(!refresh_source.contains("self.clear_repository_snapshot_view"));
         assert!(implementation_source.contains("self.maybe_refresh_repositories(ctx)"));
         assert!(!implementation_source.contains("self.maybe_refresh_inactive_repositories(ctx)"));
+    }
+
+    #[test]
+    fn workspace_status_loader_does_not_queue_behind_repository_snapshot_work() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation_source
+            .find("fn maybe_start_workspace_repository_status_load(")
+            .unwrap();
+        let end = implementation_source[start..]
+            .find("fn remote_repository_source_page(")
+            .unwrap();
+        let loader_source = &implementation_source[start..start + end];
+
+        assert!(loader_source.contains("!self.repo_tasks.is_empty()"));
     }
 
     #[test]
