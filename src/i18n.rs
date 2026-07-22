@@ -935,6 +935,14 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{62d6}\u{52a8} :: \u{8c03}\u{6574}\u{63d0}\u{4ea4}\u{987a}\u{5e8f}",
     ),
     (
+        "interactive_rebase.preview",
+        "\u{8ba1}\u{5212}\u{9884}\u{89c8}",
+    ),
+    (
+        "interactive_rebase.plan_position",
+        "\u{8ba1}\u{5212}\u{987a}\u{5e8f}",
+    ),
+    (
         "interactive_rebase.graph_drag_hint",
         "\u{62d6}\u{52a8}\u{63d0}\u{4ea4}\u{5230}\u{7956}\u{5148}\u{63d0}\u{4ea4}\u{ff0c}\u{6253}\u{5f00}\u{53d8}\u{57fa}\u{8ba1}\u{5212}",
     ),
@@ -2086,6 +2094,8 @@ const EN: &[(&str, &str)] = &[
     ("interactive_rebase.reword.cancel", "Cancel reword"),
     ("interactive_rebase.plan", "Rebase plan"),
     ("interactive_rebase.plan_hint", "Drag :: to reorder commits"),
+    ("interactive_rebase.preview", "Plan preview"),
+    ("interactive_rebase.plan_position", "Plan position"),
     (
         "interactive_rebase.graph_drag_hint",
         "Drag a commit onto an ancestor to open a rebase plan",

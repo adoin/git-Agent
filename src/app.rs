@@ -1139,6 +1139,10 @@ struct InteractiveRebaseActionDialog {
     show_remote_refs: bool,
     search: String,
     history_cache: HistoryCommitBrowserCache,
+    preview_commit_hash: Option<String>,
+    preview_file_path: Option<String>,
+    preview_selected_diff_rows: Vec<DiffLineKey>,
+    preview_diff_display_mode: DiffDisplayMode,
     actions: BTreeMap<String, InteractiveRebaseTodoAction>,
     autosquash_targets: BTreeMap<String, String>,
     reword_messages: BTreeMap<String, String>,
@@ -4343,6 +4347,10 @@ impl GitAgentApp {
             show_remote_refs: self.history_show_remote_refs,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions,
             autosquash_targets,
             reword_messages: BTreeMap::new(),
@@ -4398,6 +4406,10 @@ impl GitAgentApp {
             show_remote_refs: self.history_show_remote_refs,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions,
             autosquash_targets,
             reword_messages: BTreeMap::new(),
@@ -13565,7 +13577,7 @@ impl GitAgentApp {
                         select_rows: true,
                         multi_select: false,
                         show_rebase_plan_controls: true,
-                        max_height: Some(430.0),
+                        max_height: Some(250.0),
                     },
                     Some(HistoryRebasePlanControls {
                         actions: &mut dialog.actions,
@@ -13591,6 +13603,8 @@ impl GitAgentApp {
                         dialog.selected_hashes.remove(&hash);
                     }
                 }
+
+                self.interactive_rebase_plan_preview(ui, &mut dialog, &table_commits);
 
                 ui.add_space(10.0);
                 let selected_actionable_hashes =
@@ -13824,6 +13838,180 @@ impl GitAgentApp {
         if keep_open {
             self.pending_interactive_rebase_action = Some(dialog);
         }
+    }
+
+    fn interactive_rebase_plan_preview(
+        &mut self,
+        ui: &mut Ui,
+        dialog: &mut InteractiveRebaseActionDialog,
+        commits: &[Commit],
+    ) {
+        let Some(commit) = commits
+            .iter()
+            .find(|commit| commit.hash == dialog.selected_hash)
+            .cloned()
+        else {
+            return;
+        };
+
+        if dialog.preview_commit_hash.as_deref() != Some(commit.hash.as_str()) {
+            dialog.preview_commit_hash = Some(commit.hash.clone());
+            dialog.preview_file_path = None;
+            dialog.preview_selected_diff_rows.clear();
+        }
+        self.request_commit_details_hash(commit.hash.clone());
+        let details = self.details_cache.get(&commit.hash).cloned();
+        if dialog.preview_file_path.is_none()
+            && let Some(path) = details
+                .as_ref()
+                .and_then(|details| details.files.first())
+                .map(|file| file.diff_path.clone())
+        {
+            dialog.preview_file_path = Some(path.clone());
+            self.request_file_diff(commit.hash.clone(), path);
+        }
+
+        ui.add_space(8.0);
+        panel_heading_inline(ui, self.tr("interactive_rebase.preview"));
+        ui.add_space(4.0);
+        let height = 190.0;
+        let width = ui.available_width();
+        let gap = LAYOUT_GAP as f32;
+        let left_width = (width * 0.34).clamp(230.0, 330.0);
+        let right_width = (width - left_width - gap).max(280.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        let left_rect = Rect::from_min_size(rect.left_top(), Vec2::new(left_width, height));
+        let right_rect = Rect::from_min_size(
+            Pos2::new(left_rect.right() + gap, rect.top()),
+            Vec2::new(right_width, height),
+        );
+
+        let mut clicked_file = None;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+            source_tree_panel_frame().show(ui, |ui| {
+                safe_set_min_size(ui, frame_inner_size(left_width, height, 8, 8));
+                let action = dialog
+                    .actions
+                    .get(&commit.hash)
+                    .copied()
+                    .unwrap_or(InteractiveRebaseTodoAction::Pick);
+                let plan_position = dialog
+                    .ordered_hashes
+                    .iter()
+                    .position(|hash| hash == &commit.hash)
+                    .map(|index| format!("{}/{}", index + 1, dialog.ordered_hashes.len()))
+                    .unwrap_or_else(|| "-".to_owned());
+                source_tree_meta_line(
+                    ui,
+                    self.tr("interactive_rebase.plan_position"),
+                    &plan_position,
+                );
+                source_tree_meta_line(
+                    ui,
+                    self.tr("interactive_rebase.todo_action"),
+                    interactive_rebase_action_label(self.language, action),
+                );
+                source_tree_meta_line(ui, self.tr("commit.author"), &commit.author);
+                ui.label(RichText::new(&commit.subject).color(theme::text()).small());
+                ui.add_space(4.0);
+                history_file_table_header(ui, self.language);
+                if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(self.tr("commit.loading_files")).color(theme::muted()),
+                        );
+                    });
+                } else if let Some(details) = details.as_ref() {
+                    if details.files.is_empty() {
+                        ui.label(RichText::new(self.tr("commit.no_changes")).color(theme::muted()));
+                    } else {
+                        ScrollArea::vertical()
+                            .id_salt(("interactive_rebase_preview_files", &commit.hash))
+                            .max_height(94.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for file in &details.files {
+                                    let selected = dialog.preview_file_path.as_deref()
+                                        == Some(file.diff_path.as_str());
+                                    if history_file_table_row(
+                                        ui,
+                                        &file.status,
+                                        &file.path,
+                                        selected,
+                                    )
+                                    .clicked()
+                                    {
+                                        clicked_file = Some(file.diff_path.clone());
+                                    }
+                                }
+                            });
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(self.tr("commit.select_to_load_files")).color(theme::muted()),
+                    );
+                }
+            });
+        });
+        if let Some(path) = clicked_file {
+            dialog.preview_file_path = Some(path.clone());
+            dialog.preview_selected_diff_rows.clear();
+            self.request_file_diff(commit.hash.clone(), path);
+        }
+
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+            source_tree_panel_frame().show(ui, |ui| {
+                safe_set_min_size(ui, frame_inner_size(right_width, height, 8, 8));
+                let (header_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(header_rect, CornerRadius::ZERO, theme::panel_soft());
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(header_rect), |ui| {
+                    let switch_rect = Rect::from_min_size(
+                        Pos2::new(header_rect.right() - 122.0, header_rect.center().y - 10.0),
+                        Vec2::new(116.0, 20.0),
+                    );
+                    diff_display_mode_switch(
+                        ui,
+                        switch_rect,
+                        &mut dialog.preview_diff_display_mode,
+                        self.tr("diff.blocks"),
+                        self.tr("diff.full_file"),
+                    );
+                    let path_rect = Rect::from_min_max(
+                        Pos2::new(header_rect.left() + 8.0, header_rect.top()),
+                        Pos2::new(switch_rect.left() - 6.0, header_rect.bottom()),
+                    );
+                    if let Some(path) = &dialog.preview_file_path {
+                        draw_elided_path_label(ui, path_rect, path);
+                    }
+                });
+
+                let Some(path) = dialog.preview_file_path.as_ref() else {
+                    ui.label(RichText::new(self.tr("commit.select_file")).color(theme::muted()));
+                    return;
+                };
+                let key = git::diff_key(&commit.hash, path);
+                if self.loading_diff_key.as_deref() == Some(key.as_str()) {
+                    ui.spinner();
+                    return;
+                }
+                let Some(diff) = self.diff_cache.get(&key) else {
+                    ui.label(RichText::new(self.tr("diff.queued")).color(theme::muted()));
+                    return;
+                };
+                fill_diff_scroll_area(
+                    ui,
+                    ("interactive_rebase_preview_diff", &commit.hash, path),
+                    &diff.text,
+                    dialog.preview_diff_display_mode,
+                    self.language,
+                    &mut dialog.preview_selected_diff_rows,
+                    (diff.text.lines().count() > 1_200).then_some(self.tr("diff.truncated")),
+                );
+            });
+        });
     }
 
     fn interactive_rebase_reword_modal(
@@ -34299,7 +34487,6 @@ mod ui_tests {
         }
         for removed in [
             "interactive_rebase_action_selector",
-            "interactive_rebase.todo_action",
             "interactive_rebase.selected_commit",
         ] {
             assert!(!dialog_source.contains(removed), "{removed}");
@@ -34501,6 +34688,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::new(),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
@@ -34565,6 +34756,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::new(),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
@@ -34615,6 +34810,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::from([(b.hash.clone(), InteractiveRebaseTodoAction::Fixup)]),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
@@ -34686,6 +34885,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::from([(new.hash.clone(), InteractiveRebaseTodoAction::Reword)]),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::from([(
@@ -34736,6 +34939,37 @@ mod ui_tests {
                 .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn interactive_rebase_plan_preview_reuses_cached_details_and_diff() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source
+            .find("#[cfg(test)]")
+            .expect("application implementation should precede tests")];
+        let start = implementation_source
+            .find("fn interactive_rebase_plan_preview(")
+            .expect("plan preview should exist");
+        let end = implementation_source[start..]
+            .find("fn interactive_rebase_reword_modal(")
+            .expect("preview should end before reword modal");
+        let preview_source = &implementation_source[start..start + end];
+
+        for required in [
+            "request_commit_details_hash(commit.hash.clone())",
+            "request_file_diff(commit.hash.clone(), path)",
+            "interactive_rebase_preview_files",
+            "interactive_rebase_preview_diff",
+            "interactive_rebase.plan_position",
+            "dialog.preview_file_path",
+            "dialog.preview_diff_display_mode",
+            "fill_diff_scroll_area(",
+        ] {
+            assert!(
+                preview_source.contains(required),
+                "preview should contain {required}"
+            );
+        }
     }
 
     #[test]
@@ -34803,6 +35037,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::new(),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
@@ -34875,6 +35113,10 @@ mod ui_tests {
             show_remote_refs: true,
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
             actions: BTreeMap::new(),
             autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
@@ -36375,13 +36617,14 @@ mod ui_tests {
             implementation_source
                 .matches("fill_diff_scroll_area(")
                 .count(),
-            5
+            6
         );
         for salt in [
             "commit_diff_scroll",
             "search_commit_diff_scroll",
             "worktree_diff_scroll",
             "create_patch_diff_scroll",
+            "interactive_rebase_preview_diff",
         ] {
             assert!(implementation_source.contains(salt), "{salt}");
         }
