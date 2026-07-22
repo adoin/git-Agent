@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::{Mutex, OnceLock, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -3468,7 +3468,11 @@ fn discover_root(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to run git in {}", path.display()))?;
 
     if !output.status.success() {
-        return Err(anyhow!("{} is not a git repository", path.display()));
+        return Err(anyhow!(
+            "{} is not a git repository: {}",
+            path.display(),
+            git_failure_diagnostic(&output)
+        ));
     }
 
     Ok(PathBuf::from(
@@ -3568,11 +3572,23 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         return Err(anyhow!(
             "git {} failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            git_failure_diagnostic(&output)
         ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_failure_diagnostic(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("git process exited without diagnostics ({})", output.status)
 }
 
 fn git_output_allowing_new_conflicts(root: &Path, args: &[&str]) -> Result<()> {

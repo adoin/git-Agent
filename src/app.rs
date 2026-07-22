@@ -54,6 +54,10 @@ const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
 const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
 const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
+// Windows can transiently fail to start git.exe while the system is under memory pressure.
+// Retry from the UI scheduler after the worker has exited and released the snapshot gate.
+const REPOSITORY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_REPOSITORY_SNAPSHOT_RETRIES: u8 = 2;
 
 #[cfg(target_os = "windows")]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -64,6 +68,25 @@ fn sanitize_repo_refresh_seconds(seconds: u64) -> u64 {
 
 fn repo_refresh_duration(seconds: u64) -> Duration {
     Duration::from_secs(sanitize_repo_refresh_seconds(seconds))
+}
+
+fn repository_snapshot_error_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "not enough memory",
+        "not enough storage",
+        "insufficient system resources",
+        "paging file",
+        "os error 8",
+        "os error 1455",
+        "0xc0000142",
+        "3221225794",
+        "-1073741502",
+        "application failed to initialize",
+        "application error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 const TOP_BAR_MIN_TABS_WIDTH: f32 = 420.0;
 const TOP_BAR_PANEL_X_INSET: f32 = 8.0;
@@ -413,6 +436,8 @@ pub struct GitAgentApp {
     search_dimension: SearchDimension,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
     queued_repo_reloads: HashMap<String, PathBuf>,
+    deferred_repo_reloads: HashMap<String, DeferredRepositorySnapshotReload>,
+    repo_snapshot_retry_attempts: HashMap<String, u8>,
     foreground_repo_loads: HashSet<String>,
     next_active_repo_refresh_at: Instant,
     next_inactive_repo_refresh_at: Instant,
@@ -566,6 +591,12 @@ type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
 type RepositoryUndoTaskResult = (PathBuf, anyhow::Result<RepositoryUndoTaskOutcome>);
+
+#[derive(Clone, Debug)]
+struct DeferredRepositorySnapshotReload {
+    path: PathBuf,
+    retry_at: Instant,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryUndoDirection {
@@ -2368,6 +2399,8 @@ impl GitAgentApp {
             search_dimension: SearchDimension::Message,
             repo_tasks: HashMap::new(),
             queued_repo_reloads: HashMap::new(),
+            deferred_repo_reloads: HashMap::new(),
+            repo_snapshot_retry_attempts: HashMap::new(),
             foreground_repo_loads: HashSet::new(),
             next_active_repo_refresh_at: Instant::now()
                 + repo_refresh_duration(active_repo_refresh_seconds),
@@ -2601,6 +2634,12 @@ impl GitAgentApp {
         foreground: bool,
     ) {
         let repo_task_key = repo_state_key(&path);
+        if restart || foreground {
+            self.deferred_repo_reloads.remove(&repo_task_key);
+            self.repo_snapshot_retry_attempts.remove(&repo_task_key);
+        } else if self.deferred_repo_reloads.contains_key(&repo_task_key) {
+            return;
+        }
         if foreground {
             self.foreground_repo_loads.insert(repo_task_key.clone());
         }
@@ -2613,6 +2652,52 @@ impl GitAgentApp {
         self.spawn_repository_snapshot_load(path, repo_task_key);
     }
 
+    fn defer_repository_snapshot_retry(&mut self, path: PathBuf) -> bool {
+        let repo_task_key = repo_state_key(&path);
+        let attempts = self
+            .repo_snapshot_retry_attempts
+            .entry(repo_task_key.clone())
+            .or_default();
+        if *attempts >= MAX_REPOSITORY_SNAPSHOT_RETRIES {
+            return false;
+        }
+        *attempts += 1;
+        self.deferred_repo_reloads.insert(
+            repo_task_key,
+            DeferredRepositorySnapshotReload {
+                path,
+                retry_at: Instant::now() + REPOSITORY_SNAPSHOT_RETRY_DELAY,
+            },
+        );
+        true
+    }
+
+    fn maybe_start_deferred_repository_snapshot_reload(&mut self, ctx: &egui::Context) -> bool {
+        if !self.repo_tasks.is_empty() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let next_retry = self
+            .deferred_repo_reloads
+            .iter()
+            .min_by_key(|(_, reload)| reload.retry_at)
+            .map(|(key, reload)| (key.clone(), reload.clone()));
+        let Some((repo_task_key, reload)) = next_retry else {
+            return false;
+        };
+
+        if now < reload.retry_at {
+            ctx.request_repaint_after(reload.retry_at - now);
+            return true;
+        }
+
+        self.deferred_repo_reloads.remove(&repo_task_key);
+        self.spawn_repository_snapshot_load(reload.path, repo_task_key);
+        ctx.request_repaint();
+        true
+    }
+
     fn maybe_refresh_repositories(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
 
@@ -2620,6 +2705,10 @@ impl GitAgentApp {
         // work to one snapshot so background tabs never build a queue ahead of the user.
         if !self.repo_tasks.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+
+        if self.maybe_start_deferred_repository_snapshot_reload(ctx) {
             return;
         }
 
@@ -5202,10 +5291,18 @@ impl GitAgentApp {
             for (requested_root, result) in repo_results {
                 let repo_task_key = repo_state_key(&requested_root);
                 let queued_reload = self.queued_repo_reloads.remove(&repo_task_key);
-                let was_foreground =
-                    queued_reload.is_none() && self.foreground_repo_loads.remove(&repo_task_key);
+                let retry_queued = queued_reload.is_none()
+                    && result
+                        .as_ref()
+                        .err()
+                        .is_some_and(repository_snapshot_error_is_retryable)
+                    && self.defer_repository_snapshot_retry(requested_root.clone());
+                let was_foreground = queued_reload.is_none()
+                    && !retry_queued
+                    && self.foreground_repo_loads.remove(&repo_task_key);
                 match result {
                     Ok(snapshot) => {
+                        self.repo_snapshot_retry_attempts.remove(&repo_task_key);
                         let active_repo = self.active_repo_root_matches(&requested_root);
                         let unchanged_background_snapshot = active_repo
                             && !was_foreground
@@ -5219,6 +5316,9 @@ impl GitAgentApp {
                         }
                     }
                     Err(error) => {
+                        if !retry_queued {
+                            self.repo_snapshot_retry_attempts.remove(&repo_task_key);
+                        }
                         if was_foreground && self.active_repo_root_matches(&requested_root) {
                             self.pending_branch_checkout = None;
                             self.clear_repository_snapshot_view();
@@ -36436,6 +36536,32 @@ mod ui_tests {
             i18n::t(Language::Chinese, "credentials.github_retry_failed"),
             "\u{767b}\u{5f55}\u{540e}\u{81ea}\u{52a8}\u{91cd}\u{8bd5}\u{4ecd}\u{7136}\u{5931}\u{8d25}\u{3002}\u{8bf7}\u{68c0}\u{67e5}\u{5f53}\u{524d} HTTPS \u{51ed}\u{636e}\u{3001}GitHub \u{8d26}\u{53f7}\u{5199}\u{6743}\u{9650}\u{ff0c}\u{6216}\u{8005}\u{6539}\u{7528} SSH remote\u{3002}"
         );
+    }
+
+    #[test]
+    fn repository_snapshot_memory_errors_are_retried_without_blocking() {
+        assert!(repository_snapshot_error_is_retryable(&anyhow::anyhow!(
+            "failed to run git status: The paging file is too small for this operation to complete (os error 1455)"
+        )));
+        assert!(repository_snapshot_error_is_retryable(&anyhow::anyhow!(
+            "git process failed with application error 0xc0000142"
+        )));
+        assert!(repository_snapshot_error_is_retryable(&anyhow::anyhow!(
+            "git process exited without diagnostics (exit code: 3221225794)"
+        )));
+        assert!(!repository_snapshot_error_is_retryable(&anyhow::anyhow!(
+            "git status failed: fatal: not a git repository"
+        )));
+
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert!(implementation_source.contains("deferred_repo_reloads"));
+        assert!(implementation_source.contains("REPOSITORY_SNAPSHOT_RETRY_DELAY"));
+        assert!(implementation_source.contains("MAX_REPOSITORY_SNAPSHOT_RETRIES"));
+        assert!(
+            implementation_source.contains("fn maybe_start_deferred_repository_snapshot_reload")
+        );
+        assert!(implementation_source.contains("repository_snapshot_error_is_retryable"));
     }
 
     #[test]
