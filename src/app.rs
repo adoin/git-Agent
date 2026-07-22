@@ -412,6 +412,7 @@ pub struct GitAgentApp {
     clone_url_task: Option<Receiver<(String, anyhow::Result<()>)>>,
     search_dimension: SearchDimension,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
+    queued_repo_reloads: HashMap<String, PathBuf>,
     foreground_repo_loads: HashSet<String>,
     next_active_repo_refresh_at: Instant,
     next_inactive_repo_refresh_at: Instant,
@@ -2366,6 +2367,7 @@ impl GitAgentApp {
             clone_url_task: None,
             search_dimension: SearchDimension::Message,
             repo_tasks: HashMap::new(),
+            queued_repo_reloads: HashMap::new(),
             foreground_repo_loads: HashSet::new(),
             next_active_repo_refresh_at: Instant::now()
                 + repo_refresh_duration(active_repo_refresh_seconds),
@@ -2602,9 +2604,10 @@ impl GitAgentApp {
         if foreground {
             self.foreground_repo_loads.insert(repo_task_key.clone());
         }
-        if restart {
-            self.repo_tasks.remove(&repo_task_key);
-        } else if self.repo_tasks.contains_key(&repo_task_key) {
+        if self.repo_tasks.contains_key(&repo_task_key) {
+            if restart {
+                self.queued_repo_reloads.insert(repo_task_key, path);
+            }
             return;
         }
         self.spawn_repository_snapshot_load(path, repo_task_key);
@@ -5188,9 +5191,10 @@ impl GitAgentApp {
                 });
 
             for (requested_root, result) in repo_results {
-                let was_foreground = self
-                    .foreground_repo_loads
-                    .remove(&repo_state_key(&requested_root));
+                let repo_task_key = repo_state_key(&requested_root);
+                let queued_reload = self.queued_repo_reloads.remove(&repo_task_key);
+                let was_foreground =
+                    queued_reload.is_none() && self.foreground_repo_loads.remove(&repo_task_key);
                 match result {
                     Ok(snapshot) => {
                         let active_repo = self.active_repo_root_matches(&requested_root);
@@ -5213,10 +5217,18 @@ impl GitAgentApp {
                         }
                     }
                 }
+                if let Some(path) = queued_reload {
+                    self.spawn_repository_snapshot_load(path, repo_task_key);
+                }
                 ctx.request_repaint();
             }
 
             for key in disconnected_repo_keys {
+                if let Some(path) = self.queued_repo_reloads.remove(&key) {
+                    self.spawn_repository_snapshot_load(path, key);
+                    ctx.request_repaint();
+                    continue;
+                }
                 let was_foreground = self.foreground_repo_loads.remove(&key);
                 if was_foreground && self.active_repo_key_matches(&key) {
                     self.pending_branch_checkout = None;
@@ -31962,7 +31974,9 @@ mod ui_tests {
             .unwrap();
         let panel_source = &implementation_source[panel_start..panel_start + panel_end];
         assert!(panel_source.contains("snapshot.rebase_in_progress"));
-        assert!(panel_source.contains("self.rebase_commit_panel_body(ui, &snapshot, staged_count);"));
+        assert!(
+            panel_source.contains("self.rebase_commit_panel_body(ui, &snapshot, staged_count);")
+        );
         assert!(
             panel_source.find("snapshot.rebase_in_progress").unwrap()
                 < panel_source.find("commit_message_editor_ui(").unwrap()
@@ -38763,6 +38777,23 @@ diff --git a/file.txt b/file.txt
         );
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
         assert!(poll_source.contains("self.loading_repo = self.active_repo_has_pending_load()"));
+    }
+
+    #[test]
+    fn forced_refresh_keeps_inflight_snapshot_task_until_it_finishes() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = implementation_source
+            .find("fn start_repository_snapshot_load_with_priority(")
+            .unwrap();
+        let end = implementation_source[start..]
+            .find("fn maybe_refresh_repositories(")
+            .unwrap();
+        let load_source = &implementation_source[start..start + end];
+
+        assert!(load_source.contains("queued_repo_reloads.insert(repo_task_key, path)"));
+        assert!(!load_source.contains("self.repo_tasks.remove(&repo_task_key)"));
+        assert!(implementation_source.contains("queued_reload = self.queued_repo_reloads.remove"));
     }
 
     #[test]

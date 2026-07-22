@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{OnceLock, RwLock},
+    sync::{Mutex, OnceLock, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,6 +27,9 @@ struct SshCommandConfig {
 }
 
 static SSH_COMMAND_CONFIG: OnceLock<RwLock<SshCommandConfig>> = OnceLock::new();
+// A repository snapshot invokes many short-lived Git commands. Serializing complete
+// snapshots prevents background tab refreshes from stampeding `git.exe` on Windows.
+static REPOSITORY_SNAPSHOT_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn configure_ssh_command(executable: Option<PathBuf>, variant: Option<String>) {
     let lock = SSH_COMMAND_CONFIG.get_or_init(|| RwLock::new(SshCommandConfig::default()));
@@ -302,6 +305,10 @@ pub struct FileDiff {
 }
 
 pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
+    let _snapshot_load_guard = REPOSITORY_SNAPSHOT_GATE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let root = discover_root(path.as_ref())?;
     let branch = git_output(&root, &["branch", "--show-current"])
         .unwrap_or_else(|_| "HEAD".to_owned())
@@ -3650,6 +3657,17 @@ mod tests {
             environment.get("GIT_SSH_VARIANT"),
             Some(&Some("ssh".to_owned()))
         );
+    }
+
+    #[test]
+    fn repository_snapshot_loading_uses_a_process_gate() {
+        let source = include_str!("git.rs");
+        let start = source.find("pub fn open_repository(").unwrap();
+        let end = source[start..].find("pub fn init_repository(").unwrap();
+        let open_source = &source[start..start + end];
+
+        assert!(open_source.contains("REPOSITORY_SNAPSHOT_GATE"));
+        assert!(open_source.contains("Mutex::new(())"));
     }
 
     #[test]
