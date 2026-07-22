@@ -1140,6 +1140,7 @@ struct InteractiveRebaseActionDialog {
     search: String,
     history_cache: HistoryCommitBrowserCache,
     actions: BTreeMap<String, InteractiveRebaseTodoAction>,
+    autosquash_targets: BTreeMap<String, String>,
     reword_messages: BTreeMap<String, String>,
     reword_authors: BTreeMap<String, InteractiveRebaseAuthor>,
     confirmed_reword_hashes: HashSet<String>,
@@ -4324,12 +4325,10 @@ impl GitAgentApp {
         let base_hash =
             interactive_rebase_base_for_commits(&commits).unwrap_or_else(|| "--root".to_owned());
         let base_short_hash = short_rebase_base_label(&base_hash);
-        let actions = commits
-            .iter()
-            .filter(|commit| !interactive_rebase_commit_is_merge(commit))
-            .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
-            .collect();
-        let ordered_hashes = interactive_rebase_default_order(&commits);
+        let autosquash_plan = interactive_rebase_autosquash_plan(&commits);
+        let actions = autosquash_plan.actions;
+        let autosquash_targets = autosquash_plan.targets;
+        let ordered_hashes = autosquash_plan.ordered_hashes;
 
         self.pending_interactive_rebase_action = Some(InteractiveRebaseActionDialog {
             scope: InteractiveRebaseScope::LocalUnpushed,
@@ -4345,6 +4344,7 @@ impl GitAgentApp {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions,
+            autosquash_targets,
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -4378,12 +4378,10 @@ impl GitAgentApp {
                 Some(i18n::t(self.language, "interactive_rebase.error.no_children").to_owned());
             return;
         };
-        let actions = commits
-            .iter()
-            .filter(|commit| !interactive_rebase_commit_is_merge(commit))
-            .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
-            .collect();
-        let ordered_hashes = interactive_rebase_default_order(&commits);
+        let autosquash_plan = interactive_rebase_autosquash_plan(&commits);
+        let actions = autosquash_plan.actions;
+        let autosquash_targets = autosquash_plan.targets;
+        let ordered_hashes = autosquash_plan.ordered_hashes;
         let rewrites_published_history =
             interactive_rebase_rewrites_published_history(&snapshot, &commits);
 
@@ -4401,6 +4399,7 @@ impl GitAgentApp {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions,
+            autosquash_targets,
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -13570,6 +13569,7 @@ impl GitAgentApp {
                     },
                     Some(HistoryRebasePlanControls {
                         actions: &mut dialog.actions,
+                        autosquash_targets: &mut dialog.autosquash_targets,
                         reword_messages: &mut dialog.reword_messages,
                         reword_authors: &mut dialog.reword_authors,
                         confirmed_reword_hashes: &mut dialog.confirmed_reword_hashes,
@@ -13658,10 +13658,10 @@ impl GitAgentApp {
                         )
                         .clicked()
                     {
-                        for action in dialog.actions.values_mut() {
-                            *action = InteractiveRebaseTodoAction::Pick;
-                        }
-                        dialog.ordered_hashes = dialog.original_ordered_hashes.clone();
+                        let autosquash_plan = interactive_rebase_autosquash_plan(&commits);
+                        dialog.actions = autosquash_plan.actions;
+                        dialog.autosquash_targets = autosquash_plan.targets;
+                        dialog.ordered_hashes = autosquash_plan.ordered_hashes;
                         dialog.dragged_hash = None;
                         dialog.squash_target_hash = None;
                         dialog.squash_range_hashes.clear();
@@ -20497,6 +20497,7 @@ impl Default for HistoryCommitBrowserConfig {
 
 struct HistoryRebasePlanControls<'a> {
     actions: &'a mut BTreeMap<String, InteractiveRebaseTodoAction>,
+    autosquash_targets: &'a mut BTreeMap<String, String>,
     reword_messages: &'a mut BTreeMap<String, String>,
     reword_authors: &'a mut BTreeMap<String, InteractiveRebaseAuthor>,
     confirmed_reword_hashes: &'a mut HashSet<String>,
@@ -20719,6 +20720,7 @@ fn history_commit_browser(
                                 .as_mut()
                                 .map(|controls| HistoryRebasePlanControls {
                                     actions: &mut *controls.actions,
+                                    autosquash_targets: &mut *controls.autosquash_targets,
                                     reword_messages: &mut *controls.reword_messages,
                                     reword_authors: &mut *controls.reword_authors,
                                     confirmed_reword_hashes: &mut *controls.confirmed_reword_hashes,
@@ -20786,15 +20788,20 @@ fn history_commit_browser(
         if let Some(controls) = rebase_plan.as_mut() {
             if let Some((source_hash, target_hash, insert_above_target)) = rebase_drop_target {
                 *controls.dragged_hash = None;
-                interactive_rebase_move_hash_from_display(
+                if interactive_rebase_move_hash_from_display(
                     controls.ordered_hashes,
                     &source_hash,
                     &target_hash,
                     insert_above_target,
-                );
+                ) {
+                    controls.autosquash_targets.clear();
+                }
             } else if let Some((hash, move_towards_newer)) = rebase_step_move {
                 *controls.dragged_hash = None;
-                interactive_rebase_step_hash(controls.ordered_hashes, &hash, move_towards_newer);
+                if interactive_rebase_step_hash(controls.ordered_hashes, &hash, move_towards_newer)
+                {
+                    controls.autosquash_targets.clear();
+                }
             }
         }
     }
@@ -20997,6 +21004,7 @@ fn history_commit_table_row(
             .entry(commit.hash.clone())
             .or_insert(InteractiveRebaseTodoAction::Pick);
         let previous_action = *action;
+        let autosquash_target = controls.autosquash_targets.get(&commit.hash).cloned();
         let reword_locked = *action == InteractiveRebaseTodoAction::Reword
             && controls.confirmed_reword_hashes.contains(&commit.hash);
         if reword_locked {
@@ -21016,7 +21024,11 @@ fn history_commit_table_row(
                 commit.hash.as_str(),
                 language,
                 action,
+                autosquash_target.as_deref(),
             );
+        }
+        if *action != previous_action {
+            controls.autosquash_targets.remove(&commit.hash);
         }
         if *action == InteractiveRebaseTodoAction::Reword
             && previous_action != InteractiveRebaseTodoAction::Reword
@@ -21258,11 +21270,19 @@ fn interactive_rebase_action_dropdown(
     hash: &str,
     language: Language,
     action: &mut InteractiveRebaseTodoAction,
+    autosquash_target: Option<&str>,
 ) {
     let popup_id = ui.make_persistent_id(("interactive_rebase_table_action_popup", hash));
     let button_id = ui.make_persistent_id(("interactive_rebase_table_action_button", hash));
     let popup_open = ui.memory(|memory| memory.is_popup_open(popup_id));
-    let response = pointing_hand_cursor(ui.interact(rect, button_id, Sense::click()));
+    let mut response = pointing_hand_cursor(ui.interact(rect, button_id, Sense::click()));
+    if let Some(target) = autosquash_target {
+        let short_target = target.chars().take(8).collect::<String>();
+        response = response.on_hover_text(format!(
+            "{} {short_target}",
+            i18n::t(language, "interactive_rebase.autosquash_target")
+        ));
+    }
     if response.clicked() {
         ui.memory_mut(|memory| memory.toggle_popup(popup_id));
     }
@@ -27876,6 +27896,106 @@ fn interactive_rebase_default_order(commits: &[Commit]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone, Debug)]
+struct InteractiveRebaseAutosquashPlan {
+    actions: BTreeMap<String, InteractiveRebaseTodoAction>,
+    targets: BTreeMap<String, String>,
+    ordered_hashes: Vec<String>,
+}
+
+fn interactive_rebase_autosquash_plan(commits: &[Commit]) -> InteractiveRebaseAutosquashPlan {
+    let by_hash = commits
+        .iter()
+        .filter(|commit| !interactive_rebase_commit_is_merge(commit))
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let chronological = interactive_rebase_default_order(commits)
+        .into_iter()
+        .filter_map(|hash| by_hash.get(hash.as_str()).copied())
+        .collect::<Vec<_>>();
+    let mut actions = chronological
+        .iter()
+        .map(|commit| (commit.hash.clone(), InteractiveRebaseTodoAction::Pick))
+        .collect::<BTreeMap<_, _>>();
+    let mut targets = BTreeMap::new();
+
+    for (index, commit) in chronological.iter().enumerate() {
+        let Some((action, target)) = interactive_rebase_autosquash_directive(&commit.subject)
+        else {
+            continue;
+        };
+        let Some(target_commit) = chronological[..index]
+            .iter()
+            .rev()
+            .find(|candidate| interactive_rebase_autosquash_target_matches(candidate, target))
+        else {
+            continue;
+        };
+        actions.insert(commit.hash.clone(), action);
+        targets.insert(commit.hash.clone(), target_commit.hash.clone());
+    }
+
+    let mut children = BTreeMap::<String, Vec<String>>::new();
+    for commit in &chronological {
+        if let Some(target) = targets.get(&commit.hash) {
+            children
+                .entry(target.clone())
+                .or_default()
+                .push(commit.hash.clone());
+        }
+    }
+    let mut ordered_hashes = Vec::with_capacity(chronological.len());
+    for commit in &chronological {
+        if !targets.contains_key(&commit.hash) {
+            interactive_rebase_append_autosquash_children(
+                &commit.hash,
+                &children,
+                &mut ordered_hashes,
+            );
+        }
+    }
+
+    InteractiveRebaseAutosquashPlan {
+        actions,
+        targets,
+        ordered_hashes,
+    }
+}
+
+fn interactive_rebase_autosquash_directive(
+    subject: &str,
+) -> Option<(InteractiveRebaseTodoAction, &str)> {
+    let subject = subject.trim();
+    if let Some(target) = subject.strip_prefix("fixup!") {
+        return (!target.trim().is_empty())
+            .then_some((InteractiveRebaseTodoAction::Fixup, target.trim()));
+    }
+    if let Some(target) = subject.strip_prefix("squash!") {
+        return (!target.trim().is_empty())
+            .then_some((InteractiveRebaseTodoAction::Squash, target.trim()));
+    }
+    None
+}
+
+fn interactive_rebase_autosquash_target_matches(candidate: &Commit, target: &str) -> bool {
+    candidate.subject.trim() == target
+        || (target.len() >= 7 && candidate.hash.starts_with(target))
+        || (target.len() >= 7 && candidate.short_hash.starts_with(target))
+}
+
+fn interactive_rebase_append_autosquash_children(
+    hash: &str,
+    children: &BTreeMap<String, Vec<String>>,
+    ordered_hashes: &mut Vec<String>,
+) {
+    ordered_hashes.push(hash.to_owned());
+    if let Some(followers) = children.get(hash) {
+        for follower in followers {
+            interactive_rebase_append_autosquash_children(follower, children, ordered_hashes);
+        }
+    }
+}
+
 fn interactive_rebase_synchronize_plan(
     dialog: &mut InteractiveRebaseActionDialog,
     commits: &[Commit],
@@ -27897,6 +28017,9 @@ fn interactive_rebase_synchronize_plan(
     dialog
         .actions
         .retain(|hash, _| available.contains(hash.as_str()));
+    dialog.autosquash_targets.retain(|hash, target| {
+        available.contains(hash.as_str()) && available.contains(target.as_str())
+    });
     dialog
         .reword_messages
         .retain(|hash, _| dialog.actions.get(hash) == Some(&InteractiveRebaseTodoAction::Reword));
@@ -34441,6 +34564,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -34504,6 +34628,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -34553,6 +34678,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::from([(b.hash.clone(), InteractiveRebaseTodoAction::Fixup)]),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -34623,6 +34749,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::from([(new.hash.clone(), InteractiveRebaseTodoAction::Reword)]),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::from([(
                 new.hash.clone(),
                 "new subject rewritten\n\nbody".to_owned(),
@@ -34674,6 +34801,50 @@ mod ui_tests {
     }
 
     #[test]
+    fn interactive_rebase_autosquash_prefills_actions_targets_and_order() {
+        let root = sample_commit("root0000", &[], "root");
+        let alpha = sample_commit("alpha123456", &["root0000"], "alpha change");
+        let beta = sample_commit("beta123456", &["alpha123456"], "beta change");
+        let fixup = sample_commit("fixup123456", &["beta123456"], "fixup! alpha change");
+        let squash = sample_commit("squash123456", &["fixup123456"], "squash! alpha1234");
+        let unmatched = sample_commit("unmatched123", &["squash123456"], "fixup! missing target");
+        let plan =
+            interactive_rebase_autosquash_plan(&[unmatched, squash, fixup, beta, alpha, root]);
+
+        assert_eq!(
+            plan.ordered_hashes,
+            vec![
+                "root0000",
+                "alpha123456",
+                "fixup123456",
+                "squash123456",
+                "beta123456",
+                "unmatched123",
+            ]
+        );
+        assert_eq!(
+            plan.actions.get("fixup123456"),
+            Some(&InteractiveRebaseTodoAction::Fixup)
+        );
+        assert_eq!(
+            plan.actions.get("squash123456"),
+            Some(&InteractiveRebaseTodoAction::Squash)
+        );
+        assert_eq!(
+            plan.targets.get("fixup123456"),
+            Some(&"alpha123456".to_owned())
+        );
+        assert_eq!(
+            plan.targets.get("squash123456"),
+            Some(&"alpha123456".to_owned())
+        );
+        assert_eq!(
+            plan.actions.get("unmatched123"),
+            Some(&InteractiveRebaseTodoAction::Pick)
+        );
+    }
+
+    #[test]
     fn interactive_rebase_can_squash_selected_range_to_target_commit() {
         let a = sample_commit("a", &["base"], "a");
         let b = sample_commit("b", &["a"], "b");
@@ -34695,6 +34866,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),
@@ -34766,6 +34938,7 @@ mod ui_tests {
             search: String::new(),
             history_cache: HistoryCommitBrowserCache::default(),
             actions: BTreeMap::new(),
+            autosquash_targets: BTreeMap::new(),
             reword_messages: BTreeMap::new(),
             reword_authors: BTreeMap::new(),
             confirmed_reword_hashes: HashSet::new(),

@@ -887,6 +887,10 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "interactive_rebase.todo.fixup",
         "\u{5408}\u{5e76}\u{4e14}\u{4e22}\u{5f03}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
     ),
+    (
+        "interactive_rebase.autosquash_target",
+        "\u{81ea}\u{52a8}\u{76ee}\u{6807}\u{ff1a}",
+    ),
     ("interactive_rebase.todo.drop", "\u{5220}\u{9664}"),
     (
         "interactive_rebase.reword.commit",
@@ -2068,6 +2072,7 @@ const EN: &[(&str, &str)] = &[
     ("interactive_rebase.todo.none", "Choose action"),
     ("interactive_rebase.todo.squash", "Squash into previous"),
     ("interactive_rebase.todo.fixup", "Fixup (discard message)"),
+    ("interactive_rebase.autosquash_target", "Autosquash target:"),
     ("interactive_rebase.todo.drop", "Drop"),
     ("interactive_rebase.reword.commit", "Reword commit:"),
     ("interactive_rebase.reword.title", "Reword commit message"),
