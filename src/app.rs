@@ -13874,7 +13874,55 @@ impl GitAgentApp {
         ui.add_space(8.0);
         panel_heading_inline(ui, self.tr("interactive_rebase.preview"));
         ui.add_space(4.0);
-        let height = 190.0;
+        let action = dialog
+            .actions
+            .get(&commit.hash)
+            .copied()
+            .unwrap_or(InteractiveRebaseTodoAction::Pick);
+        let plan_index = dialog
+            .ordered_hashes
+            .iter()
+            .position(|hash| hash == &commit.hash);
+        let plan_position = plan_index
+            .map(|index| format!("{}/{}", index + 1, dialog.ordered_hashes.len()))
+            .unwrap_or_else(|| "-".to_owned());
+        let planned_neighbor = |offset: isize| {
+            plan_index
+                .and_then(|index| index.checked_add_signed(offset))
+                .and_then(|index| dialog.ordered_hashes.get(index))
+                .and_then(|hash| commits.iter().find(|candidate| candidate.hash == *hash))
+                .map(|candidate| format!("{} {}", candidate.short_hash, candidate.subject))
+        };
+        let target_hash = dialog
+            .autosquash_targets
+            .get(&commit.hash)
+            .cloned()
+            .or_else(|| {
+                matches!(
+                    action,
+                    InteractiveRebaseTodoAction::Squash | InteractiveRebaseTodoAction::Fixup
+                )
+                .then(|| {
+                    plan_index.and_then(|index| {
+                        dialog.ordered_hashes[..index]
+                            .iter()
+                            .rev()
+                            .find(|hash| {
+                                dialog.actions.get(*hash).copied()
+                                    != Some(InteractiveRebaseTodoAction::Drop)
+                            })
+                            .cloned()
+                    })
+                })
+                .flatten()
+            });
+        let target_label = target_hash
+            .as_deref()
+            .and_then(|hash| commits.iter().find(|candidate| candidate.hash == hash))
+            .map(|candidate| format!("{} {}", candidate.short_hash, candidate.subject));
+        let previous_label = planned_neighbor(-1);
+        let next_label = planned_neighbor(1);
+        let height = 214.0;
         let width = ui.available_width();
         let gap = LAYOUT_GAP as f32;
         let left_width = (width * 0.34).clamp(230.0, 330.0);
@@ -13890,17 +13938,6 @@ impl GitAgentApp {
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
             source_tree_panel_frame().show(ui, |ui| {
                 safe_set_min_size(ui, frame_inner_size(left_width, height, 8, 8));
-                let action = dialog
-                    .actions
-                    .get(&commit.hash)
-                    .copied()
-                    .unwrap_or(InteractiveRebaseTodoAction::Pick);
-                let plan_position = dialog
-                    .ordered_hashes
-                    .iter()
-                    .position(|hash| hash == &commit.hash)
-                    .map(|index| format!("{}/{}", index + 1, dialog.ordered_hashes.len()))
-                    .unwrap_or_else(|| "-".to_owned());
                 source_tree_meta_line(
                     ui,
                     self.tr("interactive_rebase.plan_position"),
@@ -13911,8 +13948,24 @@ impl GitAgentApp {
                     self.tr("interactive_rebase.todo_action"),
                     interactive_rebase_action_label(self.language, action),
                 );
-                source_tree_meta_line(ui, self.tr("commit.author"), &commit.author);
-                ui.label(RichText::new(&commit.subject).color(theme::text()).small());
+                ui.label(
+                    RichText::new(self.tr(interactive_rebase_preview_effect_key(action)))
+                        .color(theme::accent_deep())
+                        .small(),
+                );
+                if let Some(target) = target_label.as_deref() {
+                    source_tree_meta_line(ui, self.tr("interactive_rebase.preview_target"), target);
+                }
+                if let Some(previous) = previous_label.as_deref() {
+                    source_tree_meta_line(
+                        ui,
+                        self.tr("interactive_rebase.preview_previous"),
+                        previous,
+                    );
+                }
+                if let Some(next) = next_label.as_deref() {
+                    source_tree_meta_line(ui, self.tr("interactive_rebase.preview_next"), next);
+                }
                 ui.add_space(4.0);
                 history_file_table_header(ui, self.language);
                 if self.loading_details_hash.as_deref() == Some(commit.hash.as_str()) {
@@ -13928,7 +13981,7 @@ impl GitAgentApp {
                     } else {
                         ScrollArea::vertical()
                             .id_salt(("interactive_rebase_preview_files", &commit.hash))
-                            .max_height(94.0)
+                            .max_height(72.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for file in &details.files {
@@ -28287,6 +28340,17 @@ fn interactive_rebase_action_label(
     }
 }
 
+fn interactive_rebase_preview_effect_key(action: InteractiveRebaseTodoAction) -> &'static str {
+    match action {
+        InteractiveRebaseTodoAction::Pick => "interactive_rebase.preview_effect.pick",
+        InteractiveRebaseTodoAction::Reword => "interactive_rebase.preview_effect.reword",
+        InteractiveRebaseTodoAction::Edit => "interactive_rebase.preview_effect.edit",
+        InteractiveRebaseTodoAction::Squash => "interactive_rebase.preview_effect.squash",
+        InteractiveRebaseTodoAction::Fixup => "interactive_rebase.preview_effect.fixup",
+        InteractiveRebaseTodoAction::Drop => "interactive_rebase.preview_effect.drop",
+    }
+}
+
 fn interactive_rebase_selected_actionable_hashes(
     dialog: &InteractiveRebaseActionDialog,
     commits: &[Commit],
@@ -34961,6 +35025,10 @@ mod ui_tests {
             "interactive_rebase_preview_files",
             "interactive_rebase_preview_diff",
             "interactive_rebase.plan_position",
+            "interactive_rebase.preview_target",
+            "interactive_rebase.preview_previous",
+            "interactive_rebase.preview_next",
+            "interactive_rebase_preview_effect_key(action)",
             "dialog.preview_file_path",
             "dialog.preview_diff_display_mode",
             "fill_diff_scroll_area(",

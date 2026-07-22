@@ -943,6 +943,42 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{8ba1}\u{5212}\u{987a}\u{5e8f}",
     ),
     (
+        "interactive_rebase.preview_target",
+        "\u{5408}\u{5e76}\u{76ee}\u{6807}",
+    ),
+    (
+        "interactive_rebase.preview_previous",
+        "\u{524d}\u{4e00}\u{6761}",
+    ),
+    (
+        "interactive_rebase.preview_next",
+        "\u{540e}\u{4e00}\u{6761}",
+    ),
+    (
+        "interactive_rebase.preview_effect.pick",
+        "\u{5c06}\u{4fdd}\u{7559}\u{5e76}\u{91cd}\u{653e}\u{6b64}\u{63d0}\u{4ea4}",
+    ),
+    (
+        "interactive_rebase.preview_effect.reword",
+        "\u{5c06}\u{6539}\u{5199}\u{6b64}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.preview_effect.edit",
+        "\u{5e94}\u{7528}\u{6b64}\u{63d0}\u{4ea4}\u{540e}\u{6682}\u{505c}",
+    ),
+    (
+        "interactive_rebase.preview_effect.squash",
+        "\u{5c06}\u{5408}\u{5e76}\u{5230}\u{76ee}\u{6807}\u{5e76}\u{4fdd}\u{7559}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.preview_effect.fixup",
+        "\u{5c06}\u{5408}\u{5e76}\u{5230}\u{76ee}\u{6807}\u{5e76}\u{4e22}\u{5f03}\u{6b64}\u{63d0}\u{4ea4}\u{4fe1}\u{606f}",
+    ),
+    (
+        "interactive_rebase.preview_effect.drop",
+        "\u{5c06}\u{4e22}\u{5f03}\u{6b64}\u{63d0}\u{4ea4}\u{53ca}\u{5176}\u{53d8}\u{66f4}",
+    ),
+    (
         "interactive_rebase.graph_drag_hint",
         "\u{62d6}\u{52a8}\u{63d0}\u{4ea4}\u{5230}\u{7956}\u{5148}\u{63d0}\u{4ea4}\u{ff0c}\u{6253}\u{5f00}\u{53d8}\u{57fa}\u{8ba1}\u{5212}",
     ),
@@ -2096,6 +2132,33 @@ const EN: &[(&str, &str)] = &[
     ("interactive_rebase.plan_hint", "Drag :: to reorder commits"),
     ("interactive_rebase.preview", "Plan preview"),
     ("interactive_rebase.plan_position", "Plan position"),
+    ("interactive_rebase.preview_target", "Fold target"),
+    ("interactive_rebase.preview_previous", "Previous"),
+    ("interactive_rebase.preview_next", "Next"),
+    (
+        "interactive_rebase.preview_effect.pick",
+        "This commit will be replayed unchanged",
+    ),
+    (
+        "interactive_rebase.preview_effect.reword",
+        "This commit message and author will be rewritten",
+    ),
+    (
+        "interactive_rebase.preview_effect.edit",
+        "Rebase will pause after applying this commit",
+    ),
+    (
+        "interactive_rebase.preview_effect.squash",
+        "This commit will be folded into its target and keep its message",
+    ),
+    (
+        "interactive_rebase.preview_effect.fixup",
+        "This commit will be folded into its target and discard its message",
+    ),
+    (
+        "interactive_rebase.preview_effect.drop",
+        "This commit and its changes will be removed",
+    ),
     (
         "interactive_rebase.graph_drag_hint",
         "Drag a commit onto an ancestor to open a rebase plan",
