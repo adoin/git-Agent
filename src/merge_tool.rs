@@ -128,6 +128,7 @@ const MERGE_CODE_ROW_HEIGHT: f32 = 18.0;
 const MERGE_CODE_FONT_SIZE: f32 = 12.0;
 const MERGE_CONNECTOR_Y_OFFSET: f32 = 6.0;
 const MERGE_BASE_ONLY_MARKER_HEIGHT: f32 = 3.0;
+const MERGE_VIRTUAL_ROW_THRESHOLD: usize = 2_000;
 static MERGE_CONNECTOR_DEBUG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
@@ -159,6 +160,18 @@ struct ConflictActionRects {
 #[derive(Clone, Copy, Debug)]
 struct MergeSideDisplayRow<'a> {
     text: &'a str,
+    line_number: Option<usize>,
+    conflict_index: Option<usize>,
+    side_resolved: bool,
+    tone: MergeSideLineTone,
+    show_conflict_actions: bool,
+    action_target: Option<MergeLineActionTarget>,
+    base_only_gap_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMergeSideDisplayRow {
+    text: String,
     line_number: Option<usize>,
     conflict_index: Option<usize>,
     side_resolved: bool,
@@ -900,6 +913,8 @@ pub struct MergeToolApp {
     document: MergeDocument,
     result_text: String,
     manual_result_lines: Vec<String>,
+    local_display_rows: Vec<CachedMergeSideDisplayRow>,
+    remote_display_rows: Vec<CachedMergeSideDisplayRow>,
     manual_result_override: bool,
     shared_scroll_y: f32,
     local_conflict_cursor: usize,
@@ -929,6 +944,8 @@ impl MergeToolApp {
             .into_iter()
             .map(|row| row.text.to_owned())
             .collect();
+        let local_display_rows = cached_merge_side_display_rows(&document, MergeSide::Local);
+        let remote_display_rows = cached_merge_side_display_rows(&document, MergeSide::Remote);
         let initial_document = document.clone();
         Self {
             theme: args.theme,
@@ -938,6 +955,8 @@ impl MergeToolApp {
             document,
             result_text,
             manual_result_lines,
+            local_display_rows,
+            remote_display_rows,
             manual_result_override: false,
             shared_scroll_y: 0.0,
             local_conflict_cursor: 0,
@@ -1014,9 +1033,11 @@ impl MergeToolApp {
         self.manual_result_override = snapshot.manual_result_override;
         self.local_conflict_cursor = snapshot.local_conflict_cursor;
         self.remote_conflict_cursor = snapshot.remote_conflict_cursor;
+        self.rebuild_display_rows();
     }
 
     fn finish_document_edit(&mut self, before: MergeEditSnapshot) {
+        self.rebuild_display_rows();
         if self.snapshot() != before {
             self.undo_stack.push(before);
             self.redo_stack.clear();
@@ -1173,6 +1194,19 @@ impl MergeToolApp {
             .into_iter()
             .map(|row| row.text.to_owned())
             .collect();
+        self.rebuild_display_rows();
+    }
+
+    fn rebuild_display_rows(&mut self) {
+        self.local_display_rows = cached_merge_side_display_rows(&self.document, MergeSide::Local);
+        self.remote_display_rows =
+            cached_merge_side_display_rows(&self.document, MergeSide::Remote);
+    }
+
+    fn uses_virtual_merge_rows(&self) -> bool {
+        self.manual_result_lines.len() >= MERGE_VIRTUAL_ROW_THRESHOLD
+            || self.local_display_rows.len() >= MERGE_VIRTUAL_ROW_THRESHOLD
+            || self.remote_display_rows.len() >= MERGE_VIRTUAL_ROW_THRESHOLD
     }
 
     fn finish_manual_result_edit(&mut self, before: MergeEditSnapshot) {
@@ -1583,14 +1617,18 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
 
     let requested_scroll_y = app.shared_scroll_y;
     let mut result_scroll_y = requested_scroll_y;
+    let use_virtual_rows = app.uses_virtual_merge_rows();
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(result), |ui| {
         result_scroll_y =
             merge_result_panel(ui, app, "merge_result_scroll", requested_scroll_y, palette);
     });
     let frame_scroll_y = result_scroll_y;
     let mut next_shared_scroll_y = frame_scroll_y;
-    let local_scroll_y =
-        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Local, frame_scroll_y);
+    let local_scroll_y = if use_virtual_rows {
+        frame_scroll_y
+    } else {
+        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Local, frame_scroll_y)
+    };
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left), |ui| {
         if let Some(scroll_y) = merge_side_panel(
             ui,
@@ -1603,8 +1641,11 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
             next_shared_scroll_y = scroll_y;
         }
     });
-    let remote_scroll_y =
-        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Remote, frame_scroll_y);
+    let remote_scroll_y = if use_virtual_rows {
+        frame_scroll_y
+    } else {
+        merge_side_scroll_y_for_result_scroll(&app.document, MergeSide::Remote, frame_scroll_y)
+    };
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right), |ui| {
         if let Some(scroll_y) = merge_side_panel(
             ui,
@@ -1617,17 +1658,19 @@ fn merge_editor_columns(ui: &mut Ui, app: &mut MergeToolApp, palette: MergePalet
             next_shared_scroll_y = scroll_y;
         }
     });
-    let scroll_offsets = merge_scroll_offsets(&app.document, frame_scroll_y);
-    paint_merge_block_connectors(
-        ui,
-        &app.document,
-        left,
-        result,
-        right,
-        scroll_offsets,
-        app.connector_debug,
-        palette,
-    );
+    if !use_virtual_rows {
+        let scroll_offsets = merge_scroll_offsets(&app.document, frame_scroll_y);
+        paint_merge_block_connectors(
+            ui,
+            &app.document,
+            left,
+            result,
+            right,
+            scroll_offsets,
+            app.connector_debug,
+            palette,
+        );
+    }
     app.shared_scroll_y = next_shared_scroll_y;
 }
 
@@ -1654,24 +1697,28 @@ fn merge_side_panel(
         side_conflict_nav(ui, app, side, palette);
         ui.add_space(8.0);
         let mut pending_line_action = None;
+        let use_virtual_rows = app.uses_virtual_merge_rows();
+        let rows = match side {
+            MergeSide::Local => &app.local_display_rows,
+            MergeSide::Remote => &app.remote_display_rows,
+        };
         let output = ScrollArea::vertical()
             .id_salt(scroll_id)
             .vertical_scroll_offset(scroll_y)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, MERGE_CODE_ROW_HEIGHT, rows.len(), |ui, row_range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_min_width(ui.available_width());
                 let cursor = match side {
                     MergeSide::Local => app.local_conflict_cursor,
                     MergeSide::Remote => app.remote_conflict_cursor,
                 };
-                let rows = merge_side_display_rows(&app.document, side);
-                for row in rows {
+                for row in &rows[row_range] {
                     merge_code_row(
                         ui,
                         row.line_number,
                         side,
-                        row.text,
+                        &row.text,
                         row.conflict_index,
                         row.side_resolved,
                         row.tone,
@@ -1683,27 +1730,27 @@ fn merge_side_panel(
                         &mut pending_line_action,
                     );
                 }
-                if !app.manual_result_override {
-                    paint_base_only_side_overlays(
-                        ui,
-                        &app.document,
-                        side,
-                        panel_rect,
-                        scroll_y,
-                        palette,
-                        &mut pending_line_action,
-                    );
-                }
             });
+        if !use_virtual_rows && !app.manual_result_override {
+            paint_base_only_side_overlays(
+                ui,
+                &app.document,
+                side,
+                panel_rect,
+                scroll_y,
+                palette,
+                &mut pending_line_action,
+            );
+        }
         if let Some((index, action)) = pending_line_action {
             app.apply_line_action(index, side, action);
         }
         if (output.state.offset.y - scroll_y).abs() > f32::EPSILON {
-            next_result_scroll_y = Some(merge_result_scroll_y_for_side_scroll(
-                &app.document,
-                side,
-                output.state.offset.y,
-            ));
+            next_result_scroll_y = Some(if use_virtual_rows {
+                output.state.offset.y
+            } else {
+                merge_result_scroll_y_for_side_scroll(&app.document, side, output.state.offset.y)
+            });
             ui.ctx().request_repaint();
         }
     });
@@ -1722,26 +1769,37 @@ fn merge_result_panel(
         result_header(ui, app, palette);
         merge_result_nav_spacer(ui);
         ui.add_space(8.0);
+        if app.manual_result_lines.is_empty() {
+            app.manual_result_lines
+                .push(mt(app.language, "result_placeholder").to_owned());
+        }
+        let mut changed_lines = Vec::new();
+        let line_count = app.manual_result_lines.len();
         let output = ScrollArea::vertical()
             .id_salt(scroll_id)
             .vertical_scroll_offset(scroll_y)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, MERGE_CODE_ROW_HEIGHT, line_count, |ui, row_range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.set_min_width(ui.available_width());
-                let before = app.snapshot();
-                let mut changed = false;
-                if app.manual_result_lines.is_empty() {
-                    app.manual_result_lines
-                        .push(mt(app.language, "result_placeholder").to_owned());
-                }
-                for (result_index, result_line) in app.manual_result_lines.iter_mut().enumerate() {
-                    changed |= merge_editable_result_row(ui, result_index, result_line, palette);
-                }
-                if changed {
-                    app.finish_manual_result_edit(before);
+                for result_index in row_range {
+                    if let Some(before_line) = merge_editable_result_row(
+                        ui,
+                        result_index,
+                        &mut app.manual_result_lines[result_index],
+                        palette,
+                    ) {
+                        changed_lines.push((result_index, before_line));
+                    }
                 }
             });
+        if !changed_lines.is_empty() {
+            let mut before = app.snapshot();
+            for (index, line) in changed_lines {
+                before.manual_result_lines[index] = line;
+            }
+            app.finish_manual_result_edit(before);
+        }
         next_scroll_y = output.state.offset.y;
     });
     next_scroll_y
@@ -2127,6 +2185,25 @@ fn merge_side_display_rows(
     rows
 }
 
+fn cached_merge_side_display_rows(
+    document: &MergeDocument,
+    side: MergeSide,
+) -> Vec<CachedMergeSideDisplayRow> {
+    merge_side_display_rows(document, side)
+        .into_iter()
+        .map(|row| CachedMergeSideDisplayRow {
+            text: row.text.to_owned(),
+            line_number: row.line_number,
+            conflict_index: row.conflict_index,
+            side_resolved: row.side_resolved,
+            tone: row.tone,
+            show_conflict_actions: row.show_conflict_actions,
+            action_target: row.action_target,
+            base_only_gap_rows: row.base_only_gap_rows,
+        })
+        .collect()
+}
+
 fn base_only_gap_group_len(document: &MergeDocument, line_index: usize, side: MergeSide) -> usize {
     document.lines[line_index..]
         .iter()
@@ -2351,7 +2428,7 @@ fn merge_editable_result_row(
     index: usize,
     text: &mut String,
     palette: MergePalette,
-) -> bool {
+) -> Option<String> {
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), MERGE_CODE_ROW_HEIGHT),
         Sense::hover(),
@@ -2369,6 +2446,7 @@ fn merge_editable_result_row(
         Pos2::new(rect.left() + 62.0, rect.top()),
         rect.right_bottom(),
     );
+    let before = text.clone();
     ui.put(
         text_rect,
         egui::TextEdit::singleline(text)
@@ -2379,6 +2457,7 @@ fn merge_editable_result_row(
             .desired_width(text_rect.width()),
     )
     .changed()
+    .then_some(before)
 }
 
 #[cfg(test)]
@@ -3497,6 +3576,25 @@ mod tests {
         assert!(app.redo());
         assert!(app.manual_result_override);
         assert_eq!(app.result_text, "keep\nmanual result\nend\n");
+    }
+
+    #[test]
+    fn large_merge_uses_cached_virtual_rows_without_connectors() {
+        let content = (0..MERGE_VIRTUAL_ROW_THRESHOLD)
+            .map(|index| format!("lock-entry-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = three_way_merge(&content, &content, &content);
+        let app = MergeToolApp::new(test_merge_args(), document);
+        let source = include_str!("merge_tool.rs");
+
+        assert!(app.uses_virtual_merge_rows());
+        assert_eq!(app.local_display_rows.len(), MERGE_VIRTUAL_ROW_THRESHOLD);
+        assert_eq!(app.remote_display_rows.len(), MERGE_VIRTUAL_ROW_THRESHOLD);
+        assert!(source.contains(".show_rows(ui, MERGE_CODE_ROW_HEIGHT, rows.len()"));
+        assert!(source.contains(".show_rows(ui, MERGE_CODE_ROW_HEIGHT, line_count"));
+        assert!(source.contains("if !use_virtual_rows {"));
+        assert!(source.contains("if !use_virtual_rows && !app.manual_result_override"));
     }
 
     #[test]
