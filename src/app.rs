@@ -41,7 +41,7 @@ use crate::{
 
 const TITLE_BAR_HEIGHT: f32 = 32.0;
 const WINDOW_CORNER_RADIUS: u8 = 6;
-const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 224.0;
+const INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH: f32 = 220.0;
 const TITLE_MENU_RESERVED_WIDTH: f32 = 420.0;
 const TOP_BAR_TAB_TOOL_JOIN_OVERLAP: f32 = 6.0;
 const TOP_BAR_HEIGHT: f32 =
@@ -10074,7 +10074,7 @@ impl GitAgentApp {
                             let is_selected = self.selected_commit == Some(commit_index);
                             let cherry_pick_selected =
                                 self.selected_cherry_pick_hashes.contains(&commit.hash);
-                            let (response, copied_hash, select_for_cherry_pick, _, _, graph_drop) =
+                            let (response, copied_hash, select_for_cherry_pick, _, graph_drop) =
                                 history_commit_table_row(
                                     ui,
                                     commit,
@@ -20684,7 +20684,6 @@ fn history_commit_browser(
     // The table is newest-first while git's todo file is oldest-first. Keep the
     // visual drop direction until the mutation point, where it is inverted.
     let mut rebase_drop_target: Option<(String, String, bool)> = None;
-    let mut rebase_step_move: Option<(String, bool)> = None;
     ScrollArea::vertical()
         .id_salt((
             config.id_salt,
@@ -20730,7 +20729,7 @@ fn history_commit_browser(
                                 })
                         })
                         .flatten();
-                    let (response, copied_hash, select_for_cherry_pick, drop_result, step_move, _) =
+                    let (response, copied_hash, select_for_cherry_pick, drop_result, _) =
                         history_commit_table_row(
                             ui,
                             commit,
@@ -20751,9 +20750,6 @@ fn history_commit_browser(
                         );
                     if drop_result.is_some() {
                         rebase_drop_target = drop_result;
-                    }
-                    if step_move.is_some() {
-                        rebase_step_move = step_move;
                     }
                     outcome.hash_copied |= copied_hash;
                     if select_for_cherry_pick {
@@ -20794,12 +20790,6 @@ fn history_commit_browser(
                     &target_hash,
                     insert_above_target,
                 ) {
-                    controls.autosquash_targets.clear();
-                }
-            } else if let Some((hash, move_towards_newer)) = rebase_step_move {
-                *controls.dragged_hash = None;
-                if interactive_rebase_step_hash(controls.ordered_hashes, &hash, move_towards_newer)
-                {
                     controls.autosquash_targets.clear();
                 }
             }
@@ -20849,7 +20839,6 @@ fn history_commit_table_row(
     bool,
     bool,
     Option<(String, String, bool)>,
-    Option<(String, bool)>,
     Option<(String, String)>,
 ) {
     let response = ui.allocate_response(
@@ -20966,7 +20955,6 @@ fn history_commit_table_row(
         .map(|_| INTERACTIVE_REBASE_TABLE_CONTROL_WIDTH)
         .unwrap_or_default();
     let mut rebase_drop_target = None;
-    let mut rebase_step_move = None;
     if let Some(controls) = rebase_plan.as_mut().filter(|_| !disabled) {
         let handle_rect = Rect::from_min_size(
             Pos2::new(x + 4.0, rect.top() + 2.0),
@@ -20997,7 +20985,7 @@ fn history_commit_table_row(
 
         let action_rect = Rect::from_min_size(
             Pos2::new(handle_rect.right() + 2.0, rect.center().y - 10.0),
-            Vec2::new(100.0, 20.0),
+            Vec2::new(160.0, 20.0),
         );
         let action = controls
             .actions
@@ -21057,59 +21045,10 @@ fn history_commit_table_row(
             }
         }
 
-        let move_up_rect = Rect::from_min_size(
+        let reword_rect = Rect::from_min_size(
             Pos2::new(action_rect.right() + 2.0, rect.top() + 2.0),
             Vec2::new(20.0, rect.height() - 4.0),
         );
-        let move_down_rect = Rect::from_min_size(
-            Pos2::new(move_up_rect.right() + 2.0, rect.top() + 2.0),
-            Vec2::new(20.0, rect.height() - 4.0),
-        );
-        let reword_rect = Rect::from_min_size(
-            Pos2::new(move_down_rect.right() + 2.0, rect.top() + 2.0),
-            Vec2::new(20.0, rect.height() - 4.0),
-        );
-        for (button_rect, symbol, move_towards_newer, tooltip) in [
-            (
-                move_up_rect,
-                "^",
-                true,
-                i18n::t(language, "interactive_rebase.move_up"),
-            ),
-            (
-                move_down_rect,
-                "v",
-                false,
-                i18n::t(language, "interactive_rebase.move_down"),
-            ),
-        ] {
-            let button = ui
-                .interact(
-                    button_rect,
-                    ui.id().with((
-                        "interactive_rebase_step",
-                        commit.hash.as_str(),
-                        move_towards_newer,
-                    )),
-                    Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(tooltip);
-            if button.hovered() {
-                ui.painter()
-                    .rect_filled(button_rect, 3.0, theme::accent_soft());
-            }
-            ui.painter().text(
-                button_rect.center(),
-                Align2::CENTER_CENTER,
-                symbol,
-                FontId::proportional(12.0),
-                theme::muted(),
-            );
-            if button.clicked() {
-                rebase_step_move = Some((commit.hash.clone(), move_towards_newer));
-            }
-        }
         if *action == InteractiveRebaseTodoAction::Reword {
             let edit = ui
                 .interact(
@@ -21259,7 +21198,6 @@ fn history_commit_table_row(
         hash_copied,
         cherry_pick_clicked,
         rebase_drop_target,
-        rebase_step_move,
         graph_rebase_drop,
     )
 }
@@ -35029,7 +34967,7 @@ mod ui_tests {
             .find("let action_rect = Rect::from_min_size(")
             .unwrap();
         let row_end = implementation_source[row_start..]
-            .find("let move_up_rect = Rect::from_min_size(")
+            .find("let reword_rect = Rect::from_min_size(")
             .unwrap();
         let row_source = &implementation_source[row_start..row_start + row_end];
         let selector_start = implementation_source
@@ -35040,9 +34978,10 @@ mod ui_tests {
             .unwrap();
         let selector_source = &implementation_source[selector_start..selector_start + selector_end];
 
-        for required in ["rect.center().y - 10.0", "Vec2::new(100.0, 20.0)"] {
+        for required in ["rect.center().y - 10.0", "Vec2::new(160.0, 20.0)"] {
             assert!(row_source.contains(required), "{required}");
         }
+        assert!(!row_source.contains("interactive_rebase_step"));
         for required in [
             "popup_below_widget(",
             "PopupCloseBehavior::CloseOnClickOutside",
