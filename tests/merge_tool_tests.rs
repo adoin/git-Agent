@@ -38,6 +38,22 @@ fn parses_named_merge_tool_arguments() {
 }
 
 #[test]
+fn merge_tool_uses_a_custom_icon_matching_the_main_app_palette() {
+    let source = include_str!("../src/merge_tool.rs");
+    let logo = include_str!("../assets/icons/logo-git-agent-merge.svg");
+
+    assert!(source.contains(".with_icon(merge_app_icon_data())"));
+    assert!(source.contains("fn merge_app_icon_data()"));
+    assert!(source.contains("let green = [21, 196, 151, 255]"));
+    assert!(source.contains("let blue = [47, 111, 234, 255]"));
+    assert!(source.contains("paint_merge_icon_line(&mut rgba, 24, 17, 24, 34, green)"));
+    assert!(logo.contains("stroke=\"#15C497\""));
+    assert!(logo.contains("stroke=\"#2F6FEA\""));
+    assert!(logo.contains("m-6-6 6 6 6-6"));
+    assert!(logo.contains("<circle cx=\"48\" cy=\"39\""));
+}
+
+#[test]
 fn parses_positional_merge_tool_arguments() {
     let args = parse_merge_args([
         "git-agent-merge",

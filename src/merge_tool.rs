@@ -965,6 +965,7 @@ impl MergeToolApp {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title(title.clone())
+                .with_icon(merge_app_icon_data())
                 .with_inner_size([1180.0, 760.0])
                 .with_min_inner_size([980.0, 620.0]),
             ..Default::default()
@@ -1238,6 +1239,83 @@ impl MergeToolApp {
             }
         }
     }
+}
+
+fn merge_app_icon_data() -> egui::IconData {
+    const SIZE: usize = 64;
+    let mut rgba = vec![0_u8; SIZE * SIZE * 4];
+    let green = [21, 196, 151, 255];
+    let blue = [47, 111, 234, 255];
+
+    // Same visual language as the main app: transparent canvas, crisp Git routes,
+    // hollow nodes. A green change is inserted into the blue result line.
+    paint_merge_icon_line(&mut rgba, 16, 39, 48, 39, blue);
+    paint_merge_icon_line(&mut rgba, 24, 17, 24, 34, green);
+    paint_merge_icon_line(&mut rgba, 18, 28, 24, 34, green);
+    paint_merge_icon_line(&mut rgba, 30, 28, 24, 34, green);
+    paint_merge_icon_ring(&mut rgba, 24, 17, green);
+    paint_merge_icon_ring(&mut rgba, 48, 39, blue);
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
+fn paint_merge_icon_ring(rgba: &mut [u8], cx: usize, cy: usize, color: [u8; 4]) {
+    const RADIUS: usize = 8;
+    const WIDTH: usize = 4;
+    let outer_sq = (RADIUS * RADIUS) as isize;
+    let inner_sq = ((RADIUS - WIDTH) * (RADIUS - WIDTH)) as isize;
+    for y in cy - RADIUS..=cy + RADIUS {
+        for x in cx - RADIUS..=cx + RADIUS {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            let distance_sq = dx * dx + dy * dy;
+            if distance_sq <= outer_sq && distance_sq >= inner_sq {
+                paint_merge_icon_pixel(rgba, x, y, color);
+            }
+        }
+    }
+}
+
+fn paint_merge_icon_line(
+    rgba: &mut [u8],
+    start_x: usize,
+    start_y: usize,
+    end_x: usize,
+    end_y: usize,
+    color: [u8; 4],
+) {
+    let steps = start_x.abs_diff(end_x).max(start_y.abs_diff(end_y)).max(1);
+    for step in 0..=steps {
+        let progress = step as f32 / steps as f32;
+        let x = (start_x as f32 + (end_x as f32 - start_x as f32) * progress).round() as usize;
+        let y = (start_y as f32 + (end_y as f32 - start_y as f32) * progress).round() as usize;
+        paint_merge_icon_disc(rgba, x, y, color);
+    }
+}
+
+fn paint_merge_icon_disc(rgba: &mut [u8], cx: usize, cy: usize, color: [u8; 4]) {
+    const SIZE: usize = 64;
+    const RADIUS: usize = 4;
+    let radius_sq = (RADIUS * RADIUS) as isize;
+    for y in cy.saturating_sub(RADIUS)..=(cy + RADIUS).min(SIZE - 1) {
+        for x in cx.saturating_sub(RADIUS)..=(cx + RADIUS).min(SIZE - 1) {
+            let dx = x as isize - cx as isize;
+            let dy = y as isize - cy as isize;
+            if dx * dx + dy * dy <= radius_sq {
+                paint_merge_icon_pixel(rgba, x, y, color);
+            }
+        }
+    }
+}
+
+fn paint_merge_icon_pixel(rgba: &mut [u8], x: usize, y: usize, color: [u8; 4]) {
+    const SIZE: usize = 64;
+    let index = (y * SIZE + x) * 4;
+    rgba[index..index + 4].copy_from_slice(&color);
 }
 
 pub fn write_merge_output(args: &MergeArgs, result_text: &str) -> anyhow::Result<()> {
