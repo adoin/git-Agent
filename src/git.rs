@@ -27,9 +27,12 @@ struct SshCommandConfig {
 }
 
 static SSH_COMMAND_CONFIG: OnceLock<RwLock<SshCommandConfig>> = OnceLock::new();
-// A repository snapshot invokes many short-lived Git commands. Serializing complete
-// snapshots prevents background tab refreshes from stampeding `git.exe` on Windows.
+// Core state invokes many short-lived Git commands. Serializing core loads prevents
+// background tab refreshes from stampeding `git.exe` on Windows.
 static REPOSITORY_SNAPSHOT_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+// History can be expensive, but it must never block a newly selected repository from
+// showing branch/status state. Keep one history read at a time on its own lane.
+static REPOSITORY_HISTORY_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn configure_ssh_command(executable: Option<PathBuf>, variant: Option<String>) {
     let lock = SSH_COMMAND_CONFIG.get_or_init(|| RwLock::new(SshCommandConfig::default()));
@@ -225,9 +228,22 @@ pub struct RepositorySnapshot {
     pub topology_commits: Vec<Commit>,
     pub all_date_commits: Vec<Commit>,
     pub all_topology_commits: Vec<Commit>,
+    #[serde(default)]
+    pub history_loaded: bool,
+    #[serde(default)]
+    pub history_is_all_branches: bool,
+    #[serde(default)]
+    pub history_is_topology: bool,
     pub config: RepositoryConfig,
     #[serde(default)]
     pub git_flow_config: Option<GitFlowConfig>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RepositoryHistory {
+    pub commits: Vec<Commit>,
+    pub all_branches: bool,
+    pub topology: bool,
 }
 
 /// A minimal repository position used by the application-level safe undo journal.
@@ -305,6 +321,13 @@ pub struct FileDiff {
 }
 
 pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
+    let mut snapshot = open_repository_core(path)?;
+    let history = load_repository_history(&snapshot.root, CommitOrder::Date, false)?;
+    snapshot.apply_history(history);
+    Ok(snapshot)
+}
+
+pub fn open_repository_core(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     let _snapshot_load_guard = REPOSITORY_SNAPSHOT_GATE
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -345,32 +368,6 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
     let upstream = load_upstream_status(&root).ok().flatten();
     let stashes = load_stashes(&root).unwrap_or_default();
     let tags = load_tags(&root).unwrap_or_default();
-    let date_commits = load_commits(
-        &root,
-        HISTORY_COMMIT_LIMIT,
-        CommitOrder::Date,
-        CommitScope::CurrentBranch,
-    )?;
-    let topology_commits = load_commits(
-        &root,
-        HISTORY_COMMIT_LIMIT,
-        CommitOrder::Topology,
-        CommitScope::CurrentBranch,
-    )?;
-    let all_date_commits = load_commits(
-        &root,
-        HISTORY_COMMIT_LIMIT,
-        CommitOrder::Date,
-        CommitScope::AllBranches,
-    )?;
-    let all_topology_commits = load_commits(
-        &root,
-        HISTORY_COMMIT_LIMIT,
-        CommitOrder::Topology,
-        CommitScope::AllBranches,
-    )?;
-    let commits = date_commits.clone();
-
     Ok(RepositorySnapshot {
         root,
         branch,
@@ -385,13 +382,55 @@ pub fn open_repository(path: impl AsRef<Path>) -> Result<RepositorySnapshot> {
         status,
         staged,
         unstaged,
-        commits,
-        date_commits,
-        topology_commits,
-        all_date_commits,
-        all_topology_commits,
+        commits: Vec::new(),
+        date_commits: Vec::new(),
+        topology_commits: Vec::new(),
+        all_date_commits: Vec::new(),
+        all_topology_commits: Vec::new(),
+        history_loaded: false,
+        history_is_all_branches: false,
+        history_is_topology: false,
         config,
         git_flow_config,
+    })
+}
+
+impl RepositorySnapshot {
+    pub fn apply_history(&mut self, history: RepositoryHistory) {
+        self.commits = history.commits;
+        self.date_commits.clear();
+        self.topology_commits.clear();
+        self.all_date_commits.clear();
+        self.all_topology_commits.clear();
+        self.history_loaded = true;
+        self.history_is_all_branches = history.all_branches;
+        self.history_is_topology = history.topology;
+    }
+}
+
+pub fn load_repository_history(
+    path: impl AsRef<Path>,
+    order: CommitOrder,
+    all_branches: bool,
+) -> Result<RepositoryHistory> {
+    let _history_load_guard = REPOSITORY_HISTORY_GATE
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = discover_root(path.as_ref())?;
+    Ok(RepositoryHistory {
+        commits: load_commits(
+            &root,
+            HISTORY_COMMIT_LIMIT,
+            order,
+            if all_branches {
+                CommitScope::AllBranches
+            } else {
+                CommitScope::CurrentBranch
+            },
+        )?,
+        all_branches,
+        topology: order == CommitOrder::Topology,
     })
 }
 
@@ -3678,7 +3717,7 @@ mod tests {
     #[test]
     fn repository_snapshot_loading_uses_a_process_gate() {
         let source = include_str!("git.rs");
-        let start = source.find("pub fn open_repository(").unwrap();
+        let start = source.find("pub fn open_repository_core(").unwrap();
         let end = source[start..].find("pub fn init_repository(").unwrap();
         let open_source = &source[start..start + end];
 
@@ -3689,6 +3728,48 @@ mod tests {
     #[test]
     fn history_commit_limit_supports_large_repositories() {
         assert!(HISTORY_COMMIT_LIMIT >= 50_000);
+    }
+
+    #[test]
+    fn repository_history_loading_reads_only_the_requested_history_variant() {
+        let source = include_str!("git.rs");
+        let start = source.find("pub fn load_repository_history(").unwrap();
+        let end = source[start..].find("pub fn init_repository(").unwrap();
+        let history_source = &source[start..start + end];
+
+        assert_eq!(
+            history_source.matches("load_commits(").count(),
+            1,
+            "one history request must not retain all branch/order variants"
+        );
+        assert!(history_source.contains("CommitScope::AllBranches"));
+        assert!(history_source.contains("CommitScope::CurrentBranch"));
+        assert!(history_source.contains("REPOSITORY_HISTORY_GATE"));
+    }
+
+    #[test]
+    fn requested_history_is_not_mirrored_in_snapshot_variants() {
+        let source = include_str!("git.rs");
+        let start = source.find("impl RepositorySnapshot").unwrap();
+        let end = source[start..]
+            .find("pub fn load_repository_history(")
+            .unwrap();
+        let apply_source = &source[start..start + end];
+
+        assert!(apply_source.contains("self.commits = history.commits;"));
+        assert!(!apply_source.contains("history.commits.clone()"));
+        assert!(!apply_source.contains("self.date_commits = history.commits"));
+    }
+
+    #[test]
+    fn core_repository_loading_defers_history_until_requested() {
+        let source = include_str!("git.rs");
+        let start = source.find("pub fn open_repository_core(").unwrap();
+        let end = source[start..].find("impl RepositorySnapshot").unwrap();
+        let core_source = &source[start..start + end];
+
+        assert!(!core_source.contains("load_commits("));
+        assert!(core_source.contains("history_loaded: false"));
     }
 
     #[test]
@@ -4816,6 +4897,83 @@ summary add second
         assert!(log.contains("base"));
         assert!(!log.contains("two"));
         assert_eq!(author.trim(), "Rebased Author <rebased-author@example.com>");
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_rebase_reword_then_fixup_keeps_rewritten_parent_chain() -> Result<()> {
+        let root = interactive_rebase_temp_dir();
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+
+        fs::write(root.join("file.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let base_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "base\nalpha\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "alpha original"])?;
+        let alpha_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "base\nalpha\nfixup content\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "fixup! alpha original"])?;
+        let fixup_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        fs::write(root.join("file.txt"), "base\nalpha\nfixup content\nbeta\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "beta stays"])?;
+        let beta_hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+
+        interactive_rebase(
+            &root,
+            &base_hash,
+            &[
+                InteractiveRebaseTodoItem {
+                    action: InteractiveRebaseAction::Reword,
+                    hash: alpha_hash,
+                    subject: "alpha original".to_owned(),
+                    message: Some("alpha renamed".to_owned()),
+                    author_name: Some("Rewritten Parent".to_owned()),
+                    author_email: Some("rewritten-parent@example.com".to_owned()),
+                },
+                InteractiveRebaseTodoItem {
+                    action: InteractiveRebaseAction::Fixup,
+                    hash: fixup_hash,
+                    subject: "fixup! alpha original".to_owned(),
+                    message: None,
+                    author_name: None,
+                    author_email: None,
+                },
+                InteractiveRebaseTodoItem {
+                    action: InteractiveRebaseAction::Pick,
+                    hash: beta_hash,
+                    subject: "beta stays".to_owned(),
+                    message: None,
+                    author_name: None,
+                    author_email: None,
+                },
+            ],
+        )?;
+
+        let log = git_output(&root, &["log", "--format=%s|%an <%ae>"])?;
+        let content = fs::read_to_string(root.join("file.txt"))?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec![
+                "beta stays|Git Agent Test <tester@example.com>",
+                "alpha renamed|Rewritten Parent <rewritten-parent@example.com>",
+                "base|Git Agent Test <tester@example.com>",
+            ]
+        );
+        assert_eq!(
+            content.replace("\r\n", "\n"),
+            "base\nalpha\nfixup content\nbeta\n"
+        );
         Ok(())
     }
 

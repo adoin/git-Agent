@@ -26,8 +26,8 @@ use std::os::windows::process::CommandExt;
 use crate::{
     dialog,
     git::{
-        self, Commit, CommitDetails, FileDiff, RepositorySnapshot, ResetMode, StashEntry, Tag,
-        WorktreeFile,
+        self, Commit, CommitDetails, FileDiff, RepositoryHistory, RepositorySnapshot, ResetMode,
+        StashEntry, Tag, WorktreeFile,
     },
     graph::{self, EdgeKind, GraphLayout},
     i18n::{self, Language},
@@ -54,6 +54,7 @@ const DEFAULT_ACTIVE_REPO_REFRESH_SECONDS: u64 = 20;
 const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
 const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
+const REPOSITORY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 // Windows can transiently fail to start git.exe while the system is under memory pressure.
 // Retry from the UI scheduler after the worker has exited and released the snapshot gate.
 const REPOSITORY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -435,10 +436,13 @@ pub struct GitAgentApp {
     clone_url_task: Option<Receiver<(String, anyhow::Result<()>)>>,
     search_dimension: SearchDimension,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
+    repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>,
+    queued_repo_history_loads: HashMap<String, HistoryLoadRequest>,
     queued_repo_reloads: HashMap<String, PathBuf>,
     deferred_repo_reloads: HashMap<String, DeferredRepositorySnapshotReload>,
     repo_snapshot_retry_attempts: HashMap<String, u8>,
     foreground_repo_loads: HashSet<String>,
+    foreground_repo_history_loads: HashSet<String>,
     next_active_repo_refresh_at: Instant,
     next_inactive_repo_refresh_at: Instant,
     active_repo_refresh_seconds: u64,
@@ -589,6 +593,11 @@ type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>);
 type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
+type RepoHistoryTaskResult = (
+    PathBuf,
+    HistoryLoadRequest,
+    anyhow::Result<(RepositoryHistory, GraphLayout)>,
+);
 type RepositoryBenchmarkTaskResult = RepositoryBenchmarkTaskMessage;
 type RepositoryUndoTaskResult = (PathBuf, anyhow::Result<RepositoryUndoTaskOutcome>);
 
@@ -596,6 +605,12 @@ type RepositoryUndoTaskResult = (PathBuf, anyhow::Result<RepositoryUndoTaskOutco
 struct DeferredRepositorySnapshotReload {
     path: PathBuf,
     retry_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryLoadRequest {
+    scope: HistoryBranchScope,
+    order: HistorySortOrder,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2025,23 +2040,34 @@ fn repo_snapshot_cache_path_for(path: &Path) -> Option<PathBuf> {
     repo_store_dir(path).map(|store_dir| store_dir.join("snapshot.json"))
 }
 
+const REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 fn save_cached_repository_snapshot(snapshot: &RepositorySnapshot) {
+    let snapshot = core_only_repository_snapshot(snapshot.clone());
     let Some(path) = repo_snapshot_cache_path_for(&snapshot.root) else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(raw) = serde_json::to_string(snapshot) {
+    if let Ok(raw) = serde_json::to_string(&snapshot) {
         let _ = fs::write(path, raw);
     }
 }
 
 fn load_cached_repository_snapshot(path: &Path) -> Option<RepositorySnapshot> {
     let cache_path = repo_snapshot_cache_path_for(path)?;
+    if fs::metadata(&cache_path)
+        .ok()
+        .is_some_and(|metadata| metadata.len() > REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES)
+    {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
     fs::read_to_string(cache_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
+        .map(core_only_repository_snapshot)
 }
 
 fn repo_state_key(path: &Path) -> String {
@@ -2090,6 +2116,22 @@ fn normalize_repository_snapshot_refresh_labels(snapshot: &mut RepositorySnapsho
     for stash in &mut snapshot.stashes {
         stash.relative_time.clear();
     }
+}
+
+fn clear_snapshot_history(snapshot: &mut RepositorySnapshot) {
+    snapshot.commits.clear();
+    snapshot.date_commits.clear();
+    snapshot.topology_commits.clear();
+    snapshot.all_date_commits.clear();
+    snapshot.all_topology_commits.clear();
+    snapshot.history_loaded = false;
+    snapshot.history_is_all_branches = false;
+    snapshot.history_is_topology = false;
+}
+
+fn core_only_repository_snapshot(mut snapshot: RepositorySnapshot) -> RepositorySnapshot {
+    clear_snapshot_history(&mut snapshot);
+    snapshot
 }
 
 impl RepoCommitStateStore {
@@ -2403,10 +2445,13 @@ impl GitAgentApp {
             clone_url_task: None,
             search_dimension: SearchDimension::Message,
             repo_tasks: HashMap::new(),
+            repo_history_tasks: HashMap::new(),
+            queued_repo_history_loads: HashMap::new(),
             queued_repo_reloads: HashMap::new(),
             deferred_repo_reloads: HashMap::new(),
             repo_snapshot_retry_attempts: HashMap::new(),
             foreground_repo_loads: HashSet::new(),
+            foreground_repo_history_loads: HashSet::new(),
             next_active_repo_refresh_at: Instant::now()
                 + repo_refresh_duration(active_repo_refresh_seconds),
             next_inactive_repo_refresh_at: Instant::now()
@@ -2616,8 +2661,56 @@ impl GitAgentApp {
 
         thread::spawn(move || {
             let requested_root = path.clone();
-            let _ = sender.send((requested_root, git::open_repository(path)));
+            let _ = sender.send((requested_root, git::open_repository_core(path)));
         });
+    }
+
+    fn spawn_repository_history_load(
+        &mut self,
+        path: PathBuf,
+        repo_task_key: String,
+        foreground: bool,
+        request: HistoryLoadRequest,
+    ) {
+        if foreground {
+            self.foreground_repo_history_loads
+                .insert(repo_task_key.clone());
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.repo_history_tasks.insert(repo_task_key, receiver);
+
+        thread::spawn(move || {
+            let requested_root = path.clone();
+            let order = match request.order {
+                HistorySortOrder::Date => git::CommitOrder::Date,
+                HistorySortOrder::Topology => git::CommitOrder::Topology,
+            };
+            let _ = sender.send((
+                requested_root,
+                request,
+                git::load_repository_history(path, order, request.scope == HistoryBranchScope::All)
+                    .map(|history| {
+                        let layout = graph::layout(&history.commits);
+                        (history, layout)
+                    }),
+            ));
+        });
+    }
+
+    fn request_active_repository_history(&mut self) {
+        let Some(root) = self.active_repo_root() else {
+            return;
+        };
+        let key = repo_state_key(&root);
+        let request = HistoryLoadRequest {
+            scope: self.history_branch_scope,
+            order: self.history_sort_order,
+        };
+        if self.repo_history_tasks.contains_key(&key) {
+            self.queued_repo_history_loads.insert(key, request);
+            return;
+        }
+        self.spawn_repository_history_load(root, key, true, request);
     }
 
     fn start_repository_snapshot_load(&mut self, path: PathBuf) {
@@ -2678,7 +2771,7 @@ impl GitAgentApp {
     }
 
     fn maybe_start_deferred_repository_snapshot_reload(&mut self, ctx: &egui::Context) -> bool {
-        if !self.repo_tasks.is_empty() {
+        if !self.repo_tasks.is_empty() || !self.repo_history_tasks.is_empty() {
             return false;
         }
 
@@ -2708,8 +2801,8 @@ impl GitAgentApp {
 
         // A full snapshot starts many short-lived Git commands. Keep automatic refresh
         // work to one snapshot so background tabs never build a queue ahead of the user.
-        if !self.repo_tasks.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(80));
+        if !self.repo_tasks.is_empty() || !self.repo_history_tasks.is_empty() {
+            ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL);
             return;
         }
 
@@ -2968,6 +3061,19 @@ impl GitAgentApp {
             .is_some_and(|root| repo_state_key(&root) == key)
     }
 
+    fn repo_root_for_key(&self, key: &str) -> Option<PathBuf> {
+        self.repo_tabs
+            .iter()
+            .find(|tab| repo_state_key(&tab.root) == key)
+            .map(|tab| tab.root.clone())
+            .or_else(|| {
+                self.snapshot_cache
+                    .values()
+                    .find(|snapshot| repo_state_key(&snapshot.root) == key)
+                    .map(|snapshot| snapshot.root.clone())
+            })
+    }
+
     fn active_repo_has_pending_load(&self) -> bool {
         self.active_repo_root()
             .map(|root| repo_state_key(&root))
@@ -2975,9 +3081,10 @@ impl GitAgentApp {
     }
 
     fn cache_repository_snapshot(&mut self, snapshot: &RepositorySnapshot) {
-        save_cached_repository_snapshot(snapshot);
+        let snapshot = core_only_repository_snapshot(snapshot.clone());
+        save_cached_repository_snapshot(&snapshot);
         self.snapshot_cache
-            .insert(repo_state_key(&snapshot.root), snapshot.clone());
+            .insert(repo_state_key(&snapshot.root), snapshot);
     }
 
     fn cached_snapshot_for(&self, path: &Path) -> Option<RepositorySnapshot> {
@@ -2991,6 +3098,7 @@ impl GitAgentApp {
                     .cloned()
             })
             .or_else(|| load_cached_repository_snapshot(path))
+            .map(core_only_repository_snapshot)
     }
 
     fn apply_cached_snapshot_for(&mut self, path: &Path) -> bool {
@@ -3053,13 +3161,49 @@ impl GitAgentApp {
         self.request_selected_details();
     }
 
-    fn active_snapshot_matches_background_refresh(&self, snapshot: &RepositorySnapshot) -> bool {
+    fn apply_repository_history(
+        &mut self,
+        root: &Path,
+        history: RepositoryHistory,
+        layout: GraphLayout,
+    ) {
+        let selected_hash = self.selected_commit_hash().map(str::to_owned);
+        let Some(mut snapshot) = self.snapshot.take() else {
+            return;
+        };
+        if !paths_equal(&snapshot.root, root) {
+            self.snapshot = Some(snapshot);
+            return;
+        }
+
+        snapshot.apply_history(history);
+        self.apply_history_sort_order_to_snapshot(&mut snapshot);
+        self.layout = layout;
+        self.selected_commit = selected_hash
+            .as_deref()
+            .and_then(|hash| {
+                snapshot
+                    .commits
+                    .iter()
+                    .position(|commit| commit.hash == hash)
+            })
+            .or_else(|| (!snapshot.commits.is_empty()).then_some(0));
+        self.search_selected_commit = None;
+        self.history_rows_cache.clear();
+        self.snapshot = Some(snapshot);
+        self.request_selected_details();
+    }
+
+    fn active_snapshot_matches_background_core_refresh(
+        &self,
+        snapshot: &RepositorySnapshot,
+    ) -> bool {
         let Some(current) = self.snapshot.as_ref() else {
             return false;
         };
-        let mut comparable = snapshot.clone();
-        self.apply_history_sort_order_to_snapshot(&mut comparable);
-        repository_snapshots_equal_for_refresh(current, &comparable)
+        let mut current = current.clone();
+        clear_snapshot_history(&mut current);
+        repository_snapshots_equal_for_refresh(&current, snapshot)
     }
 
     fn maybe_prepare_rewritten_history_prompt(&mut self, snapshot: &RepositorySnapshot) {
@@ -3104,6 +3248,14 @@ impl GitAgentApp {
     }
 
     fn apply_history_sort_order_to_snapshot(&self, snapshot: &mut RepositorySnapshot) {
+        let requested_all_branches = self.history_branch_scope == HistoryBranchScope::All;
+        let requested_topology = self.history_sort_order == HistorySortOrder::Topology;
+        if snapshot.history_loaded
+            && snapshot.history_is_all_branches == requested_all_branches
+            && snapshot.history_is_topology == requested_topology
+        {
+            return;
+        }
         snapshot.commits = match (self.history_branch_scope, self.history_sort_order) {
             (HistoryBranchScope::Current, HistorySortOrder::Date) => snapshot.date_commits.clone(),
             (HistoryBranchScope::Current, HistorySortOrder::Topology) => {
@@ -3131,19 +3283,31 @@ impl GitAgentApp {
         let selected_hash = self.selected_commit_hash().map(str::to_owned);
         self.history_branch_scope = scope;
         self.history_sort_order = order;
+        let mut needs_history_load = true;
         if let Some(mut snapshot) = self.snapshot.take() {
-            self.apply_history_sort_order_to_snapshot(&mut snapshot);
-            self.layout = graph::layout(&snapshot.commits);
-            self.selected_commit = selected_hash
-                .as_deref()
-                .and_then(|hash| {
-                    snapshot
-                        .commits
-                        .iter()
-                        .position(|commit| commit.hash == hash)
-                })
-                .or_else(|| (!snapshot.commits.is_empty()).then_some(0));
+            let history_matches = snapshot.history_loaded
+                && snapshot.history_is_all_branches == (scope == HistoryBranchScope::All)
+                && snapshot.history_is_topology == (order == HistorySortOrder::Topology);
+            if history_matches {
+                needs_history_load = false;
+                self.apply_history_sort_order_to_snapshot(&mut snapshot);
+                self.layout = graph::layout(&snapshot.commits);
+                self.selected_commit = selected_hash
+                    .as_deref()
+                    .and_then(|hash| {
+                        snapshot
+                            .commits
+                            .iter()
+                            .position(|commit| commit.hash == hash)
+                    })
+                    .or_else(|| (!snapshot.commits.is_empty()).then_some(0));
+            } else {
+                snapshot.history_loaded = false;
+            }
             self.snapshot = Some(snapshot);
+        }
+        if needs_history_load {
+            self.request_active_repository_history();
         }
     }
 
@@ -4165,6 +4329,63 @@ impl GitAgentApp {
             || self.repo_source_task.is_some()
     }
 
+    fn repo_toolbar_loading_label(&self) -> &str {
+        if self.branch_checkout_busy() {
+            return self.tr("status.switching_branch");
+        }
+        if self.remote_git_busy() {
+            return self.tr("status.running_git_action");
+        }
+        if self.merge_tool_busy() {
+            return self.tr("status.resolving_conflicts");
+        }
+        if self.repo_source_task.is_some() {
+            return self.tr("status.opening_repository");
+        }
+        if self
+            .active_repo_root()
+            .map(|root| repo_state_key(&root))
+            .is_some_and(|key| self.repo_tasks.contains_key(&key))
+        {
+            return self.tr("status.reading_worktree");
+        }
+        self.tr("status.loading_repo")
+    }
+
+    fn repo_toolbar_background_status_label(&self) -> Option<&str> {
+        if self.repo_toolbar_loading_busy() {
+            return None;
+        }
+
+        if self.loading_diff_key.is_some() {
+            return Some(self.tr("status.background_diff"));
+        }
+        if self.loading_details_hash.is_some() {
+            return Some(self.tr("status.loading_commit_details"));
+        }
+
+        let active_repo_key = self.active_repo_root().map(|root| repo_state_key(&root));
+        if active_repo_key
+            .as_ref()
+            .is_some_and(|key| self.repo_history_tasks.contains_key(key))
+        {
+            return Some(self.tr("status.loading_history"));
+        }
+        if active_repo_key
+            .as_ref()
+            .is_some_and(|key| self.repo_tasks.contains_key(key))
+        {
+            return Some(self.tr("status.background_worktree"));
+        }
+        if !self.repo_tasks.is_empty() {
+            return Some(self.tr("status.background_refresh"));
+        }
+        if !self.repo_history_tasks.is_empty() {
+            return Some(self.tr("status.background_history"));
+        }
+        None
+    }
+
     fn request_branch_checkout(&mut self, name: String) {
         if self.branch_actions_busy() {
             return;
@@ -4230,10 +4451,16 @@ impl GitAgentApp {
         if self.branch_actions_busy() {
             return;
         }
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(snapshot) = self.snapshot.as_ref().cloned() else {
             return;
         };
-        let commits = merge_dialog_commits(snapshot, self.history_sort_order);
+        if !snapshot.history_loaded {
+            self.active_view = MainView::History;
+            self.request_active_repository_history();
+            self.show_toast(self.tr("history.loading"));
+            return;
+        }
+        let commits = merge_dialog_commits(&snapshot, self.history_sort_order);
         let Some(commit) = self
             .selected_commit
             .and_then(|index| snapshot.commits.get(index))
@@ -4268,9 +4495,15 @@ impl GitAgentApp {
         if self.branch_actions_busy() {
             return None;
         }
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(snapshot) = self.snapshot.as_ref().cloned() else {
             return None;
         };
+        if !snapshot.history_loaded {
+            self.active_view = MainView::History;
+            self.request_active_repository_history();
+            self.show_toast(self.tr("history.loading"));
+            return None;
+        }
         if snapshot.rebase_in_progress {
             if !git::repository_rebase_in_progress(&snapshot.root) {
                 let root = snapshot.root.clone();
@@ -4292,13 +4525,13 @@ impl GitAgentApp {
                 Some(i18n::t(self.language, "interactive_rebase.error.index_dirty").to_owned());
             return None;
         }
-        if current_named_local_branch(snapshot).is_none() {
+        if current_named_local_branch(&snapshot).is_none() {
             self.error =
                 Some(i18n::t(self.language, "interactive_rebase.error.detached").to_owned());
             return None;
         }
 
-        Some(snapshot.clone())
+        Some(snapshot)
     }
 
     fn open_interactive_rebase_dialog(&mut self) {
@@ -5279,7 +5512,9 @@ impl GitAgentApp {
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
+        let mut repository_load_activity = false;
         if !self.repo_tasks.is_empty() {
+            repository_load_activity = true;
             let mut repo_results = Vec::new();
             let mut disconnected_repo_keys = Vec::new();
             let mut waiting_for_repo = false;
@@ -5317,7 +5552,7 @@ impl GitAgentApp {
                         let active_repo = self.active_repo_root_matches(&requested_root);
                         let unchanged_background_snapshot = active_repo
                             && !was_foreground
-                            && self.active_snapshot_matches_background_refresh(&snapshot);
+                            && self.active_snapshot_matches_background_core_refresh(&snapshot);
                         self.cache_repository_snapshot(&snapshot);
                         if active_repo {
                             if !unchanged_background_snapshot {
@@ -5325,6 +5560,9 @@ impl GitAgentApp {
                             }
                             self.pending_branch_checkout = None;
                         }
+                        // History and graph layout are demand-loaded. A workspace switch only
+                        // needs core state; eagerly scanning history makes every open tab compete
+                        // for CPU even when its History view is never opened.
                     }
                     Err(error) => {
                         if !retry_queued {
@@ -5359,8 +5597,80 @@ impl GitAgentApp {
             }
 
             if waiting_for_repo {
-                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL);
             }
+        }
+
+        if !self.repo_history_tasks.is_empty() {
+            repository_load_activity = true;
+            let mut history_results = Vec::new();
+            let mut disconnected_history_keys = Vec::new();
+            let mut waiting_for_history = false;
+            self.repo_history_tasks
+                .retain(|key, receiver| match receiver.try_recv() {
+                    Ok(result) => {
+                        history_results.push(result);
+                        false
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        waiting_for_history = true;
+                        true
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected_history_keys.push(key.clone());
+                        false
+                    }
+                });
+
+            for (requested_root, request, result) in history_results {
+                let repo_task_key = repo_state_key(&requested_root);
+                let was_foreground = self.foreground_repo_history_loads.remove(&repo_task_key);
+                match result {
+                    Ok((history, layout)) => {
+                        let request_is_current = request.scope == self.history_branch_scope
+                            && request.order == self.history_sort_order;
+                        if request_is_current && self.active_repo_root_matches(&requested_root) {
+                            self.apply_repository_history(&requested_root, history, layout);
+                        }
+                    }
+                    Err(error) => {
+                        if was_foreground && self.active_repo_root_matches(&requested_root) {
+                            self.error = Some(error.to_string());
+                        }
+                    }
+                }
+                if let Some(next_request) = self.queued_repo_history_loads.remove(&repo_task_key) {
+                    self.spawn_repository_history_load(
+                        requested_root,
+                        repo_task_key.clone(),
+                        was_foreground,
+                        next_request,
+                    );
+                }
+                ctx.request_repaint();
+            }
+
+            for key in disconnected_history_keys {
+                let was_foreground = self.foreground_repo_history_loads.remove(&key);
+                if let Some(next_request) = self.queued_repo_history_loads.remove(&key) {
+                    if let Some(root) = self.repo_root_for_key(&key) {
+                        self.spawn_repository_history_load(root, key, was_foreground, next_request);
+                        ctx.request_repaint();
+                        continue;
+                    }
+                }
+                if was_foreground && self.active_repo_key_matches(&key) {
+                    self.error = Some("Repository history loader stopped unexpectedly".to_owned());
+                }
+                ctx.request_repaint();
+            }
+
+            if waiting_for_history {
+                ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL);
+            }
+        }
+
+        if repository_load_activity {
             self.loading_repo = self.active_repo_has_pending_load();
         }
 
@@ -8593,6 +8903,10 @@ impl GitAgentApp {
         if let Some(tool_content_row) = tool_content_row {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tool_content_row), |ui| {
                 let repo_toolbar_loading = self.repo_toolbar_loading_busy();
+                let repo_toolbar_loading_label = self.repo_toolbar_loading_label().to_owned();
+                let repo_toolbar_background_status = self
+                    .repo_toolbar_background_status_label()
+                    .map(str::to_owned);
                 let repo_action_busy = self.loading_repo || self.remote_git_busy();
                 let branch_actions_enabled = !self.branch_actions_busy();
                 let upstream_counts = upstream_sync_counts(self.snapshot.as_ref());
@@ -8605,7 +8919,7 @@ impl GitAgentApp {
                     upstream_push_badge(Some(upstream_counts)),
                 );
                 if repo_toolbar_loading {
-                    repo_toolbar_loading_indicator(ui);
+                    repo_toolbar_loading_indicator(ui, &repo_toolbar_loading_label);
                 } else {
                     ScrollArea::horizontal()
                         .id_salt("repo_toolbar_strip")
@@ -8697,6 +9011,9 @@ impl GitAgentApp {
                                 }
                             });
                         });
+                    if let Some(status) = repo_toolbar_background_status {
+                        repo_toolbar_background_indicator(ui, &status);
+                    }
                 }
             });
         }
@@ -9641,6 +9958,15 @@ impl GitAgentApp {
             empty_state(ui, self.loading_repo, self.language);
             return;
         }
+        if !self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.history_loaded)
+        {
+            self.request_active_repository_history();
+            history_loading_panel(ui, self.tr("history.loading"));
+            return;
+        }
 
         let filtered_indices = self.search_filtered_commit_indices();
         let commit_count = self
@@ -9843,6 +10169,15 @@ impl GitAgentApp {
             empty_state(ui, self.loading_repo, self.language);
             return;
         }
+        if !self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.history_loaded)
+        {
+            self.request_active_repository_history();
+            history_loading_panel(ui, self.tr("history.loading"));
+            return;
+        }
 
         let available = ui.available_size();
         let min_top_height = history_top_min_height();
@@ -10026,6 +10361,25 @@ impl GitAgentApp {
         );
         if prefs_changed {
             self.layout_prefs.save();
+        }
+
+        let history_loaded = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.history_loaded);
+        if !history_loaded {
+            let loading_size = ui.available_size();
+            ui.allocate_ui_with_layout(
+                loading_size,
+                Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(self.tr("history.loading")).color(theme::muted()));
+                    });
+                },
+            );
+            return;
         }
 
         if commit_count == 0 {
@@ -13886,13 +14240,7 @@ impl GitAgentApp {
         let plan_position = plan_index
             .map(|index| format!("{}/{}", index + 1, dialog.ordered_hashes.len()))
             .unwrap_or_else(|| "-".to_owned());
-        let planned_neighbor = |offset: isize| {
-            plan_index
-                .and_then(|index| index.checked_add_signed(offset))
-                .and_then(|index| dialog.ordered_hashes.get(index))
-                .and_then(|hash| commits.iter().find(|candidate| candidate.hash == *hash))
-                .map(|candidate| format!("{} {}", candidate.short_hash, candidate.subject))
-        };
+        let preview_plan = interactive_rebase_preview_plan(dialog, commits);
         let target_hash = dialog
             .autosquash_targets
             .get(&commit.hash)
@@ -13918,10 +14266,14 @@ impl GitAgentApp {
             });
         let target_label = target_hash
             .as_deref()
-            .and_then(|hash| commits.iter().find(|candidate| candidate.hash == hash))
-            .map(|candidate| format!("{} {}", candidate.short_hash, candidate.subject));
-        let previous_label = planned_neighbor(-1);
-        let next_label = planned_neighbor(1);
+            .and_then(|hash| preview_plan.output_for(hash))
+            .map(|node| interactive_rebase_preview_node_label(self.language, node));
+        let previous_label = preview_plan
+            .previous_for(&commit.hash)
+            .map(|node| interactive_rebase_preview_node_label(self.language, node));
+        let next_label = preview_plan
+            .next_for(&commit.hash)
+            .map(|node| interactive_rebase_preview_node_label(self.language, node));
         let height = 214.0;
         let width = ui.available_width();
         let gap = LAYOUT_GAP as f32;
@@ -18969,20 +19321,52 @@ fn toolbar_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> egui::
     AppButton::toolbar(icon, label, enabled).show(ui)
 }
 
-fn repo_toolbar_loading_indicator(ui: &mut Ui) {
+fn repo_toolbar_loading_indicator(ui: &mut Ui, label: &str) {
     let rect = ui.max_rect();
     let size = 18.0;
-    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size));
-    let angle = ui.input(|input| input.time as f32 * std::f32::consts::TAU);
-    ui.ctx().request_repaint();
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(icon_rect), |ui| {
-        ui.add(
-            egui::Image::new(icon_source(UiIcon::Loading))
-                .fit_to_exact_size(Vec2::splat(size))
-                .rotate(angle, Vec2::splat(0.5))
-                .tint(theme::muted()),
-        );
+    let font = FontId::proportional(13.0);
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), font.clone(), theme::text())
+            .rect
+            .width()
     });
+    let content_width = size + 8.0 + text_width;
+
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.add_space(((rect.width() - content_width) * 0.5).max(0.0));
+            ui.add(
+                egui::Image::new(icon_source(UiIcon::Loading))
+                    .fit_to_exact_size(Vec2::splat(size))
+                    .tint(theme::muted()),
+            );
+            ui.add_space(8.0);
+            ui.label(RichText::new(label).font(font).color(theme::text()));
+        },
+    );
+}
+
+fn repo_toolbar_background_indicator(ui: &mut Ui, label: &str) {
+    let rect = ui.max_rect();
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::right_to_left(Align::Center)),
+        |ui| {
+            ui.add_space(16.0);
+            ui.label(RichText::new(label).small().color(theme::muted()));
+            ui.add_space(6.0);
+            ui.add(
+                egui::Image::new(icon_source(UiIcon::Loading))
+                    .fit_to_exact_size(Vec2::splat(14.0))
+                    .tint(theme::muted()),
+            );
+        },
+    );
 }
 
 fn themed_text_edit_selection(ui: &mut Ui) {
@@ -27088,6 +27472,16 @@ fn empty_state(ui: &mut Ui, loading: bool, language: Language) {
     });
 }
 
+fn history_loading_panel(ui: &mut Ui, label: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label(RichText::new(label).heading().color(theme::text()));
+        });
+    });
+}
+
 fn no_commits_state(ui: &mut Ui, language: Language) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
@@ -28348,6 +28742,122 @@ fn interactive_rebase_preview_effect_key(action: InteractiveRebaseTodoAction) ->
         InteractiveRebaseTodoAction::Squash => "interactive_rebase.preview_effect.squash",
         InteractiveRebaseTodoAction::Fixup => "interactive_rebase.preview_effect.fixup",
         InteractiveRebaseTodoAction::Drop => "interactive_rebase.preview_effect.drop",
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InteractiveRebasePreviewNode {
+    source_hash: String,
+    short_hash: String,
+    subject: String,
+    rewritten: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InteractiveRebasePreviewPlan {
+    output_nodes: Vec<InteractiveRebasePreviewNode>,
+    output_index_by_source: BTreeMap<String, usize>,
+}
+
+impl InteractiveRebasePreviewPlan {
+    fn output_for(&self, source_hash: &str) -> Option<&InteractiveRebasePreviewNode> {
+        self.output_index_by_source
+            .get(source_hash)
+            .and_then(|index| self.output_nodes.get(*index))
+    }
+
+    fn previous_for(&self, source_hash: &str) -> Option<&InteractiveRebasePreviewNode> {
+        self.output_index_by_source
+            .get(source_hash)
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| self.output_nodes.get(index))
+    }
+
+    fn next_for(&self, source_hash: &str) -> Option<&InteractiveRebasePreviewNode> {
+        self.output_index_by_source
+            .get(source_hash)
+            .and_then(|index| self.output_nodes.get(index + 1))
+    }
+}
+
+fn interactive_rebase_preview_plan(
+    dialog: &InteractiveRebaseActionDialog,
+    commits: &[Commit],
+) -> InteractiveRebasePreviewPlan {
+    let commits_by_hash = commits
+        .iter()
+        .map(|commit| (commit.hash.as_str(), commit))
+        .collect::<HashMap<_, _>>();
+    let mut plan = InteractiveRebasePreviewPlan::default();
+    let mut active_output = None;
+    let mut rewrite_chain = false;
+
+    for item in interactive_rebase_todo_items(dialog, commits) {
+        match item.action {
+            git::InteractiveRebaseAction::Drop => {
+                rewrite_chain = true;
+            }
+            git::InteractiveRebaseAction::Squash | git::InteractiveRebaseAction::Fixup => {
+                let Some(index) = active_output else {
+                    continue;
+                };
+                plan.output_index_by_source.insert(item.hash, index);
+                if let Some(target) = plan.output_nodes.get_mut(index) {
+                    target.rewritten = true;
+                }
+                rewrite_chain = true;
+            }
+            git::InteractiveRebaseAction::Pick
+            | git::InteractiveRebaseAction::Reword
+            | git::InteractiveRebaseAction::Edit => {
+                let Some(commit) = commits_by_hash.get(item.hash.as_str()) else {
+                    continue;
+                };
+                let rewritten = rewrite_chain || item.action != git::InteractiveRebaseAction::Pick;
+                let subject = item
+                    .message
+                    .as_deref()
+                    .and_then(interactive_rebase_message_subject)
+                    .unwrap_or_else(|| commit.subject.clone());
+                let index = plan.output_nodes.len();
+                plan.output_nodes.push(InteractiveRebasePreviewNode {
+                    source_hash: commit.hash.clone(),
+                    short_hash: commit.short_hash.clone(),
+                    subject,
+                    rewritten,
+                });
+                plan.output_index_by_source
+                    .insert(commit.hash.clone(), index);
+                active_output = Some(index);
+                rewrite_chain |= rewritten;
+            }
+        }
+    }
+
+    plan
+}
+
+fn interactive_rebase_message_subject(message: &str) -> Option<String> {
+    message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+}
+
+fn interactive_rebase_preview_node_label(
+    language: Language,
+    node: &InteractiveRebasePreviewNode,
+) -> String {
+    if node.rewritten {
+        format!(
+            "{} {} {}",
+            i18n::t(language, "interactive_rebase.preview_rewritten"),
+            node.short_hash,
+            node.subject
+        )
+    } else {
+        format!("{} {}", node.short_hash, node.subject)
     }
 }
 
@@ -31261,6 +31771,7 @@ mod ui_tests {
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("fn repo_snapshot_cache_path_for("));
         assert!(implementation_source.contains("store_dir.join(\"snapshot.json\")"));
+        assert!(implementation_source.contains("REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES"));
         assert!(implementation_source.contains("fn save_cached_repository_snapshot("));
         assert!(implementation_source.contains("fn load_cached_repository_snapshot("));
 
@@ -31271,7 +31782,8 @@ mod ui_tests {
             .find("fn cached_snapshot_for(")
             .unwrap();
         let cache_source = &implementation_source[cache_start..cache_start + cache_end];
-        assert!(cache_source.contains("save_cached_repository_snapshot(snapshot)"));
+        assert!(cache_source.contains("core_only_repository_snapshot(snapshot.clone())"));
+        assert!(cache_source.contains("save_cached_repository_snapshot(&snapshot)"));
 
         let cached_start = implementation_source
             .find("fn cached_snapshot_for(&self")
@@ -31281,6 +31793,27 @@ mod ui_tests {
             .unwrap();
         let cached_source = &implementation_source[cached_start..cached_start + cached_end];
         assert!(cached_source.contains("load_cached_repository_snapshot(path)"));
+        assert!(cached_source.contains(".map(core_only_repository_snapshot)"));
+
+        let save_start = implementation_source
+            .find("fn save_cached_repository_snapshot(")
+            .unwrap();
+        let save_end = implementation_source[save_start..]
+            .find("fn load_cached_repository_snapshot(")
+            .unwrap();
+        let save_source = &implementation_source[save_start..save_start + save_end];
+        assert!(save_source.contains("core_only_repository_snapshot(snapshot.clone())"));
+
+        let load_start = implementation_source
+            .find("fn load_cached_repository_snapshot(")
+            .unwrap();
+        let load_end = implementation_source[load_start..]
+            .find("fn repo_state_key(")
+            .unwrap();
+        let load_source = &implementation_source[load_start..load_start + load_end];
+        assert!(load_source.contains(".map(core_only_repository_snapshot)"));
+        assert!(load_source.contains("metadata.len() > REPOSITORY_SNAPSHOT_CACHE_MAX_BYTES"));
+        assert!(load_source.contains("fs::remove_file(cache_path)"));
     }
 
     #[test]
@@ -34932,6 +35465,83 @@ mod ui_tests {
     }
 
     #[test]
+    fn interactive_rebase_preview_relinks_children_to_reworded_parent() {
+        let a = sample_commit("a1111111", &["base"], "alpha old");
+        let b = sample_commit("b2222222", &["a1111111"], "beta stays");
+        let c = sample_commit("c3333333", &["b2222222"], "gamma stays");
+        let commits = vec![c.clone(), b.clone(), a.clone()];
+        let mut dialog = InteractiveRebaseActionDialog {
+            scope: InteractiveRebaseScope::LocalUnpushed,
+            base_hash: "base".to_owned(),
+            base_short_hash: "base".to_owned(),
+            rewrites_published_history: false,
+            acknowledge_published_rewrite: true,
+            selected_hash: b.hash.clone(),
+            selected_short_hash: b.short_hash.clone(),
+            branch_scope: HistoryBranchScope::Current,
+            sort_order: HistorySortOrder::Date,
+            show_remote_refs: true,
+            search: String::new(),
+            history_cache: HistoryCommitBrowserCache::default(),
+            preview_commit_hash: None,
+            preview_file_path: None,
+            preview_selected_diff_rows: Vec::new(),
+            preview_diff_display_mode: DiffDisplayMode::Blocks,
+            actions: BTreeMap::from([(a.hash.clone(), InteractiveRebaseTodoAction::Reword)]),
+            autosquash_targets: BTreeMap::new(),
+            reword_messages: BTreeMap::from([(
+                a.hash.clone(),
+                "alpha renamed\n\nrewrite body".to_owned(),
+            )]),
+            reword_authors: BTreeMap::new(),
+            confirmed_reword_hashes: HashSet::from([a.hash.clone()]),
+            editing_reword_hash: None,
+            ordered_hashes: interactive_rebase_default_order(&commits),
+            original_ordered_hashes: interactive_rebase_default_order(&commits),
+            dragged_hash: None,
+            selected_hashes: HashSet::new(),
+            squash_target_hash: None,
+            squash_range_hashes: Vec::new(),
+            validation_error: None,
+        };
+
+        let plan = interactive_rebase_preview_plan(&dialog, &commits);
+        let previous = plan.previous_for(&b.hash).expect("beta parent preview");
+        assert_eq!(previous.source_hash, a.hash);
+        assert_eq!(previous.subject, "alpha renamed");
+        assert!(previous.rewritten);
+        assert_eq!(
+            interactive_rebase_preview_node_label(Language::Chinese, previous),
+            "\u{91cd}\u{5199}\u{540e} a1111111 alpha renamed"
+        );
+        assert_eq!(
+            plan.next_for(&a.hash)
+                .expect("rewritten alpha next preview")
+                .source_hash,
+            b.hash
+        );
+
+        // Reordering changes the planned parent chain too; preview must not keep
+        // displaying the original Git parent after the user moves a commit.
+        dialog.ordered_hashes = vec![b.hash.clone(), a.hash.clone(), c.hash.clone()];
+        let reordered = interactive_rebase_preview_plan(&dialog, &commits);
+        assert_eq!(
+            reordered
+                .previous_for(&a.hash)
+                .expect("reordered alpha parent preview")
+                .source_hash,
+            b.hash
+        );
+
+        dialog.ordered_hashes = interactive_rebase_default_order(&commits);
+        dialog
+            .actions
+            .insert(b.hash.clone(), InteractiveRebaseTodoAction::Fixup);
+        let folded = interactive_rebase_preview_plan(&dialog, &commits);
+        assert_eq!(folded.output_for(&b.hash), folded.output_for(&a.hash));
+    }
+
+    #[test]
     fn interactive_rebase_plan_emits_reword_message() {
         let old = sample_commit("old", &["base"], "old subject");
         let new = sample_commit("new", &["old"], "new subject");
@@ -38110,8 +38720,25 @@ diff --git a/file.txt b/file.txt
 
         assert!(implementation_source.contains("fn repo_toolbar_loading_busy(&self) -> bool"));
         assert!(implementation_source.contains("fn repo_toolbar_loading_indicator("));
+        assert!(implementation_source.contains("fn repo_toolbar_loading_label(&self) -> &str"));
+        assert!(
+            implementation_source
+                .contains("fn repo_toolbar_background_status_label(&self) -> Option<&str>")
+        );
+        assert!(implementation_source.contains("fn repo_toolbar_background_indicator("));
         assert!(implementation_source.contains("UiIcon::Loading"));
         assert!(implementation_source.contains("../assets/icons/loading.svg"));
+        let indicator_start = implementation_source
+            .find("fn repo_toolbar_loading_indicator(")
+            .unwrap();
+        let indicator_end = implementation_source[indicator_start..]
+            .find("fn themed_text_edit_selection(")
+            .unwrap();
+        let indicator_source =
+            &implementation_source[indicator_start..indicator_start + indicator_end];
+        assert!(indicator_source.contains("RichText::new(label)"));
+        assert!(!indicator_source.contains(".rotate("));
+        assert!(!indicator_source.contains("request_repaint"));
 
         let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let toolbar_end = implementation_source[toolbar_start..]
@@ -38121,8 +38748,13 @@ diff --git a/file.txt b/file.txt
         assert!(
             toolbar_source.contains("let repo_toolbar_loading = self.repo_toolbar_loading_busy();")
         );
+        assert!(toolbar_source.contains("self.repo_toolbar_loading_label().to_owned()"));
+        assert!(toolbar_source.contains("repo_toolbar_background_status_label()"));
         assert!(toolbar_source.contains("if repo_toolbar_loading {"));
-        assert!(toolbar_source.contains("repo_toolbar_loading_indicator(ui);"));
+        assert!(
+            toolbar_source
+                .contains("repo_toolbar_loading_indicator(ui, &repo_toolbar_loading_label);")
+        );
         assert!(toolbar_source.contains("} else {"));
 
         let loading_branch_start = toolbar_source.find("if repo_toolbar_loading {").unwrap();
@@ -38132,7 +38764,27 @@ diff --git a/file.txt b/file.txt
         let loading_branch =
             &toolbar_source[loading_branch_start..loading_branch_start + loading_branch_end];
         assert!(!loading_branch.contains("toolbar_button("));
-        assert!(!loading_branch.contains("status.loading_repo"));
+        assert!(loading_branch.contains("repo_toolbar_loading_label"));
+        assert!(toolbar_source.contains("repo_toolbar_background_indicator(ui, &status);"));
+
+        let background_start = implementation_source
+            .find("fn repo_toolbar_background_status_label(")
+            .unwrap();
+        let background_end = implementation_source[background_start..]
+            .find("fn request_branch_checkout(")
+            .unwrap();
+        let background_source =
+            &implementation_source[background_start..background_start + background_end];
+        for required in [
+            "self.loading_diff_key.is_some()",
+            "self.loading_details_hash.is_some()",
+            "self.repo_history_tasks.contains_key(key)",
+            "self.repo_tasks.contains_key(key)",
+            "status.background_worktree",
+            "status.background_diff",
+        ] {
+            assert!(background_source.contains(required), "{required}");
+        }
     }
 
     #[test]
@@ -39308,7 +39960,24 @@ diff --git a/file.txt b/file.txt
         assert!(load_source.contains("self.restart_repository_snapshot_load(path)"));
         assert!(load_source.contains("self.repo_tasks.insert(repo_task_key, receiver)"));
         assert!(load_source.contains("let requested_root = path.clone();"));
-        assert!(load_source.contains("sender.send((requested_root, git::open_repository(path)))"));
+        assert!(
+            load_source.contains("sender.send((requested_root, git::open_repository_core(path)))")
+        );
+        assert!(
+            implementation_source
+                .contains("repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>"),
+            "history must use an independent task so core repository state can appear first"
+        );
+        assert!(implementation_source.contains("fn spawn_repository_history_load("));
+        assert!(implementation_source.contains("git::load_repository_history("));
+        assert!(
+            implementation_source.contains("let layout = graph::layout(&history.commits);"),
+            "large history graph layout must stay off the UI thread"
+        );
+        assert!(
+            !implementation_source.contains("cached.apply_history(history.clone())"),
+            "active history must not be retained in both the visible snapshot and repository cache"
+        );
 
         let clear_start = implementation_source
             .find("fn clear_repository_snapshot_view(")
@@ -39334,7 +40003,48 @@ diff --git a/file.txt b/file.txt
                 .contains("let active_repo = self.active_repo_root_matches(&requested_root)")
         );
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
+        assert!(
+            poll_source.contains("self.apply_repository_history(&requested_root, history, layout)")
+        );
+        assert!(poll_source.contains("self.queued_repo_history_loads.remove(&key)"));
         assert!(poll_source.contains("self.loading_repo = self.active_repo_has_pending_load()"));
+    }
+
+    #[test]
+    fn core_snapshot_defers_history_until_a_history_consumer_requests_it() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_end = implementation_source[poll_start..]
+            .find("fn poll_merge_tool_task(")
+            .unwrap();
+        let poll_source = &implementation_source[poll_start..poll_start + poll_end];
+        let snapshot_success_start = poll_source.find("Ok(snapshot) =>").unwrap();
+        let snapshot_success_end = poll_source[snapshot_success_start..]
+            .find("Err(error) =>")
+            .unwrap();
+        let snapshot_success =
+            &poll_source[snapshot_success_start..snapshot_success_start + snapshot_success_end];
+        assert!(snapshot_success.contains("self.apply_repository_snapshot(snapshot)"));
+        assert!(
+            !snapshot_success.contains("self.spawn_repository_history_load("),
+            "a workspace snapshot must not eagerly start a full history scan"
+        );
+
+        for consumer in [
+            "fn search_view(&mut self, ui: &mut Ui)",
+            "fn history_view(&mut self, ui: &mut Ui)",
+            "fn open_merge_dialog(&mut self)",
+            "fn prepare_interactive_rebase_snapshot(&mut self)",
+        ] {
+            let start = implementation_source.find(consumer).unwrap();
+            let section = &implementation_source
+                [start..start + 1_200.min(implementation_source.len() - start)];
+            assert!(
+                section.contains("self.request_active_repository_history()"),
+                "{consumer} must request history only when it is actually needed"
+            );
+        }
     }
 
     #[test]
@@ -39451,6 +40161,10 @@ diff --git a/file.txt b/file.txt
             &implementation_source[active_pending_start..active_pending_start + active_pending_end];
         assert!(active_pending_source.contains("self.foreground_repo_loads.contains"));
         assert!(!active_pending_source.contains("self.repo_tasks.keys().any"));
+        assert!(
+            !active_pending_source.contains("foreground_repo_history_loads"),
+            "history must load locally without holding the whole repository UI busy"
+        );
 
         let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
         let poll_end = implementation_source[poll_start..]
@@ -39466,7 +40180,10 @@ diff --git a/file.txt b/file.txt
     fn unchanged_background_refresh_preserves_all_active_list_and_diff_state() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
-        assert!(implementation_source.contains("fn active_snapshot_matches_background_refresh("));
+        assert!(
+            implementation_source.contains("fn active_snapshot_matches_background_core_refresh(")
+        );
+        assert!(implementation_source.contains("clear_snapshot_history(&mut current)"));
         assert!(implementation_source.contains("repository_snapshots_equal_for_refresh("));
 
         let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
@@ -39476,7 +40193,9 @@ diff --git a/file.txt b/file.txt
         let poll_source = &implementation_source[poll_start..poll_start + poll_end];
         assert!(poll_source.contains("let unchanged_background_snapshot = active_repo"));
         assert!(poll_source.contains("&& !was_foreground"));
-        assert!(poll_source.contains("self.active_snapshot_matches_background_refresh(&snapshot)"));
+        assert!(
+            poll_source.contains("self.active_snapshot_matches_background_core_refresh(&snapshot)")
+        );
         assert!(poll_source.contains("if !unchanged_background_snapshot"));
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
 
@@ -39484,7 +40203,7 @@ diff --git a/file.txt b/file.txt
             .find("fn apply_repository_snapshot(")
             .unwrap();
         let apply_end = implementation_source[apply_start..]
-            .find("fn active_snapshot_matches_background_refresh(")
+            .find("fn active_snapshot_matches_background_core_refresh(")
             .unwrap();
         let apply_source = &implementation_source[apply_start..apply_start + apply_end];
         for reset in [
@@ -40203,7 +40922,9 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("self.active_repo_tab != Some(*index)"));
         assert!(refresh_source.contains("self.start_repository_snapshot_load(tab.root.clone())"));
         assert!(refresh_source.contains("if !self.repo_tasks.is_empty()"));
-        assert!(refresh_source.contains("ctx.request_repaint_after(Duration::from_millis(80))"));
+        assert!(
+            refresh_source.contains("ctx.request_repaint_after(REPOSITORY_TASK_POLL_INTERVAL)")
+        );
         assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.restart_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.loading_repo = true"));
