@@ -55,6 +55,8 @@ const DEFAULT_INACTIVE_REPO_REFRESH_SECONDS: u64 = 60;
 const MIN_REPO_REFRESH_SECONDS: u64 = 1;
 const MAX_REPO_REFRESH_SECONDS: u64 = 3600;
 const REPOSITORY_TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TOOLBAR_BACKGROUND_STATUS_GRACE: Duration = Duration::from_millis(450);
+const TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 // Windows can transiently fail to start git.exe while the system is under memory pressure.
 // Retry from the UI scheduler after the worker has exited and released the snapshot gate.
 const REPOSITORY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -448,6 +450,7 @@ pub struct GitAgentApp {
     active_repo_refresh_seconds: u64,
     inactive_repo_refresh_seconds: u64,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    remote_git_status_key: Option<&'static str>,
     repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
     undo_entries: HashMap<String, RepositoryUndoEntry>,
     redo_entries: HashMap<String, RepositoryUndoEntry>,
@@ -490,6 +493,7 @@ pub struct GitAgentApp {
     loading_repo: bool,
     loading_details_hash: Option<String>,
     loading_diff_key: Option<String>,
+    toolbar_background_status: Option<(String, Instant)>,
     pending_branch_checkout: Option<String>,
     pending_commit_action: Option<CommitActionDialog>,
     last_notice: Option<String>,
@@ -2459,6 +2463,7 @@ impl GitAgentApp {
             active_repo_refresh_seconds,
             inactive_repo_refresh_seconds,
             remote_git_task: None,
+            remote_git_status_key: None,
             repository_undo_task: None,
             undo_entries: HashMap::new(),
             redo_entries: HashMap::new(),
@@ -2501,6 +2506,7 @@ impl GitAgentApp {
             loading_repo: false,
             loading_details_hash: None,
             loading_diff_key: None,
+            toolbar_background_status: None,
             pending_branch_checkout: None,
             pending_commit_action: None,
             last_notice: None,
@@ -3757,7 +3763,7 @@ impl GitAgentApp {
         let title = format!("{short_hash} vs working tree");
         let theme = merge_theme_arg(self.theme_mode).to_owned();
         let language = merge_language_arg(self.language).to_owned();
-        self.start_remote_git_action(move |root| {
+        self.start_remote_git_action_with_status("status.opening_merge_tool", move |root| {
             let diff_text = git::diff_worktree_against_commit(root, &hash)?;
             let temp_dir = env::temp_dir()
                 .join("git-agent-diffs")
@@ -3801,7 +3807,7 @@ impl GitAgentApp {
         let title = display_path.clone();
         let theme = merge_theme_arg(self.theme_mode).to_owned();
         let language = merge_language_arg(self.language).to_owned();
-        self.start_remote_git_action(move |root| {
+        self.start_remote_git_action_with_status("status.opening_merge_tool", move |root| {
             let diff = git::load_worktree_diff(root, &path, staged, untracked)?;
             let temp_dir = env::temp_dir()
                 .join("git-agent-diffs")
@@ -3855,7 +3861,7 @@ impl GitAgentApp {
             return;
         };
         let failure_hint = self.tr("patch.apply.failed_hint").to_owned();
-        self.start_remote_git_action(move |root| {
+        self.start_remote_git_action_with_status("status.applying_patch", move |root| {
             git::apply_patch(root, &patch_path)
                 .map_err(|error| anyhow::anyhow!("{failure_hint}\n\n{error:#}"))
         });
@@ -4239,7 +4245,7 @@ impl GitAgentApp {
         &mut self,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        self.start_remote_git_action(action);
+        self.start_remote_git_action_with_status("status.applying_changes", action);
     }
 
     fn branch_checkout_busy(&self) -> bool {
@@ -4322,19 +4328,24 @@ impl GitAgentApp {
     }
 
     fn repo_toolbar_loading_busy(&self) -> bool {
-        self.loading_repo
-            || self.branch_checkout_busy()
-            || self.remote_git_busy()
+        self.branch_checkout_busy()
             || self.merge_tool_busy()
             || self.repo_source_task.is_some()
+            || (self.loading_repo && !self.remote_git_busy())
     }
 
     fn repo_toolbar_loading_label(&self) -> &str {
         if self.branch_checkout_busy() {
             return self.tr("status.switching_branch");
         }
-        if self.remote_git_busy() {
-            return self.tr("status.running_git_action");
+        if self.credential_login_task.is_some() {
+            return self.tr("status.authenticating");
+        }
+        if self.remote_git_task.is_some() {
+            return self
+                .remote_git_status_key
+                .map(|key| self.tr(key))
+                .unwrap_or_else(|| self.tr("status.running_git_action"));
         }
         if self.merge_tool_busy() {
             return self.tr("status.resolving_conflicts");
@@ -4357,6 +4368,25 @@ impl GitAgentApp {
             return None;
         }
 
+        if self.credential_login_task.is_some() {
+            return Some(self.tr("status.authenticating"));
+        }
+        if self.remote_git_task.is_some() {
+            return Some(
+                self.remote_git_status_key
+                    .map(|key| self.tr(key))
+                    .unwrap_or_else(|| self.tr("status.running_git_action")),
+            );
+        }
+        if self.create_patch_task.is_some() {
+            return Some(self.tr("status.creating_patch"));
+        }
+        if self.repository_benchmark_task.is_some() {
+            return Some(self.tr("status.benchmarking_repository"));
+        }
+        if self.repository_undo_task.is_some() {
+            return Some(self.tr("status.restoring_repository_state"));
+        }
         if self.loading_diff_key.is_some() {
             return Some(self.tr("status.background_diff"));
         }
@@ -4383,6 +4413,30 @@ impl GitAgentApp {
         if !self.repo_history_tasks.is_empty() {
             return Some(self.tr("status.background_history"));
         }
+        None
+    }
+
+    fn displayed_repo_toolbar_background_status(&mut self, ctx: &egui::Context) -> Option<String> {
+        if self.repo_toolbar_loading_busy() {
+            self.toolbar_background_status = None;
+            return None;
+        }
+
+        if let Some(label) = self.repo_toolbar_background_status_label() {
+            let label = label.to_owned();
+            self.toolbar_background_status = Some((label.clone(), Instant::now()));
+            return Some(label);
+        }
+
+        let Some((label, last_active_at)) = self.toolbar_background_status.as_ref() else {
+            return None;
+        };
+        let elapsed = last_active_at.elapsed();
+        if elapsed < TOOLBAR_BACKGROUND_STATUS_GRACE {
+            ctx.request_repaint_after(TOOLBAR_BACKGROUND_STATUS_GRACE - elapsed);
+            return Some(label.clone());
+        }
+        self.toolbar_background_status = None;
         None
     }
 
@@ -4944,7 +4998,7 @@ impl GitAgentApp {
                 self.pending_pull_request_open_after_push = None;
                 self.pending_credential_retry = Some(action);
                 self.credential_retry_in_progress = after_login;
-                self.start_remote_git_action(move |root| {
+                self.start_remote_git_action_with_status("status.pushing", move |root| {
                     git::push_selected(root, &remote, &branches, options)
                 });
             }
@@ -4955,7 +5009,7 @@ impl GitAgentApp {
             } => {
                 self.pending_credential_retry = Some(action);
                 self.credential_retry_in_progress = after_login;
-                self.start_remote_git_action(move |root| {
+                self.start_remote_git_action_with_status("status.pushing", move |root| {
                     git::push_pull_request_branch(root, &remote, &local_branch, &remote_branch)
                 });
             }
@@ -4998,6 +5052,14 @@ impl GitAgentApp {
         &mut self,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
+        self.start_remote_git_action_with_status("status.running_git_action", action);
+    }
+
+    fn start_remote_git_action_with_status(
+        &mut self,
+        status_key: &'static str,
+        action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    ) {
         if self.remote_git_busy() || self.loading_repo {
             return;
         }
@@ -5012,6 +5074,7 @@ impl GitAgentApp {
 
         let (sender, receiver) = mpsc::channel();
         self.remote_git_task = Some(receiver);
+        self.remote_git_status_key = Some(status_key);
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -5090,7 +5153,7 @@ impl GitAgentApp {
     }
 
     fn quick_fetch_all(&mut self) {
-        self.start_remote_git_action(|root| {
+        self.start_remote_git_action_with_status("status.fetching", |root| {
             git::fetch_with_options(root, git::FetchOptions::default())
         });
     }
@@ -5178,7 +5241,7 @@ impl GitAgentApp {
     }
 
     fn quick_pull_current(&mut self) {
-        self.start_remote_git_action(|root| git::pull(root));
+        self.start_remote_git_action_with_status("status.pulling", |root| git::pull(root));
     }
 
     fn open_pull_dialog(&mut self, local_branch: Option<String>) {
@@ -5334,7 +5397,7 @@ impl GitAgentApp {
             self.error = Some(self.tr("push.detached_error").to_owned());
             return;
         }
-        self.start_remote_git_action(|root| git::push(root));
+        self.start_remote_git_action_with_status("status.pushing", |root| git::push(root));
     }
 
     fn open_push_dialog(&mut self, target_branch: Option<String>, target_remote: Option<String>) {
@@ -5960,6 +6023,7 @@ impl GitAgentApp {
         if let Some(receiver) = self.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
+                    self.remote_git_status_key = None;
                     let pull_request_to_open = self
                         .pending_pull_request_open_after_push
                         .take()
@@ -5979,6 +6043,7 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((root, Err(error))) => {
+                    self.remote_git_status_key = None;
                     let failed_pull_request_root = self
                         .pending_pull_request_open_after_push
                         .as_ref()
@@ -6030,6 +6095,7 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.remote_git_status_key = None;
                     self.pending_rewritten_history_prompt_root = None;
                     self.pending_pull_request_open_after_push = None;
                     self.loading_repo = false;
@@ -6828,7 +6894,12 @@ impl GitAgentApp {
                 move |root| git::commit_with_options(root, &message, options),
             );
         } else {
-            self.start_remote_git_action(move |root| {
+            let status_key = if push_immediately {
+                "status.committing_and_pushing"
+            } else {
+                "status.committing"
+            };
+            self.start_remote_git_action_with_status(status_key, move |root| {
                 git::commit_with_options(root, &message, options)?;
                 if push_immediately {
                     if let Some((remote, branch, has_upstream)) = push_target {
@@ -8904,9 +8975,8 @@ impl GitAgentApp {
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tool_content_row), |ui| {
                 let repo_toolbar_loading = self.repo_toolbar_loading_busy();
                 let repo_toolbar_loading_label = self.repo_toolbar_loading_label().to_owned();
-                let repo_toolbar_background_status = self
-                    .repo_toolbar_background_status_label()
-                    .map(str::to_owned);
+                let repo_toolbar_background_status =
+                    self.displayed_repo_toolbar_background_status(ctx);
                 let repo_action_busy = self.loading_repo || self.remote_git_busy();
                 let branch_actions_enabled = !self.branch_actions_busy();
                 let upstream_counts = upstream_sync_counts(self.snapshot.as_ref());
@@ -9012,7 +9082,7 @@ impl GitAgentApp {
                             });
                         });
                     if let Some(status) = repo_toolbar_background_status {
-                        repo_toolbar_background_indicator(ui, &status);
+                        repo_toolbar_background_indicator(ui, ctx, &status);
                     }
                 }
             });
@@ -11356,13 +11426,17 @@ impl GitAgentApp {
                 self.active_view = MainView::Workspace;
                 self.commit_message.clear();
                 self.save_commit_message_draft_for_active_repo();
-                self.start_remote_git_action(move |root| git::merge_branch(root, &name));
+                self.start_remote_git_action_with_status("status.merging", move |root| {
+                    git::merge_branch(root, &name)
+                });
             }
             BranchMenuAction::RebaseCurrentOnto { name } => {
-                self.start_remote_git_action(move |root| git::rebase_current_onto(root, &name));
+                self.start_remote_git_action_with_status("status.rebasing", move |root| {
+                    git::rebase_current_onto(root, &name)
+                });
             }
             BranchMenuAction::FetchTracked { remote_branch } => {
-                self.start_remote_git_action(move |root| {
+                self.start_remote_git_action_with_status("status.fetching", move |root| {
                     git::fetch_remote_branch(root, &remote_branch)
                 });
             }
@@ -11385,7 +11459,7 @@ impl GitAgentApp {
                 name,
                 remote_branch,
             } => {
-                self.start_remote_git_action(move |root| {
+                self.start_remote_git_action_with_status("status.updating_tracking", move |root| {
                     if let Some(remote_branch) = remote_branch {
                         git::set_branch_upstream(root, &name, &remote_branch)
                     } else {
@@ -19350,7 +19424,7 @@ fn repo_toolbar_loading_indicator(ui: &mut Ui, label: &str) {
     );
 }
 
-fn repo_toolbar_background_indicator(ui: &mut Ui, label: &str) {
+fn repo_toolbar_background_indicator(ui: &mut Ui, ctx: &egui::Context, label: &str) {
     let rect = ui.max_rect();
     ui.allocate_new_ui(
         egui::UiBuilder::new()
@@ -19360,13 +19434,10 @@ fn repo_toolbar_background_indicator(ui: &mut Ui, label: &str) {
             ui.add_space(16.0);
             ui.label(RichText::new(label).small().color(theme::muted()));
             ui.add_space(6.0);
-            ui.add(
-                egui::Image::new(icon_source(UiIcon::Loading))
-                    .fit_to_exact_size(Vec2::splat(14.0))
-                    .tint(theme::muted()),
-            );
+            ui.add(egui::Spinner::new().size(14.0).color(theme::muted()));
         },
     );
+    ctx.request_repaint_after(TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL);
 }
 
 fn themed_text_edit_selection(ui: &mut Ui) {
@@ -32906,7 +32977,10 @@ mod ui_tests {
         assert!(commit_source.contains("self.loading_repo || self.remote_git_busy()"));
         assert!(commit_source.contains("current_named_local_branch(snapshot)"));
         assert!(commit_source.contains("push.detached_error"));
-        assert!(commit_source.contains("self.start_remote_git_action(move |root|"));
+        assert!(
+            commit_source
+                .contains("self.start_remote_git_action_with_status(status_key, move |root|")
+        );
         assert!(!commit_source.contains("self.execute_git_action(move |root|"));
 
         let panel_start = implementation_source.find("fn commit_panel(").unwrap();
@@ -32994,7 +33068,9 @@ mod ui_tests {
             .unwrap();
         let action_source = &implementation_source[action_start..action_start + action_end];
         assert!(action_source.contains("Send + 'static"));
-        assert!(action_source.contains("self.start_remote_git_action(action);"));
+        assert!(action_source.contains(
+            "self.start_remote_git_action_with_status(\"status.applying_changes\", action);"
+        ));
         assert!(!action_source.contains("match action(&root)"));
         assert!(!action_source.contains("self.load_repository(root)"));
     }
@@ -38236,6 +38312,7 @@ diff --git a/file.txt b/file.txt
         let remote_action_source =
             &implementation_source[remote_action_start..remote_action_start + remote_action_end];
         assert!(remote_action_source.contains("self.loading_repo = true;"));
+        assert!(remote_action_source.contains("self.remote_git_status_key = Some(status_key);"));
 
         let remote_task_start = implementation_source
             .find("if let Some(receiver) = self.remote_git_task.take()")
@@ -38246,6 +38323,7 @@ diff --git a/file.txt b/file.txt
         let remote_task_source =
             &implementation_source[remote_task_start..remote_task_start + remote_task_end];
         assert!(remote_task_source.contains("self.load_repository_uncached(root)"));
+        assert!(remote_task_source.contains("self.remote_git_status_key = None;"));
         assert!(remote_task_source.contains("self.loading_repo = false"));
         assert!(
             !remote_task_source.contains("self.show_toast(self.tr(\"status.action_completed\"))")
@@ -38725,6 +38803,7 @@ diff --git a/file.txt b/file.txt
             implementation_source
                 .contains("fn repo_toolbar_background_status_label(&self) -> Option<&str>")
         );
+        assert!(implementation_source.contains("fn displayed_repo_toolbar_background_status("));
         assert!(implementation_source.contains("fn repo_toolbar_background_indicator("));
         assert!(implementation_source.contains("UiIcon::Loading"));
         assert!(implementation_source.contains("../assets/icons/loading.svg"));
@@ -38732,7 +38811,7 @@ diff --git a/file.txt b/file.txt
             .find("fn repo_toolbar_loading_indicator(")
             .unwrap();
         let indicator_end = implementation_source[indicator_start..]
-            .find("fn themed_text_edit_selection(")
+            .find("fn repo_toolbar_background_indicator(")
             .unwrap();
         let indicator_source =
             &implementation_source[indicator_start..indicator_start + indicator_end];
@@ -38749,7 +38828,7 @@ diff --git a/file.txt b/file.txt
             toolbar_source.contains("let repo_toolbar_loading = self.repo_toolbar_loading_busy();")
         );
         assert!(toolbar_source.contains("self.repo_toolbar_loading_label().to_owned()"));
-        assert!(toolbar_source.contains("repo_toolbar_background_status_label()"));
+        assert!(toolbar_source.contains("self.displayed_repo_toolbar_background_status(ctx)"));
         assert!(toolbar_source.contains("if repo_toolbar_loading {"));
         assert!(
             toolbar_source
@@ -38765,7 +38844,7 @@ diff --git a/file.txt b/file.txt
             &toolbar_source[loading_branch_start..loading_branch_start + loading_branch_end];
         assert!(!loading_branch.contains("toolbar_button("));
         assert!(loading_branch.contains("repo_toolbar_loading_label"));
-        assert!(toolbar_source.contains("repo_toolbar_background_indicator(ui, &status);"));
+        assert!(toolbar_source.contains("repo_toolbar_background_indicator(ui, ctx, &status);"));
 
         let background_start = implementation_source
             .find("fn repo_toolbar_background_status_label(")
@@ -38785,6 +38864,29 @@ diff --git a/file.txt b/file.txt
         ] {
             assert!(background_source.contains(required), "{required}");
         }
+
+        let displayed_start = implementation_source
+            .find("fn displayed_repo_toolbar_background_status(")
+            .unwrap();
+        let displayed_end = implementation_source[displayed_start..]
+            .find("fn request_branch_checkout(")
+            .unwrap();
+        let displayed_source =
+            &implementation_source[displayed_start..displayed_start + displayed_end];
+        assert!(displayed_source.contains("TOOLBAR_BACKGROUND_STATUS_GRACE"));
+        assert!(displayed_source.contains("self.toolbar_background_status = Some"));
+        assert!(displayed_source.contains("ctx.request_repaint_after"));
+
+        let background_indicator_start = implementation_source
+            .find("fn repo_toolbar_background_indicator(")
+            .unwrap();
+        let background_indicator_end = implementation_source[background_indicator_start..]
+            .find("fn themed_text_edit_selection(")
+            .unwrap();
+        let background_indicator_source = &implementation_source
+            [background_indicator_start..background_indicator_start + background_indicator_end];
+        assert!(background_indicator_source.contains("egui::Spinner::new()"));
+        assert!(background_indicator_source.contains("TOOLBAR_BACKGROUND_STATUS_FRAME_INTERVAL"));
     }
 
     #[test]
@@ -39268,7 +39370,7 @@ diff --git a/file.txt b/file.txt
             "git::set_branch_upstream(root, &name, &remote_branch)",
             "git::unset_branch_upstream(root, &name)",
             "self.commit_message.clear();",
-            "self.start_remote_git_action(move |root|",
+            "self.start_remote_git_action_with_status(",
             "self.active_view = MainView::Workspace;",
             "self.open_pull_dialog(Some(name));",
             "self.open_push_dialog(Some(name), None);",
