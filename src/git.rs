@@ -1054,6 +1054,22 @@ pub fn checkout_branch(root: impl AsRef<Path>, name: &str) -> Result<()> {
     git_output(root.as_ref(), &["checkout", name]).map(|_| ())
 }
 
+pub fn checkout_branch_with_merge(root: impl AsRef<Path>, name: &str) -> Result<()> {
+    git_output(root.as_ref(), &["checkout", "--merge", name]).map(|_| ())
+}
+
+pub fn checkout_error_requires_local_change_recovery(error_message: &str) -> bool {
+    let message = error_message.to_ascii_lowercase();
+    [
+        "would be overwritten by checkout",
+        "would be overwritten by merge",
+        "please commit your changes or stash them before you switch branches",
+        "you have local changes to",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 pub fn create_branch(root: impl AsRef<Path>, name: &str, hash: &str, checkout: bool) -> Result<()> {
     if checkout {
         git_output(root.as_ref(), &["checkout", "-b", name, hash]).map(|_| ())
@@ -3851,6 +3867,56 @@ mod tests {
             helper_source.find("reset").unwrap() < helper_source.find("clean").unwrap(),
             "tracked changes should reset before untracked files are cleaned"
         );
+    }
+
+    #[test]
+    fn checkout_local_change_conflicts_offer_recovery_but_other_errors_do_not() {
+        assert!(checkout_error_requires_local_change_recovery(
+            "error: Your local changes to the following files would be overwritten by checkout"
+        ));
+        assert!(checkout_error_requires_local_change_recovery(
+            "error: The following untracked working tree files would be overwritten by checkout"
+        ));
+        assert!(!checkout_error_requires_local_change_recovery(
+            "error: pathspec 'missing-branch' did not match any file(s) known to git"
+        ));
+    }
+
+    #[test]
+    fn checkout_branch_keeps_non_conflicting_worktree_changes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-checkout-preserve-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        fs::write(root.join("shared.txt"), "base\n")?;
+        fs::write(root.join("local-only.txt"), "base\n")?;
+        git_output(&root, &["add", "."])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let base_branch = git_output(&root, &["branch", "--show-current"])?;
+        let base_branch = base_branch.trim().to_owned();
+
+        git_output(&root, &["checkout", "-b", "target"])?;
+        fs::write(root.join("shared.txt"), "target\n")?;
+        git_output(&root, &["add", "shared.txt"])?;
+        git_output(&root, &["commit", "-m", "target change"])?;
+        git_output(&root, &["checkout", &base_branch])?;
+
+        fs::write(root.join("local-only.txt"), "local draft\n")?;
+        checkout_branch(&root, "target")?;
+
+        assert_eq!(
+            fs::read_to_string(root.join("local-only.txt"))?,
+            "local draft\n"
+        );
+        assert_eq!(fs::read_to_string(root.join("shared.txt"))?, "target\n");
+        fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]

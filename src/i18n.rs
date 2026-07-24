@@ -689,6 +689,26 @@ const ZH_SOURCE: &[(&str, &str)] = &[
         "\u{6e05}\u{9664}\u{ff08}\u{4e22}\u{5f03}\u{6240}\u{6709}\u{66f4}\u{6539}\u{ff09}",
     ),
     (
+        "branch.checkout_recovery_title",
+        "\u{672c}\u{5730}\u{66f4}\u{6539}\u{963b}\u{6b62}\u{5207}\u{6362}",
+    ),
+    (
+        "branch.checkout_recovery_detail",
+        "Git \u{65e0}\u{6cd5}\u{5728}\u{4fdd}\u{7559}\u{672c}\u{5730}\u{66f4}\u{6539}\u{7684}\u{6761}\u{4ef6}\u{4e0b}\u{5207}\u{6362}\u{5230}",
+    ),
+    (
+        "branch.checkout_stash_and_switch",
+        "\u{6682}\u{5b58}\u{540e}\u{5207}\u{6362}",
+    ),
+    (
+        "branch.checkout_merge_and_switch",
+        "\u{5c1d}\u{8bd5}\u{5408}\u{5e76}\u{5e76}\u{5207}\u{6362}",
+    ),
+    (
+        "branch.checkout_discard_and_switch",
+        "\u{4e22}\u{5f03}\u{5e76}\u{5207}\u{6362}",
+    ),
+    (
         "worktree.discard_all_confirm",
         "\u{4e22}\u{5f03}\u{6240}\u{6709}\u{672a}\u{63d0}\u{4ea4}\u{7684}\u{66f4}\u{6539}\u{ff1f}",
     ),
@@ -2107,6 +2127,17 @@ const EN: &[(&str, &str)] = &[
         "branch.discard_before_checkout",
         "Clear (discard all changes)",
     ),
+    (
+        "branch.checkout_recovery_title",
+        "Local changes block branch switch",
+    ),
+    (
+        "branch.checkout_recovery_detail",
+        "Git cannot switch while preserving local changes to",
+    ),
+    ("branch.checkout_stash_and_switch", "Stash and switch"),
+    ("branch.checkout_merge_and_switch", "Try merge and switch"),
+    ("branch.checkout_discard_and_switch", "Discard and switch"),
     ("checkout.title", "Checkout"),
     ("checkout.existing", "Checkout existing"),
     ("checkout.new_branch", "Checkout new branch"),

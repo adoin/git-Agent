@@ -594,7 +594,7 @@ struct KnownRepository {
 
 type RemoteGitTaskResult = (PathBuf, anyhow::Result<()>);
 type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>);
-type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>);
+type BranchCheckoutTaskResult = (PathBuf, String, BranchCheckoutStrategy, anyhow::Result<()>);
 type MergeToolTaskResult = (PathBuf, anyhow::Result<bool>);
 type RepoTaskResult = (PathBuf, anyhow::Result<RepositorySnapshot>);
 type RepoHistoryTaskResult = (
@@ -837,6 +837,14 @@ enum SshToolAction {
 enum CheckoutDialogTab {
     Existing,
     NewBranch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchCheckoutStrategy {
+    PreserveLocalChanges,
+    StashLocalChanges,
+    MergeLocalChanges,
+    DiscardLocalChanges,
 }
 
 #[derive(Clone, Debug)]
@@ -1319,8 +1327,9 @@ enum BranchActionDialog {
         short_hash: String,
         discard_changes: bool,
     },
-    ConfirmCheckout {
+    CheckoutRecovery {
         name: String,
+        checkout_error: String,
         discard_changes: bool,
     },
     CheckoutRemote {
@@ -4450,15 +4459,7 @@ impl GitAgentApp {
         if snapshot.branch == name {
             return;
         }
-        if !snapshot.status.is_empty() {
-            self.pending_branch_action = Some(BranchActionDialog::ConfirmCheckout {
-                name,
-                discard_changes: false,
-            });
-            return;
-        }
-
-        self.start_branch_checkout(name, false);
+        self.start_branch_checkout(name, BranchCheckoutStrategy::PreserveLocalChanges);
     }
 
     fn open_checkout_dialog(&mut self) {
@@ -4768,7 +4769,7 @@ impl GitAgentApp {
         });
     }
 
-    fn start_branch_checkout(&mut self, name: String, discard_changes: bool) {
+    fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy) {
         if self.branch_actions_busy() {
             return;
         }
@@ -4779,7 +4780,8 @@ impl GitAgentApp {
             return;
         }
 
-        if !discard_changes {
+        let has_local_changes = !snapshot.status.is_empty();
+        if strategy == BranchCheckoutStrategy::PreserveLocalChanges && !has_local_changes {
             let checkout_name = name.clone();
             self.start_undoable_git_action(
                 menu_label(self.language, "repo_checkout").to_owned(),
@@ -4799,13 +4801,28 @@ impl GitAgentApp {
         self.last_notice = None;
 
         thread::spawn(move || {
-            let result = (|| {
-                if discard_changes {
-                    git::discard_all_changes(&root)?;
+            let result = (|| match strategy {
+                BranchCheckoutStrategy::PreserveLocalChanges => git::checkout_branch(&root, &name),
+                BranchCheckoutStrategy::StashLocalChanges => {
+                    git::stash_push(
+                        &root,
+                        &format!("git-agent: before switching to {name}"),
+                        git::StashOptions {
+                            include_untracked: true,
+                            ..git::StashOptions::default()
+                        },
+                    )?;
+                    git::checkout_branch(&root, &name)
                 }
-                git::checkout_branch(&root, &name)
+                BranchCheckoutStrategy::MergeLocalChanges => {
+                    git::checkout_branch_with_merge(&root, &name)
+                }
+                BranchCheckoutStrategy::DiscardLocalChanges => {
+                    git::discard_all_changes(&root)?;
+                    git::checkout_branch(&root, &name)
+                }
             })();
-            let _ = sender.send((root, name, result));
+            let _ = sender.send((root, name, strategy, result));
         });
     }
 
@@ -5739,18 +5756,29 @@ impl GitAgentApp {
 
         if let Some(receiver) = self.branch_checkout_task.take() {
             match receiver.try_recv() {
-                Ok((root, name, Ok(()))) => {
+                Ok((root, name, _, Ok(()))) => {
                     self.error = None;
                     self.last_notice = None;
                     self.pending_branch_checkout = Some(name);
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
-                Ok((_, _, Err(error))) => {
+                Ok((_, name, strategy, Err(error))) => {
                     self.branch_checkout_task = None;
                     self.pending_branch_checkout = None;
                     self.loading_repo = false;
-                    self.error = Some(error.to_string());
+                    if strategy == BranchCheckoutStrategy::PreserveLocalChanges
+                        && git::checkout_error_requires_local_change_recovery(&error.to_string())
+                    {
+                        self.pending_branch_action = Some(BranchActionDialog::CheckoutRecovery {
+                            name,
+                            checkout_error: error.to_string(),
+                            discard_changes: false,
+                        });
+                        self.error = None;
+                    } else {
+                        self.error = Some(error.to_string());
+                    }
                     self.last_notice = None;
                     ctx.request_repaint();
                 }
@@ -15876,7 +15904,7 @@ impl GitAgentApp {
         let mut close_after = false;
         let mut execute: Option<Box<dyn FnOnce(&std::path::Path) -> anyhow::Result<()> + Send>> =
             None;
-        let mut checkout_requested: Option<(String, bool)> = None;
+        let mut checkout_requested: Option<(String, BranchCheckoutStrategy)> = None;
         let branch_actions_enabled = !self.branch_actions_busy();
 
         if matches!(
@@ -15937,13 +15965,14 @@ impl GitAgentApp {
                         },
                     );
                 }
-                BranchActionDialog::ConfirmCheckout {
+                BranchActionDialog::CheckoutRecovery {
                     name,
+                    checkout_error,
                     discard_changes,
                 } => {
                     compact_action_dialog(
                         ctx,
-                        self.tr("branch.confirm_checkout_title"),
+                        self.tr("branch.checkout_recovery_title"),
                         ACTION_DIALOG_WIDTH,
                         |ui| {
                             ui.horizontal(|ui| {
@@ -15957,37 +15986,75 @@ impl GitAgentApp {
                                 );
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} \"{}\"?",
-                                        self.tr("branch.confirm_checkout"),
+                                        "{} \"{}\"",
+                                        self.tr("branch.checkout_recovery_detail"),
                                         name
                                     ))
                                     .color(theme::text()),
                                 );
                             });
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(checkout_error.as_str())
+                                    .small()
+                                    .color(theme::muted()),
+                            );
                             ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                action_checkbox(
-                                    ui,
-                                    discard_changes,
-                                    self.tr("branch.discard_before_checkout"),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.button(self.tr("dialog.cancel")).clicked() {
-                                        close_after = true;
-                                    }
-                                    let submit_requested = dialog_default_submit_requested(ui);
-                                    if ui
-                                        .add_enabled(
-                                            branch_actions_enabled,
-                                            egui::Button::new(self.tr("dialog.ok")),
-                                        )
-                                        .clicked()
-                                        || (submit_requested && branch_actions_enabled)
-                                    {
-                                        checkout_requested = Some((name.clone(), *discard_changes));
-                                        close_after = true;
-                                    }
-                                });
+                            action_checkbox(
+                                ui,
+                                discard_changes,
+                                self.tr("branch.discard_before_checkout"),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if dialog_cancel_button(ui, self.tr("dialog.cancel")).clicked() {
+                                    close_after = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled,
+                                        egui::Button::new(
+                                            self.tr("branch.checkout_stash_and_switch"),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    checkout_requested = Some((
+                                        name.clone(),
+                                        BranchCheckoutStrategy::StashLocalChanges,
+                                    ));
+                                    close_after = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled,
+                                        egui::Button::new(
+                                            self.tr("branch.checkout_merge_and_switch"),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    checkout_requested = Some((
+                                        name.clone(),
+                                        BranchCheckoutStrategy::MergeLocalChanges,
+                                    ));
+                                    close_after = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        branch_actions_enabled && *discard_changes,
+                                        egui::Button::new(
+                                            self.tr("branch.checkout_discard_and_switch"),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    checkout_requested = Some((
+                                        name.clone(),
+                                        BranchCheckoutStrategy::DiscardLocalChanges,
+                                    ));
+                                    close_after = true;
+                                }
                             });
                         },
                     );
@@ -16165,8 +16232,8 @@ impl GitAgentApp {
             }
         }
 
-        if let Some((name, discard_changes)) = checkout_requested {
-            self.start_branch_checkout(name, discard_changes);
+        if let Some((name, strategy)) = checkout_requested {
+            self.start_branch_checkout(name, strategy);
         }
         if let Some(action) = execute {
             self.execute_git_action(action);
@@ -38894,10 +38961,9 @@ diff --git a/file.txt b/file.txt
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
-        assert!(
-            implementation_source
-                .contains("type BranchCheckoutTaskResult = (PathBuf, String, anyhow::Result<()>)")
-        );
+        assert!(implementation_source.contains(
+            "type BranchCheckoutTaskResult = (PathBuf, String, BranchCheckoutStrategy, anyhow::Result<()>)"
+        ));
         assert!(
             implementation_source
                 .contains("branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>")
@@ -38907,11 +38973,9 @@ diff --git a/file.txt b/file.txt
         assert!(
             implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
         );
-        assert!(
-            implementation_source.contains(
-                "fn start_branch_checkout(&mut self, name: String, discard_changes: bool)"
-            )
-        );
+        assert!(implementation_source.contains(
+            "fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)"
+        ));
         assert!(implementation_source.contains("self.request_branch_checkout(name);"));
         assert!(
             implementation_source.contains("fn load_repository_uncached(&mut self, path: PathBuf)")
@@ -38930,21 +38994,19 @@ diff --git a/file.txt b/file.txt
     }
 
     #[test]
-    fn dirty_local_branch_checkout_prompts_before_checkout_and_can_discard() {
+    fn dirty_local_branch_checkout_tries_native_checkout_then_offers_recovery() {
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains(
-            "ConfirmCheckout {\n        name: String,\n        discard_changes: bool,\n    }"
+            "CheckoutRecovery {\n        name: String,\n        checkout_error: String,\n        discard_changes: bool,\n    }"
         ));
         assert!(
             implementation_source.contains("fn request_branch_checkout(&mut self, name: String)")
         );
-        assert!(
-            implementation_source.contains(
-                "fn start_branch_checkout(&mut self, name: String, discard_changes: bool)"
-            )
-        );
+        assert!(implementation_source.contains(
+            "fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)"
+        ));
 
         let request_start = implementation_source
             .find("fn request_branch_checkout(&mut self, name: String)")
@@ -38953,21 +39015,24 @@ diff --git a/file.txt b/file.txt
             .find("fn start_branch_checkout(")
             .unwrap();
         let request_source = &implementation_source[request_start..request_start + request_end];
-        assert!(request_source.contains("!snapshot.status.is_empty()"));
-        assert!(
-            request_source
-                .contains("self.pending_branch_action = Some(BranchActionDialog::ConfirmCheckout")
-        );
-        assert!(request_source.contains("self.start_branch_checkout(name, false);"));
+        assert!(request_source.contains(
+            "self.start_branch_checkout(name, BranchCheckoutStrategy::PreserveLocalChanges);"
+        ));
 
         let checkout_start = implementation_source
-            .find("fn start_branch_checkout(&mut self, name: String, discard_changes: bool)")
+            .find("fn start_branch_checkout(&mut self, name: String, strategy: BranchCheckoutStrategy)")
             .unwrap();
         let checkout_end = implementation_source[checkout_start..]
             .find("fn remote_git_busy(&self)")
             .unwrap();
         let checkout_source = &implementation_source[checkout_start..checkout_start + checkout_end];
-        assert!(checkout_source.contains("if discard_changes {"));
+        assert!(checkout_source.contains("let has_local_changes = !snapshot.status.is_empty();"));
+        assert!(checkout_source.contains("BranchCheckoutStrategy::PreserveLocalChanges"));
+        assert!(checkout_source.contains("BranchCheckoutStrategy::StashLocalChanges"));
+        assert!(checkout_source.contains("BranchCheckoutStrategy::MergeLocalChanges"));
+        assert!(checkout_source.contains("BranchCheckoutStrategy::DiscardLocalChanges"));
+        assert!(checkout_source.contains("git::stash_push("));
+        assert!(checkout_source.contains("git::checkout_branch_with_merge(&root, &name)"));
         assert!(checkout_source.contains("git::discard_all_changes(&root)?;"));
         assert!(checkout_source.contains("git::checkout_branch(&root, &name)"));
 
@@ -38978,12 +39043,15 @@ diff --git a/file.txt b/file.txt
             .find("fn tag_action_modal(")
             .unwrap();
         let dialog_source = &implementation_source[dialog_start..dialog_start + dialog_end];
-        assert!(dialog_source.contains("BranchActionDialog::ConfirmCheckout"));
-        assert!(dialog_source.contains("branch.confirm_checkout"));
+        assert!(dialog_source.contains("BranchActionDialog::CheckoutRecovery"));
+        assert!(dialog_source.contains("branch.checkout_recovery_title"));
+        assert!(dialog_source.contains("branch.checkout_stash_and_switch"));
+        assert!(dialog_source.contains("branch.checkout_merge_and_switch"));
+        assert!(dialog_source.contains("branch.checkout_discard_and_switch"));
         assert!(dialog_source.contains("branch.discard_before_checkout"));
         assert!(dialog_source.contains("action_checkbox("));
         assert!(dialog_source.contains("discard_changes,"));
-        assert!(dialog_source.contains("self.start_branch_checkout(name, discard_changes);"));
+        assert!(dialog_source.contains("self.start_branch_checkout(name, strategy);"));
     }
 
     #[test]
