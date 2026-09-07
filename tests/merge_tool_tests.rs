@@ -215,13 +215,15 @@ fn merge_toolbar_labels_show_current_theme_and_language() {
 }
 
 #[test]
-fn write_merge_output_can_stage_resolved_file() {
+fn write_merge_output_can_stage_non_ascii_resolved_file_with_quotepath_enabled() {
     let root = env::temp_dir().join(format!("git-agent-merge-stage-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     run_git(&root, &["init"]);
+    run_git(&root, &["config", "core.quotepath", "true"]);
 
-    let output = root.join("story.txt");
+    let file_name = "客户合并 结果.mjs";
+    let output = root.join(file_name);
     let args = MergeArgs {
         base: root.join("base.txt"),
         local: root.join("local.txt"),
@@ -237,8 +239,8 @@ fn write_merge_output_can_stage_resolved_file() {
     write_merge_output(&args, "resolved\n").unwrap();
 
     assert_eq!(fs::read_to_string(&output).unwrap(), "resolved\n");
-    let cached = git_output(&root, &["diff", "--cached", "--name-only"]);
-    assert_eq!(cached.trim(), "story.txt");
+    let cached = git_output(&root, &["diff", "--cached", "--name-only", "-z"]);
+    assert_eq!(cached.strip_suffix('\0'), Some(file_name));
 
     let _ = fs::remove_dir_all(&root);
 }

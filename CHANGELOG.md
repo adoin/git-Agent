@@ -5,6 +5,18 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.5 — 2026-09-07
+
+### Changed
+
+- Reworked Git Agent Diff to use the same frameless shell as the merge tool, with rounded shadowed chrome, custom window controls, borderless sections, and in-window English / Chinese and light / dark switches.
+
+### Fixed
+
+- Preserved non-ASCII file names as real actionable paths throughout worktree status, staging and discarding, commit details and file search, patch creation, undo-state checks, conflict resolution, and AI merge context collection—even when `core.quotepath=true`.
+- Switched machine-readable Git path output to NUL-delimited parsing, including rename and copy records, instead of treating Git's display quoting as a path. Patch headers, which do not support NUL-delimited output, now use a dedicated Git C-style quoted-path decoder.
+- Kept Chinese and other non-ASCII paths readable and syntax-highlightable in Git Agent Diff, including created, deleted, renamed, and conflicted files.
+
 ## 1.4.4 — 2026-09-04
 
 ### Added

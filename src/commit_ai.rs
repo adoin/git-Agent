@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -28,12 +28,7 @@ pub(crate) struct Suggestion {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = crate::git::git_command();
     let mut child = command
         .current_dir(root)
         .args(["-c", "core.fsmonitor=false"])
@@ -125,12 +120,7 @@ impl Snapshot {
 }
 
 fn empty_tree(root: &Path) -> Result<String, String> {
-    let mut command = Command::new("git");
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = crate::git::git_command();
     let out = command
         .current_dir(root)
         .args(["hash-object", "-t", "tree", "--stdin", "-w"])

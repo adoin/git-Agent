@@ -4,7 +4,6 @@ use std::{
     env, fs,
     ops::Range,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver},
@@ -12,6 +11,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[allow(unused_imports)]
+use std::process::Command;
 
 use anyhow::{Context, anyhow};
 use eframe::egui::containers::scroll_area::ScrollBarVisibility;
@@ -25,6 +27,7 @@ use eframe::{
 };
 use similar::{Algorithm, DiffTag, capture_diff_slices};
 
+#[allow(unused_imports)]
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -2519,7 +2522,7 @@ pub fn write_merge_output(args: &MergeArgs, result_text: &str) -> anyhow::Result
 
 fn stage_merge_output(repo_root: &Path, output: &Path) -> anyhow::Result<()> {
     let path_arg = output.strip_prefix(repo_root).unwrap_or(output);
-    let status = Command::new("git")
+    let status = crate::git::git_command()
         .arg("-C")
         .arg(repo_root)
         .arg("add")
@@ -2972,10 +2975,22 @@ fn git_context_output<I>(repo_root: &Path, args: I) -> Result<String, String>
 where
     I: IntoIterator<Item = String>,
 {
-    let args = args.into_iter().collect::<Vec<_>>();
-    let mut command = Command::new("git");
-    #[cfg(target_os = "windows")]
-    command.creation_flags(MERGE_WINDOWS_CREATE_NO_WINDOW);
+    let mut args = args.into_iter().collect::<Vec<_>>();
+    let path_output = if args.iter().any(|arg| arg == "--name-status") {
+        Some(GitPathOutput::NameStatus)
+    } else if args.iter().any(|arg| arg == "--name-only") {
+        Some(GitPathOutput::NameOnly)
+    } else if args.first().is_some_and(|arg| arg == "status")
+        && args.iter().any(|arg| arg == "--short")
+    {
+        Some(GitPathOutput::Status)
+    } else {
+        None
+    };
+    if path_output.is_some() && !args.iter().any(|arg| arg == "-z") {
+        args.insert(1, "-z".to_owned());
+    }
+    let mut command = crate::git::git_command();
     let output = command
         .arg("-C")
         .arg(repo_root)
@@ -2983,7 +2998,12 @@ where
         .output()
         .map_err(|error| format!("Unable to read Git context: {error}"))?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(match path_output {
+            Some(GitPathOutput::NameOnly) => format_nul_name_only(&output.stdout),
+            Some(GitPathOutput::NameStatus) => format_nul_name_status(&output.stdout),
+            Some(GitPathOutput::Status) => format_nul_status(&output.stdout),
+            None => String::from_utf8_lossy(&output.stdout).into_owned(),
+        })
     } else {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if !error.is_empty() {
@@ -2998,6 +3018,75 @@ where
         }
         Err(error)
     }
+}
+
+#[derive(Clone, Copy)]
+enum GitPathOutput {
+    NameOnly,
+    NameStatus,
+    Status,
+}
+
+fn format_nul_name_only(output: &[u8]) -> String {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_nul_name_status(output: &[u8]) -> String {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let status = String::from_utf8_lossy(fields[index]);
+        index += 1;
+        let Some(path) = fields.get(index) else { break };
+        let path = String::from_utf8_lossy(path);
+        index += 1;
+        if (status.starts_with('R') || status.starts_with('C')) && index < fields.len() {
+            let destination = String::from_utf8_lossy(fields[index]);
+            index += 1;
+            lines.push(format!("{status}\t{path} -> {destination}"));
+        } else {
+            lines.push(format!("{status}\t{path}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_nul_status(output: &[u8]) -> String {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let record = String::from_utf8_lossy(fields[index]);
+        index += 1;
+        if record.starts_with("## ") {
+            lines.push(record.into_owned());
+            continue;
+        }
+        let bytes = record.as_bytes();
+        let renamed = bytes.len() >= 3
+            && bytes[2] == b' '
+            && (matches!(bytes[0], b'R' | b'C') || matches!(bytes[1], b'R' | b'C'));
+        if renamed && index < fields.len() {
+            let source = String::from_utf8_lossy(fields[index]);
+            index += 1;
+            lines.push(format!("{} {source} -> {}", &record[..2], &record[3..]));
+        } else {
+            lines.push(record.into_owned());
+        }
+    }
+    lines.join("\n")
 }
 
 fn send_merge_ai_tool_request(

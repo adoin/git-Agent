@@ -19,6 +19,11 @@ const DIFF_MINIMAP_WIDTH: f32 = 14.0;
 const DIFF_HORIZONTAL_SCROLLBAR_HEIGHT: f32 = 9.0;
 const DIFF_PANE_GAP: f32 = 8.0;
 const DIFF_GUTTER_WIDTH: f32 = 50.0;
+const DIFF_WINDOW_TITLEBAR_HEIGHT: f32 = 32.0;
+const DIFF_TOOLBAR_HEIGHT: f32 = 38.0;
+const DIFF_WINDOW_CONTROLS_WIDTH: f32 = 112.0;
+const DIFF_WINDOW_RESIZE_BORDER: f32 = 8.0;
+const DIFF_TITLE_DRAG_TOP_INSET: f32 = 9.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiffTheme {
@@ -184,14 +189,19 @@ impl DiffToolApp {
                 .with_title(title.clone())
                 .with_icon(diff_app_icon_data())
                 .with_inner_size([1120.0, 760.0])
-                .with_min_inner_size([820.0, 540.0]),
+                .with_min_inner_size([820.0, 540.0])
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_resizable(true),
             ..Default::default()
         };
         eframe::run_native(
             &title,
             options,
             Box::new(move |cc| {
+                prefer_shadowed_diff_window(cc);
                 crate::theme::install(&cc.egui_ctx);
+                egui_extras::install_image_loaders(&cc.egui_ctx);
                 apply_diff_theme(&cc.egui_ctx, args.theme);
                 let app = Self::from_args(args).unwrap_or_else(|error| Self {
                     args: DiffArgs {
@@ -215,27 +225,48 @@ impl DiffToolApp {
 }
 
 impl App for DiffToolApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let resizing = request_diff_window_resize_on_pointer_down(ctx, frame);
+        if !resizing {
+            request_diff_window_drag_on_pointer_down(ctx, frame);
+        }
+        update_diff_window_resize_cursor(ctx);
         let palette = diff_palette(self.args.theme);
 
+        egui::TopBottomPanel::top("diff_window_titlebar")
+            .exact_height(DIFF_WINDOW_TITLEBAR_HEIGHT)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.panel)
+                    .corner_radius(egui::CornerRadius {
+                        nw: 8,
+                        ne: 8,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .stroke(Stroke::NONE),
+            )
+            .show(ctx, |ui| diff_custom_title_bar(ui, ctx, self, palette));
+
         egui::TopBottomPanel::top("diff_toolbar")
-            .exact_height(32.0)
-            .frame(egui::Frame::new().fill(palette.bg))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.label(RichText::new(&self.args.title).strong().color(palette.text));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(&self.args.right_label).color(palette.added));
-                        ui.label(RichText::new("vs").color(palette.muted));
-                        ui.label(RichText::new(&self.args.left_label).color(palette.removed));
-                    });
-                });
-            });
+            .exact_height(DIFF_TOOLBAR_HEIGHT)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(palette.panel).stroke(Stroke::NONE))
+            .show(ctx, |ui| diff_toolbar(ui, ctx, self, palette));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.panel))
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.bg)
+                    .corner_radius(egui::CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 8,
+                        se: 8,
+                    })
+                    .stroke(Stroke::NONE),
+            )
             .show(ctx, |ui| {
                 if self.diff_text.trim().is_empty() {
                     ui.label(RichText::new(dt(self.args.language, "empty")).color(palette.muted));
@@ -259,6 +290,166 @@ impl App for DiffToolApp {
                 }
             });
     }
+}
+
+fn diff_custom_title_bar(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &DiffToolApp,
+    palette: DiffPalette,
+) {
+    let rect = ui.max_rect();
+    let title_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + 10.0, rect.top()),
+        Pos2::new(
+            rect.right() - DIFF_WINDOW_CONTROLS_WIDTH - 8.0,
+            rect.bottom(),
+        ),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(title_rect), |ui| {
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.label(RichText::new("Git Agent Diff").strong().color(palette.text));
+            ui.label(RichText::new(format!("- {}", app.args.title)).color(palette.muted));
+        });
+    });
+
+    let double_click_rect = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top() + DIFF_TITLE_DRAG_TOP_INSET),
+        Pos2::new(rect.right() - DIFF_WINDOW_CONTROLS_WIDTH, rect.bottom()),
+    );
+    if ui
+        .interact(
+            double_click_rect,
+            ui.id().with("diff_window_title_double_click"),
+            Sense::click(),
+        )
+        .double_clicked()
+    {
+        let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+
+    let controls_rect = Rect::from_min_max(
+        Pos2::new(rect.right() - DIFF_WINDOW_CONTROLS_WIDTH, rect.top() + 4.0),
+        Pos2::new(rect.right() - 7.0, rect.bottom() - 4.0),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if diff_window_control_button(ui, "\u{00d7}", true, palette).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+            if diff_window_control_button(
+                ui,
+                if maximized { "\u{2750}" } else { "\u{25a1}" },
+                false,
+                palette,
+            )
+            .clicked()
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            if diff_window_control_button(ui, "\u{2212}", false, palette).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        });
+    });
+}
+
+fn diff_toolbar(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &mut DiffToolApp,
+    palette: DiffPalette,
+) {
+    ui.horizontal_centered(|ui| {
+        ui.add_space(10.0);
+        ui.label(RichText::new(&app.args.left_label).color(palette.removed));
+        ui.label(RichText::new("vs").color(palette.muted));
+        ui.label(RichText::new(&app.args.right_label).color(palette.added));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(10.0);
+            if diff_toolbar_toggle_button(
+                ui,
+                egui::include_image!("../assets/icons/merge-language.svg"),
+                dt(app.args.language, "language"),
+                palette,
+            )
+            .clicked()
+            {
+                app.args.language = match app.args.language {
+                    DiffLanguage::English => DiffLanguage::Chinese,
+                    DiffLanguage::Chinese => DiffLanguage::English,
+                };
+            }
+            let (theme_icon, tooltip) = match app.args.theme {
+                DiffTheme::Dark => (
+                    egui::include_image!("../assets/icons/merge-moon.svg"),
+                    dt(app.args.language, "dark"),
+                ),
+                DiffTheme::Light => (
+                    egui::include_image!("../assets/icons/merge-sun.svg"),
+                    dt(app.args.language, "light"),
+                ),
+            };
+            if diff_toolbar_toggle_button(ui, theme_icon, tooltip, palette).clicked() {
+                app.args.theme = match app.args.theme {
+                    DiffTheme::Dark => DiffTheme::Light,
+                    DiffTheme::Light => DiffTheme::Dark,
+                };
+                apply_diff_theme(ctx, app.args.theme);
+            }
+        });
+    });
+}
+
+fn diff_toolbar_toggle_button(
+    ui: &mut egui::Ui,
+    icon: egui::ImageSource<'static>,
+    tooltip: &str,
+    palette: DiffPalette,
+) -> egui::Response {
+    let image = egui::Image::new(icon)
+        .fit_to_exact_size(Vec2::splat(15.0))
+        .tint(palette.muted);
+    ui.add(
+        egui::Button::image(image)
+            .min_size(Vec2::splat(28.0))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(egui::CornerRadius::same(4)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn diff_window_control_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    close: bool,
+    palette: DiffPalette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 22.0), Sense::click());
+    let fill = if close && response.hovered() {
+        Color32::from_rgb(192, 55, 43)
+    } else if response.hovered() {
+        palette.panel_soft
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(4), fill);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(16.0),
+        if close && response.hovered() {
+            Color32::WHITE
+        } else {
+            palette.text
+        },
+    );
+    response
 }
 
 pub fn parse_diff_args<I, S>(args: I) -> anyhow::Result<DiffArgs>
@@ -360,11 +551,17 @@ pub fn parse_side_by_side_diff(diff_text: &str) -> Vec<DiffFile> {
 
         let file = current_file_mut(&mut current);
         if raw.starts_with("--- ") {
-            file.left_path = raw.trim_start_matches("--- ").to_owned();
+            file.left_path = parse_git_path_tokens(raw.trim_start_matches("--- "))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "left".to_owned());
             continue;
         }
         if raw.starts_with("+++ ") {
-            file.right_path = raw.trim_start_matches("+++ ").to_owned();
+            file.right_path = parse_git_path_tokens(raw.trim_start_matches("+++ "))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "right".to_owned());
             continue;
         }
         if raw.starts_with("@@") {
@@ -561,10 +758,76 @@ fn parse_diff_paths(line: &str) -> (String, String) {
         .or_else(|| line.strip_prefix("diff --cc "))
         .or_else(|| line.strip_prefix("diff --combined "))
         .unwrap_or(line);
-    let mut parts = raw.split_whitespace().map(str::to_owned);
+    let mut parts = parse_git_path_tokens(raw).into_iter();
     let left = parts.next().unwrap_or_else(|| "left".to_owned());
     let right = parts.next().unwrap_or_else(|| left.clone());
     (left, right)
+}
+
+/// Decode the C-style path quoting used by Git patch headers. Patch output does
+/// not support `-z`, so this is the boundary where display quoting must be
+/// decoded back into the UTF-8 path used by the rest of the application.
+pub(crate) fn parse_git_path_tokens(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let mut token = Vec::new();
+        if bytes[index] == b'"' {
+            index += 1;
+            while index < bytes.len() && bytes[index] != b'"' {
+                if bytes[index] != b'\\' {
+                    token.push(bytes[index]);
+                    index += 1;
+                    continue;
+                }
+                index += 1;
+                if index >= bytes.len() {
+                    token.push(b'\\');
+                    break;
+                }
+                if matches!(bytes[index], b'0'..=b'7') {
+                    let mut value = 0u16;
+                    let mut digits = 0;
+                    while index < bytes.len() && digits < 3 && matches!(bytes[index], b'0'..=b'7') {
+                        value = value * 8 + u16::from(bytes[index] - b'0');
+                        index += 1;
+                        digits += 1;
+                    }
+                    token.push(value.min(255) as u8);
+                    continue;
+                }
+                token.push(match bytes[index] {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 0x0b,
+                    b'f' => 0x0c,
+                    b'r' => b'\r',
+                    escaped => escaped,
+                });
+                index += 1;
+            }
+            if index < bytes.len() && bytes[index] == b'"' {
+                index += 1;
+            }
+        } else {
+            let start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            token.extend_from_slice(&bytes[start..index]);
+        }
+        tokens.push(String::from_utf8_lossy(&token).into_owned());
+    }
+    tokens
 }
 
 fn parse_hunk_start(line: &str) -> Option<(usize, usize)> {
@@ -642,6 +905,7 @@ fn format_hunk_range(range: DiffHunkRange) -> String {
 struct DiffPalette {
     bg: Color32,
     panel: Color32,
+    panel_soft: Color32,
     text: Color32,
     muted: Color32,
     added: Color32,
@@ -660,6 +924,7 @@ fn diff_palette(theme: DiffTheme) -> DiffPalette {
         DiffTheme::Dark => DiffPalette {
             bg: Color32::from_rgb(24, 27, 31),
             panel: Color32::from_rgb(29, 32, 36),
+            panel_soft: Color32::from_rgb(49, 43, 43),
             text: Color32::from_rgb(222, 229, 238),
             muted: Color32::from_rgb(130, 143, 160),
             added: Color32::from_rgb(154, 220, 170),
@@ -675,6 +940,7 @@ fn diff_palette(theme: DiffTheme) -> DiffPalette {
         DiffTheme::Light => DiffPalette {
             bg: Color32::from_rgb(239, 242, 246),
             panel: Color32::from_rgb(253, 254, 255),
+            panel_soft: Color32::from_rgb(248, 225, 219),
             text: Color32::from_rgb(32, 39, 50),
             muted: Color32::from_rgb(105, 116, 132),
             added: Color32::from_rgb(32, 132, 72),
@@ -1418,15 +1684,254 @@ fn apply_diff_theme(ctx: &egui::Context, theme: DiffTheme) {
     visuals.widgets.hovered.bg_stroke = Stroke::NONE;
     visuals.widgets.active.bg_stroke = Stroke::NONE;
     visuals.widgets.open.bg_stroke = Stroke::NONE;
+    visuals.extreme_bg_color = palette.panel_soft;
+    visuals.faint_bg_color = palette.panel_soft;
     visuals.selection.stroke = Stroke::NONE;
     visuals.override_text_color = Some(palette.text);
     ctx.set_visuals(visuals);
 }
 
+fn diff_window_resize_direction(
+    rect: Rect,
+    pointer_pos: Pos2,
+) -> Option<egui::viewport::ResizeDirection> {
+    if !rect.contains(pointer_pos) {
+        return None;
+    }
+    let north = pointer_pos.y <= rect.top() + DIFF_WINDOW_RESIZE_BORDER;
+    let south = pointer_pos.y >= rect.bottom() - DIFF_WINDOW_RESIZE_BORDER;
+    let west = pointer_pos.x <= rect.left() + DIFF_WINDOW_RESIZE_BORDER;
+    let east = pointer_pos.x >= rect.right() - DIFF_WINDOW_RESIZE_BORDER;
+    use egui::viewport::ResizeDirection;
+    match (north, south, west, east) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (true, _, _, true) => Some(ResizeDirection::NorthEast),
+        (_, true, true, _) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::North),
+        (_, true, _, _) => Some(ResizeDirection::South),
+        (_, _, true, _) => Some(ResizeDirection::West),
+        (_, _, _, true) => Some(ResizeDirection::East),
+        _ => None,
+    }
+}
+
+fn diff_resize_cursor_icon(direction: egui::viewport::ResizeDirection) -> CursorIcon {
+    use egui::viewport::ResizeDirection;
+    match direction {
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::ResizeVertical,
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
+    }
+}
+
+fn request_diff_window_resize_on_pointer_down(ctx: &egui::Context, frame: &eframe::Frame) -> bool {
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    if maximized {
+        return false;
+    }
+    let Some((screen, pointer_pos)) = ctx.input(|input| {
+        input
+            .pointer
+            .primary_pressed()
+            .then(|| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .map(|pos| (input.screen_rect(), pos))
+            })
+            .flatten()
+    }) else {
+        return false;
+    };
+    let Some(direction) = diff_window_resize_direction(screen, pointer_pos) else {
+        return false;
+    };
+    request_native_diff_window_resize(ctx, frame, direction);
+    true
+}
+
+fn request_diff_window_drag_on_pointer_down(ctx: &egui::Context, frame: &eframe::Frame) {
+    let Some((screen, pointer_pos)) = ctx.input(|input| {
+        input
+            .pointer
+            .primary_pressed()
+            .then(|| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .map(|pos| (input.screen_rect(), pos))
+            })
+            .flatten()
+    }) else {
+        return;
+    };
+    let drag_rect = Rect::from_min_max(
+        Pos2::new(
+            screen.left() + DIFF_WINDOW_RESIZE_BORDER,
+            screen.top() + DIFF_TITLE_DRAG_TOP_INSET,
+        ),
+        Pos2::new(
+            screen.right() - DIFF_WINDOW_CONTROLS_WIDTH,
+            screen.top() + DIFF_WINDOW_TITLEBAR_HEIGHT,
+        ),
+    );
+    if drag_rect.contains(pointer_pos) {
+        request_native_diff_window_drag(ctx, frame);
+    }
+}
+
+fn update_diff_window_resize_cursor(ctx: &egui::Context) {
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    if maximized {
+        return;
+    }
+    if let Some((screen, pointer_pos)) = ctx.input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .map(|pos| (input.screen_rect(), pos))
+    }) {
+        if let Some(direction) = diff_window_resize_direction(screen, pointer_pos) {
+            ctx.set_cursor_icon(diff_resize_cursor_icon(direction));
+        }
+    }
+}
+
+fn request_native_diff_window_drag(ctx: &egui::Context, frame: &eframe::Frame) {
+    #[cfg(target_os = "windows")]
+    if post_diff_windows_non_client_pointer_down(
+        frame,
+        windows_sys::Win32::UI::WindowsAndMessaging::HTCAPTION as usize,
+    ) {
+        return;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = frame;
+    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+}
+
+fn request_native_diff_window_resize(
+    ctx: &egui::Context,
+    frame: &eframe::Frame,
+    direction: egui::ResizeDirection,
+) {
+    #[cfg(target_os = "windows")]
+    if post_diff_windows_non_client_pointer_down(frame, diff_windows_resize_hit_test(direction)) {
+        return;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = frame;
+    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+}
+
+#[cfg(target_os = "windows")]
+fn diff_windows_resize_hit_test(direction: egui::ResizeDirection) -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    };
+
+    match direction {
+        egui::ResizeDirection::North => HTTOP as usize,
+        egui::ResizeDirection::NorthEast => HTTOPRIGHT as usize,
+        egui::ResizeDirection::East => HTRIGHT as usize,
+        egui::ResizeDirection::SouthEast => HTBOTTOMRIGHT as usize,
+        egui::ResizeDirection::South => HTBOTTOM as usize,
+        egui::ResizeDirection::SouthWest => HTBOTTOMLEFT as usize,
+        egui::ResizeDirection::West => HTLEFT as usize,
+        egui::ResizeDirection::NorthWest => HTTOPLEFT as usize,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn diff_win32_point_lparam(x: i32, y: i32) -> isize {
+    let x = u32::from(x as i16 as u16);
+    let y = u32::from(y as i16 as u16);
+    ((y << 16) | x) as isize
+}
+
+#[cfg(target_os = "windows")]
+fn post_diff_windows_non_client_pointer_down(frame: &eframe::Frame, hit_test: usize) -> bool {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        UI::{
+            Input::KeyboardAndMouse::ReleaseCapture,
+            WindowsAndMessaging::{GetCursorPos, PostMessageW, WM_NCLBUTTONDOWN},
+        },
+    };
+
+    let Ok(window_handle) = frame.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+        return false;
+    };
+    let mut cursor = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut cursor) == 0 {
+            return false;
+        }
+        ReleaseCapture();
+        PostMessageW(
+            handle.hwnd.get() as _,
+            WM_NCLBUTTONDOWN,
+            hit_test,
+            diff_win32_point_lparam(cursor.x, cursor.y),
+        ) != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn prefer_shadowed_diff_window(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWCP_ROUND: u32 = 2;
+    const DWMWA_COLOR_NONE: u32 = 0xffff_fffe;
+
+    let Ok(window_handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = window_handle.as_raw() else {
+        return;
+    };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            handle.hwnd.get() as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &DWMWCP_ROUND as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+        // Suppress Windows 11's one-pixel accent border. The native DWM drop
+        // shadow remains, so the window is separated by depth rather than a line.
+        let _ = DwmSetWindowAttribute(
+            handle.hwnd.get() as _,
+            DWMWA_BORDER_COLOR,
+            &DWMWA_COLOR_NONE as *const u32 as _,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prefer_shadowed_diff_window(_: &eframe::CreationContext<'_>) {}
+
 fn dt(language: DiffLanguage, key: &str) -> &'static str {
     match (language, key) {
         (DiffLanguage::Chinese, "empty") => "\u{6ca1}\u{6709}\u{5dee}\u{5f02}",
+        (DiffLanguage::Chinese, "language") => "\u{4e2d}\u{6587}",
+        (DiffLanguage::Chinese, "dark") => "\u{6df1}\u{8272}",
+        (DiffLanguage::Chinese, "light") => "\u{4eae}\u{8272}",
         (_, "empty") => "No differences",
+        (_, "language") => "EN",
+        (_, "dark") => "Dark",
+        (_, "light") => "Light",
         _ => "",
     }
 }
@@ -1446,6 +1951,73 @@ mod tests {
             format_hunk_summary(raw, DiffLanguage::English),
             "Block  old 96–101  →  new 96–107  ·  const ruleId = getRuleId()"
         );
+    }
+
+    #[test]
+    fn git_quoted_non_ascii_patch_paths_decode_to_real_file_names() {
+        let quoted = "\"a/\\346\\265\\213\\350\\257\\225 \\346\\226\\207\\344\\273\\266.txt\"";
+        assert_eq!(parse_git_path_tokens(quoted), ["a/测试 文件.txt"]);
+
+        let patch = format!(
+            "diff --git {quoted} \"b/\\346\\265\\213\\350\\257\\225 \\346\\226\\207\\344\\273\\266.txt\"\n--- {quoted}\n+++ \"b/\\346\\265\\213\\350\\257\\225 \\346\\226\\207\\344\\273\\266.txt\"\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        let files = parse_side_by_side_diff(&patch);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].left_path, "a/测试 文件.txt");
+        assert_eq!(files[0].right_path, "b/测试 文件.txt");
+    }
+
+    #[test]
+    fn diff_window_shell_matches_merge_controls_without_native_borders_or_dividers() {
+        let source = include_str!("diff_tool.rs");
+        assert!(source.contains("prefer_shadowed_diff_window(cc);"));
+        assert!(source.contains("DWMWA_BORDER_COLOR"));
+        assert!(source.contains("DWMWA_COLOR_NONE"));
+        assert!(source.contains(".with_decorations(false)"));
+        assert!(source.contains(".with_transparent(true)"));
+        assert!(source.contains("fn diff_custom_title_bar("));
+        assert!(source.contains("fn diff_window_control_button("));
+        assert!(source.contains("merge-language.svg"));
+        assert!(source.contains("merge-sun.svg"));
+        assert!(source.contains("merge-moon.svg"));
+        assert!(source.matches(".show_separator_line(false)").count() >= 2);
+    }
+
+    #[test]
+    fn frameless_diff_window_edges_resize_before_the_title_drag_region() {
+        use egui::viewport::ResizeDirection;
+
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_120.0, 760.0));
+        assert_eq!(
+            diff_window_resize_direction(rect, Pos2::new(1_117.0, 757.0)),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            diff_window_resize_direction(rect, Pos2::new(2.0, 380.0)),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            diff_window_resize_direction(rect, Pos2::new(560.0, 380.0)),
+            None
+        );
+
+        let source = include_str!("diff_tool.rs");
+        let update_start = source.find("impl App for DiffToolApp").unwrap();
+        let update_end = source[update_start..]
+            .find("pub fn parse_diff_args")
+            .unwrap();
+        let update_source = &source[update_start..update_start + update_end];
+        assert!(
+            update_source
+                .find("request_diff_window_resize_on_pointer_down(ctx, frame)")
+                .unwrap()
+                < update_source
+                    .find("request_diff_window_drag_on_pointer_down(ctx, frame)")
+                    .unwrap()
+        );
+        assert!(source.contains("input.pointer.primary_pressed()"));
+        assert!(source.contains("ViewportCommand::BeginResize(direction)"));
+        assert!(source.contains("ViewportCommand::StartDrag"));
     }
 
     #[test]

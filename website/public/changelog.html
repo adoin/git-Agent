@@ -26,6 +26,17 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>1.4.5 — 2026-09-07</h2>
+<h3>改进</h3>
+<ul>
+<li>Git Agent Diff 改用与合并工具一致的无边框外壳，包括圆角阴影、自绘窗口按钮、无分割线区域，以及窗口内的中英文和深色 / 亮色切换。</li>
+</ul>
+<h3>修复</h3>
+<ul>
+<li>即使仓库启用了 `core.quotepath=true`，工作区状态、暂存与丢弃、提交详情与文件搜索、补丁创建、撤销状态检查、冲突处理和 AI 合并上下文也会始终保留真实可操作的中文及其他非 ASCII 文件路径。</li>
+<li>机器可读的 Git 路径输出统一改为 NUL 分隔解析，并正确处理重命名与复制记录，不再把 Git 用于展示的转义文本当作真实路径。无法使用 NUL 分隔的补丁头则通过专用的 Git C 风格路径反转义器解析。</li>
+<li>Git Agent Diff 中新增、删除、重命名和冲突文件的中文及其他非 ASCII 路径现在可以正常显示并匹配语法高亮。</li>
+</ul>
 <h2>1.4.4 — 2026-09-04</h2>
 <h3>新增</h3>
 <ul>
@@ -77,6 +88,17 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>1.4.5 — 2026-09-07</h2>
+<h3>Changed</h3>
+<ul>
+<li>Reworked Git Agent Diff to use the same frameless shell as the merge tool, with rounded shadowed chrome, custom window controls, borderless sections, and in-window English / Chinese and light / dark switches.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Preserved non-ASCII file names as real actionable paths throughout worktree status, staging and discarding, commit details and file search, patch creation, undo-state checks, conflict resolution, and AI merge context collection—even when `core.quotepath=true`.</li>
+<li>Switched machine-readable Git path output to NUL-delimited parsing, including rename and copy records, instead of treating Git&#x27;s display quoting as a path. Patch headers, which do not support NUL-delimited output, now use a dedicated Git C-style quoted-path decoder.</li>
+<li>Kept Chinese and other non-ASCII paths readable and syntax-highlightable in Git Agent Diff, including created, deleted, renamed, and conflicted files.</li>
+</ul>
 <h2>1.4.4 — 2026-09-04</h2>
 <h3>Added</h3>
 <ul>

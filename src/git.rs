@@ -305,7 +305,11 @@ pub struct RepositoryUndoPosition {
 pub fn repository_undo_position(root: impl AsRef<Path>) -> Result<RepositoryUndoPosition> {
     let root = root.as_ref();
     let mut position = repository_undo_position_without_status(root)?;
-    position.status = git_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    position.status = String::from_utf8_lossy(&git_output_bytes(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?)
+    .into_owned();
     Ok(position)
 }
 
@@ -326,10 +330,12 @@ pub fn repository_undo_position_without_status(
 }
 
 pub fn repository_has_worktree_changes(position: &RepositoryUndoPosition) -> bool {
-    position.status.lines().any(|line| {
-        let bytes = line.as_bytes();
-        bytes.get(1).is_some_and(|status| *status != b' ')
-    })
+    let status = if position.status.contains('\0') {
+        parse_porcelain_v1_z(position.status.as_bytes())
+    } else {
+        position.status.lines().map(str::to_owned).collect()
+    };
+    parse_status_entries(&status).1.len() > 0
 }
 
 pub fn restore_repository_undo_position(
@@ -484,11 +490,17 @@ pub fn repository_refresh_fingerprint(
     root: impl AsRef<Path>,
 ) -> Result<RepositoryRefreshFingerprint> {
     let root = root.as_ref();
-    let output = git_output(
+    let output = git_output_bytes(
         root,
-        &["status", "--short", "--branch", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+        ],
     )?;
-    let mut fingerprint = parse_repository_refresh_fingerprint(&output);
+    let mut fingerprint = parse_repository_refresh_fingerprint_z(&output);
     fingerprint.worktree_signature = repository_worktree_signature(root, &fingerprint.status);
     Ok(fingerprint)
 }
@@ -536,6 +548,33 @@ fn parse_repository_refresh_fingerprint(output: &str) -> RepositoryRefreshFinger
     };
     let (branch, ahead, behind) = header
         .map(parse_short_branch_status_header)
+        .unwrap_or_else(|| ("HEAD".to_owned(), 0, 0));
+    let (_, unstaged) = parse_status_entries(&status);
+    RepositoryRefreshFingerprint {
+        branch,
+        status,
+        ahead,
+        behind,
+        unstaged_count: unstaged.len(),
+        worktree_signature: Vec::new(),
+    }
+}
+
+fn parse_repository_refresh_fingerprint_z(output: &[u8]) -> RepositoryRefreshFingerprint {
+    let mut fields = output.split(|byte| *byte == 0).filter(|field| !field.is_empty());
+    let first = fields.next();
+    let (header, status_fields) = match first {
+        Some(first) if first.starts_with(b"## ") => (Some(first), fields.collect::<Vec<_>>()),
+        Some(first) => {
+            let mut status = vec![first];
+            status.extend(fields);
+            (None, status)
+        }
+        None => (None, Vec::new()),
+    };
+    let status = parse_porcelain_v1_z_fields(&status_fields);
+    let (branch, ahead, behind) = header
+        .map(|header| parse_short_branch_status_header(&String::from_utf8_lossy(header)))
         .unwrap_or_else(|| ("HEAD".to_owned(), 0, 0));
     let (_, unstaged) = parse_status_entries(&status);
     RepositoryRefreshFingerprint {
@@ -750,14 +789,15 @@ where
     report_benchmark_progress(&mut on_progress, completed, "benchmark.step.commit_details");
     let (get_file_status_all_ms, status_output) = benchmark_git_output(
         &root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     );
     completed += 1;
     report_benchmark_progress(&mut on_progress, completed, "benchmark.step.file_status");
     let (get_remote_repos_ms, _) = benchmark_git_output(&root, &["remote", "-v"]);
     completed += 1;
     report_benchmark_progress(&mut on_progress, completed, "benchmark.step.remotes");
-    let (_, file_output) = benchmark_git_output(&root, &["ls-files", "-co", "--exclude-standard"]);
+    let (_, file_output) =
+        benchmark_git_output(&root, &["ls-files", "-z", "-co", "--exclude-standard"]);
     completed += 1;
     report_benchmark_progress(&mut on_progress, completed, "benchmark.step.files");
     let hardware_stats = hardware_stats();
@@ -778,14 +818,11 @@ where
         get_file_status_all_ms,
         get_remote_repos_ms,
         total_files: file_output
-            .lines()
-            .filter(|line| !line.trim().is_empty())
+            .split('\0')
+            .filter(|path| !path.is_empty())
             .count()
             .max(
-                status_output
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .count(),
+                parse_porcelain_v1_z(status_output.as_bytes()).len(),
             ),
         hardware_stats,
         source_tree_version: format!("Git Agent {}", env!("CARGO_PKG_VERSION")),
@@ -958,12 +995,19 @@ pub fn validate_remote_url(url: &str) -> Result<()> {
 
 pub fn load_commit_details(root: impl AsRef<Path>, hash: &str) -> Result<CommitDetails> {
     let root = root.as_ref();
-    let output = git_output(
+    let output = git_output_bytes(
         root,
-        &["show", "--format=", "--name-status", "--find-renames", hash],
+        &[
+            "show",
+            "--format=",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            hash,
+        ],
     )?;
 
-    let files = parse_file_changes(&output);
+    let files = parse_file_changes_z(&output);
     let committer = git_output(root, &["show", "-s", "--format=%cn", hash])
         .unwrap_or_default()
         .trim()
@@ -1009,17 +1053,18 @@ pub fn search_commits_by_changed_file(
     }
 
     let max_count = format!("--max-count={HISTORY_COMMIT_LIMIT}");
-    let path_output = search_git_output(
+    let path_output = search_git_output_bytes(
         root.as_ref(),
         &[
             "log",
             "--date-order",
             &max_count,
             "--name-only",
+            "-z",
             "--format=%x1e%H",
         ], cancelled,
     )?;
-    let mut hashes = parse_changed_file_search_log(&path_output, raw_query);
+    let mut hashes = parse_changed_file_search_log_z(&path_output, raw_query);
     on_paths(hashes.clone());
     let content_regex = literal_git_regex(raw_query);
     let content_output = search_git_output(
@@ -1045,13 +1090,17 @@ pub fn search_commits_by_changed_file(
 }
 
 fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<String> {
+    Ok(String::from_utf8_lossy(&search_git_output_bytes(root, args, cancelled)?).into_owned())
+}
+
+fn search_git_output_bytes(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>> {
     if cancelled.load(AtomicOrdering::Relaxed) { return Err(anyhow!("Search cancelled")); }
     let mut child = git_command().arg("-C").arg(root).args(args)
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes while waiting, so large filename output cannot block Git.
-    std::thread::scope(|scope| -> Result<String> {
+    std::thread::scope(|scope| -> Result<Vec<u8>> {
         let output = scope.spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
         let errors = scope.spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
         let status = loop {
@@ -1069,7 +1118,7 @@ fn search_git_output(root: &Path, args: &[&str], cancelled: &AtomicBool) -> Resu
         let stdout = output.join().map_err(|_| anyhow!("Search output reader stopped"))??;
         let stderr = errors.join().map_err(|_| anyhow!("Search diagnostic reader stopped"))??;
         if !status.success() { return Err(anyhow!("{}", String::from_utf8_lossy(&stderr))); }
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        Ok(stdout)
     })
 }
 
@@ -1106,6 +1155,36 @@ fn parse_changed_file_search_log(output: &str, query: &str) -> Vec<String> {
         }
     }
     hashes
+}
+
+fn parse_changed_file_search_log_z(output: &[u8], query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    output
+        .split(|byte| *byte == 0x1e)
+        .filter_map(|record| {
+            let mut fields = record.split(|byte| *byte == 0);
+            let hash = String::from_utf8_lossy(fields.next()?).trim().to_owned();
+            if hash.is_empty() {
+                return None;
+            }
+            fields
+                .filter(|path| !path.is_empty())
+                .enumerate()
+                .any(|(index, path)| {
+                    let path = if index == 0 {
+                        path.strip_prefix(b"\n").unwrap_or(path)
+                    } else {
+                        path
+                    };
+                    String::from_utf8_lossy(path).to_lowercase().contains(&query)
+                })
+                .then_some(hash)
+        })
+        .collect()
 }
 
 fn parse_hash_lines(output: &str) -> Vec<String> {
@@ -1280,16 +1359,17 @@ fn unified_diff_paths(text: &str, fallback: &str) -> (Option<String>, Option<Str
 }
 
 fn diff_header_path(value: &str) -> Option<String> {
-    let value = value.split('\t').next().unwrap_or(value).trim();
+    let value = crate::diff_tool::parse_git_path_tokens(value)
+        .into_iter()
+        .next()?;
     if value == "/dev/null" {
         return None;
     }
-    let value = value.trim_matches('"');
     Some(
         value
             .strip_prefix("a/")
             .or_else(|| value.strip_prefix("b/"))
-            .unwrap_or(value)
+            .unwrap_or(&value)
             .to_owned(),
     )
 }
@@ -2933,24 +3013,29 @@ pub fn create_worktree_patch_for_paths(
 
 pub fn create_worktree_patch(root: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
     let root = root.as_ref();
-    let mut paths = git_output(root, &["diff", "--name-only", "HEAD", "--"])?
-        .lines()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard"])?;
-    for path in untracked
-        .lines()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-    {
-        if !paths.iter().any(|existing| existing == path) {
-            paths.push(path.to_owned());
+    let mut paths = parse_nul_paths(&git_output_bytes(
+        root,
+        &["diff", "--name-only", "-z", "HEAD", "--"],
+    )?);
+    let untracked = parse_nul_paths(&git_output_bytes(
+        root,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )?);
+    for path in untracked {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
         }
     }
     create_worktree_patch_for_paths(root, output_path, &paths)?;
     Ok(())
+}
+
+fn parse_nul_paths(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
 }
 
 fn write_patch_atomically(output_path: &Path, contents: &[u8]) -> Result<()> {
@@ -3757,6 +3842,41 @@ fn parse_file_changes(output: &str) -> Vec<FileChange> {
         .collect()
 }
 
+fn parse_file_changes_z(output: &[u8]) -> Vec<FileChange> {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut changes = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let status = String::from_utf8_lossy(fields[index]).into_owned();
+        index += 1;
+        let Some(first_path) = fields.get(index) else {
+            break;
+        };
+        let first_path = String::from_utf8_lossy(first_path).into_owned();
+        index += 1;
+        let renamed = status.starts_with('R') || status.starts_with('C');
+        let (path, diff_path) = if renamed {
+            let Some(destination) = fields.get(index) else {
+                break;
+            };
+            let destination = String::from_utf8_lossy(destination).into_owned();
+            index += 1;
+            (format!("{first_path} -> {destination}"), destination)
+        } else {
+            (first_path.clone(), first_path)
+        };
+        changes.push(FileChange {
+            status,
+            path,
+            diff_path,
+        });
+    }
+    changes
+}
+
 fn parse_status_entries(lines: &[String]) -> (Vec<WorktreeFile>, Vec<WorktreeFile>) {
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
@@ -3775,27 +3895,69 @@ fn parse_status_entries(lines: &[String]) -> (Vec<WorktreeFile>, Vec<WorktreeFil
     (staged, unstaged)
 }
 
+/// Parse `git status --porcelain=v1 -z` without relying on Git's display quoting.
+/// Rename/copy records contain the destination first and the source in the next
+/// NUL field. We retain both in one canonical record separated by NUL, which is
+/// the only byte forbidden in a filesystem path.
+fn parse_porcelain_v1_z(output: &[u8]) -> Vec<String> {
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    parse_porcelain_v1_z_fields(&fields)
+}
+
+fn parse_porcelain_v1_z_fields(fields: &[&[u8]]) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let field = String::from_utf8_lossy(fields[index]);
+        index += 1;
+        let bytes = field.as_bytes();
+        if bytes.len() < 3 || bytes[2] != b' ' {
+            continue;
+        }
+        let renamed = matches!(bytes[0], b'R' | b'C') || matches!(bytes[1], b'R' | b'C');
+        if renamed && index < fields.len() {
+            let source = String::from_utf8_lossy(fields[index]);
+            index += 1;
+            records.push(format!("{field}\0{source}"));
+        } else {
+            records.push(field.into_owned());
+        }
+    }
+    records
+}
+
 fn parse_status_entry(line: &str) -> Option<WorktreeFile> {
     let mut chars = line.chars();
     let index_status = chars.next().unwrap_or(' ');
     let worktree_status = chars.next().unwrap_or(' ');
-    let raw_path = line.get(3..)?.trim();
+    let raw_path = line.get(3..)?;
     if raw_path.is_empty() {
         return None;
     }
 
-    let path = raw_path
-        .split(" -> ")
-        .last()
-        .unwrap_or(raw_path)
-        .trim()
-        .to_owned();
+    let (path, display_path) = if let Some((destination, source)) = raw_path.split_once('\0') {
+        (
+            destination.to_owned(),
+            format!("{source} -> {destination}"),
+        )
+    } else {
+        let path = raw_path
+            .split(" -> ")
+            .last()
+            .unwrap_or(raw_path)
+            .trim()
+            .to_owned();
+        (path, raw_path.to_owned())
+    };
 
     Some(WorktreeFile {
         index_status,
         worktree_status,
         path,
-        display_path: raw_path.to_owned(),
+        display_path,
     })
 }
 
@@ -4254,6 +4416,10 @@ fn has_head(root: &Path) -> bool {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_output_bytes(root, args)?).into_owned())
+}
+
+fn git_output_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = git_command()
         .arg("-C")
         .arg(root)
@@ -4269,7 +4435,7 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output.stdout)
 }
 
 fn git_failure_diagnostic(output: &Output) -> String {
@@ -4351,7 +4517,7 @@ fn has_unmerged_paths(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn git_command() -> Command {
+pub(crate) fn git_command() -> Command {
     #[cfg(target_os = "windows")]
     {
         let mut command = Command::new("git");
@@ -4560,6 +4726,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_nul_changed_file_search_log_without_path_quoting() {
+        let output = b"\x1eabc123\0\nsrc/normal.rs\0\xe6\xb5\x8b\xe8\xaf\x95 \xe6\x96\x87\xe6\xa1\xa3.txt\0\x1edef456\0\nsrc/main.rs\0";
+
+        assert_eq!(
+            parse_changed_file_search_log_z(output, "测试"),
+            vec!["abc123"]
+        );
+    }
+
+    #[test]
     fn parses_content_search_hash_lines_and_escapes_literal_regex() {
         assert_eq!(
             parse_hash_lines("abc123\n\n def456 \n"),
@@ -4579,6 +4755,28 @@ mod tests {
         assert_eq!(changes[2].status, "R100");
         assert_eq!(changes[2].path, "old.rs -> new.rs");
         assert_eq!(changes[2].diff_path, "new.rs");
+    }
+
+    #[test]
+    fn parses_nul_name_status_and_rename_paths() {
+        let changes = parse_file_changes_z(
+            b"M\0\xe6\xb5\x8b\xe8\xaf\x95 \xe6\x96\x87\xe6\xa1\xa3.txt\0R100\0old -> name.txt\0new -> name.txt\0",
+        );
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].diff_path, "测试 文档.txt");
+        assert_eq!(changes[1].path, "old -> name.txt -> new -> name.txt");
+        assert_eq!(changes[1].diff_path, "new -> name.txt");
+    }
+
+    #[test]
+    fn parses_nul_porcelain_rename_without_confusing_arrow_in_path() {
+        let status = parse_porcelain_v1_z(b"R  new -> name.txt\0old -> name.txt\0");
+        let (staged, unstaged) = parse_status_entries(&status);
+
+        assert!(unstaged.is_empty());
+        assert_eq!(staged[0].path, "new -> name.txt");
+        assert_eq!(staged[0].display_path, "old -> name.txt -> new -> name.txt");
     }
 
     #[test]
@@ -4867,6 +5065,14 @@ mod tests {
         assert_eq!(
             unified_diff_paths(created, "src/new.ts"),
             (None, Some("src/new.ts".to_owned()))
+        );
+        let quoted = "--- \"a/\\346\\265\\213\\350\\257\\225 \\346\\226\\207\\344\\273\\266.txt\"\n+++ \"b/\\346\\265\\213\\350\\257\\225 \\346\\226\\207\\344\\273\\266.txt\"\n";
+        assert_eq!(
+            unified_diff_paths(quoted, "测试 文件.txt"),
+            (
+                Some("测试 文件.txt".to_owned()),
+                Some("测试 文件.txt".to_owned())
+            )
         );
     }
 
@@ -5539,6 +5745,129 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[test]
+    fn nul_path_outputs_remain_actionable_with_quotepath_enabled() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-non-ascii-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        git_output(&root, &["config", "core.quotepath", "true"])?;
+        fs::write(root.join("README.md"), "base\n")?;
+        git_output(&root, &["add", "README.md"])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+
+        let path = "测试 文档.txt";
+        fs::write(root.join(path), "中文路径\n")?;
+        let display_status = git_output(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )?;
+        assert!(display_status.contains("\\346"));
+
+        let snapshot = repository_refresh_fingerprint(&root)?;
+        let (_, unstaged) = parse_status_entries(&snapshot.status);
+        assert_eq!(unstaged.len(), 1);
+        assert_eq!(unstaged[0].path, path);
+
+        stage_paths(&root, &[unstaged[0].path.clone()])?;
+        assert_eq!(
+            parse_nul_paths(&git_output_bytes(
+                &root,
+                &["diff", "--cached", "--name-only", "-z"],
+            )?),
+            vec![path]
+        );
+        git_output(&root, &["commit", "-m", "add localized document"])?;
+        let hash = git_output(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
+        assert_eq!(load_commit_details(&root, &hash)?.files[0].diff_path, path);
+        let cancelled = AtomicBool::new(false);
+        assert!(search_commits_by_changed_file(&root, "测试", &cancelled, |_| {})?
+            .contains(&hash));
+
+        fs::write(root.join(path), "已修改\n")?;
+        unstage_paths(&root, &[path.to_owned()])?;
+        let snapshot = repository_refresh_fingerprint(&root)?;
+        assert_eq!(snapshot.status, [format!(" M {path}")]);
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn non_ascii_conflict_list_versions_and_accept_action_use_the_exact_path() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "git-agent-non-ascii-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        git_output(&root, &["init"])?;
+        git_output(&root, &["config", "user.email", "tester@example.com"])?;
+        git_output(&root, &["config", "user.name", "Git Agent Test"])?;
+        git_output(&root, &["config", "core.autocrlf", "false"])?;
+        git_output(&root, &["config", "core.quotepath", "true"])?;
+
+        let path = "客户冲突 资料.mjs";
+        fs::write(root.join(path), "base\n")?;
+        git_output(&root, &["add", "--", path])?;
+        git_output(&root, &["commit", "-m", "base"])?;
+        let main = git_output(&root, &["branch", "--show-current"])?
+            .trim()
+            .to_owned();
+        git_output(&root, &["checkout", "-b", "feature"])?;
+        fs::write(root.join(path), "remote\n")?;
+        git_output(&root, &["add", "--", path])?;
+        git_output(&root, &["commit", "-m", "remote"])?;
+        git_output(&root, &["checkout", &main])?;
+        fs::write(root.join(path), "local\n")?;
+        git_output(&root, &["add", "--", path])?;
+        git_output(&root, &["commit", "-m", "local"])?;
+        assert!(git_output(&root, &["merge", "feature"]).is_err());
+
+        let fingerprint = repository_refresh_fingerprint(&root)?;
+        let (staged, unstaged) = parse_status_entries(&fingerprint.status);
+        let conflicts = collect_worktree_conflicts(&staged, &unstaged);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, path);
+        assert_eq!(conflict_file_versions(&root, path)?, ("base\n".into(), "local\n".into(), "remote\n".into()));
+
+        accept_conflict_side(&root, path, ConflictSide::Theirs)?;
+        assert_eq!(fs::read_to_string(root.join(path))?, "remote\n");
+        assert_eq!(
+            parse_nul_paths(&git_output_bytes(
+                &root,
+                &["diff", "--cached", "--name-only", "-z", "--", path],
+            )?),
+            vec![path]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn auxiliary_git_readers_share_the_configured_command_without_quotepath_override() {
+        let git = include_str!("git.rs").split("#[cfg(test)]").next().unwrap();
+        let commit_ai = include_str!("commit_ai.rs").split("#[cfg(test)]").next().unwrap();
+        let merge_tool = include_str!("merge_tool.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!git.contains("core.quotepath=false"));
+        assert!(commit_ai.matches("crate::git::git_command()").count() >= 2);
+        assert!(merge_tool.matches("crate::git::git_command()").count() >= 2);
+        assert!(!commit_ai.contains("Command::new(\"git\")"));
+        assert!(!merge_tool.contains("Command::new(\"git\")"));
     }
 
     #[test]
