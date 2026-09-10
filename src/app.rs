@@ -15984,6 +15984,7 @@ impl GitAgentApp {
                 ui.add_space(8.0);
                 let message_hint = placeholder_for_label(self.language, self.tr("commit.message"));
                 let message_height = commit_message_editor_height(ui.available_height());
+                let action_row_rect = commit_action_row_rect(ui.max_rect());
                 let commit_message_input = commit_message_input_id();
                 guard_commit_message_ime_enter(
                     ui,
@@ -16025,15 +16026,14 @@ impl GitAgentApp {
                         self.toggle_amend();
                     }
                 }
-                ui.add_space(
-                    (ui.available_height() - COMMIT_BUTTON_ROW_HEIGHT)
-                        .max(COMMIT_MESSAGE_BOTTOM_GAP),
-                );
                 let can_commit = (staged_count > 0 || self.commit_state.amend)
                     && !self.commit_message.trim().is_empty()
                     && !self.branch_actions_busy()
                     && self.pending_commit_identity_warning.is_none();
-                let commit_clicked = self.commit_action_row(ui, can_commit);
+                let commit_clicked = ui.allocate_new_ui(
+                    egui::UiBuilder::new().max_rect(action_row_rect),
+                    |ui| self.commit_action_row(ui, can_commit),
+                ).inner;
                 if commit_clicked {
                     self.commit_current_message(staged_count);
                 }
@@ -26071,10 +26071,18 @@ fn commit_message_editor_ui(
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
         ui.set_clip_rect(inner_rect);
         themed_text_edit_selection(ui);
-        ui.add_sized(
-            inner_rect.size(),
-            commit_message_text_edit(message, id, hint),
-        )
+        ScrollArea::vertical()
+            .id_salt(id.with("scroll"))
+            .max_height(inner_rect.height())
+            .min_scrolled_height(inner_rect.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_sized(
+                    Vec2::new(ui.available_width(), inner_rect.height()),
+                    commit_message_text_edit(message, id, hint),
+                )
+            })
+            .inner
     })
     .inner
 }
@@ -34904,6 +34912,16 @@ fn commit_message_editor_height(available_body_height: f32) -> f32 {
         .max(COMMIT_MESSAGE_EDITOR_MIN_HEIGHT)
 }
 
+fn commit_action_row_rect(content_rect: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(
+            content_rect.left(),
+            content_rect.bottom() - COMMIT_BUTTON_ROW_HEIGHT,
+        ),
+        content_rect.right_bottom(),
+    )
+}
+
 fn shortcut_pressed(ctx: &egui::Context, key: egui::Key, shift: bool) -> bool {
     ctx.input(|input| {
         input.modifiers.ctrl
@@ -41735,6 +41753,10 @@ mod ui_tests {
             120.0 - COMMIT_BUTTON_ROW_HEIGHT - COMMIT_MESSAGE_BOTTOM_GAP
         );
         assert!(commit_message_editor_height(220.0) > 150.0);
+        let content = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(620.0, 360.0));
+        let action_row = commit_action_row_rect(content);
+        assert_eq!(action_row.bottom(), content.bottom());
+        assert_eq!(action_row.height(), COMMIT_BUTTON_ROW_HEIGHT);
 
         let source = include_str!("app.rs");
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
@@ -41763,13 +41785,29 @@ mod ui_tests {
             )
         );
         assert!(panel_source.contains("COMMIT_BUTTON_ROW_HEIGHT"));
-        assert!(panel_source.contains("ui.available_height() - COMMIT_BUTTON_ROW_HEIGHT"));
-        assert!(panel_source.contains("COMMIT_MESSAGE_BOTTOM_GAP"));
+        assert!(implementation_source.contains("COMMIT_MESSAGE_BOTTOM_GAP"));
+        assert!(panel_source.contains("commit_action_row_rect(ui.max_rect())"));
+        assert!(panel_source.contains("max_rect(action_row_rect)"));
+        assert!(!panel_source.contains("ui.add_space(\n                    (ui.available_height()"));
         assert!(panel_source.contains("commit_action_row("));
         assert!(
             !panel_source.contains("ui.add_space(6.0);\r\n                ui.horizontal(|ui|")
                 && !panel_source.contains("ui.add_space(6.0);\n                ui.horizontal(|ui|")
         );
+    }
+
+    #[test]
+    fn long_commit_messages_scroll_inside_the_editor_instead_of_moving_the_action_row() {
+        let source = include_str!("app.rs");
+        let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let editor_start = implementation_source.find("fn commit_message_editor_ui(").unwrap();
+        let editor_end = implementation_source[editor_start..]
+            .find("fn commit_submit_button(").unwrap();
+        let editor_source = &implementation_source[editor_start..editor_start + editor_end];
+        assert!(editor_source.contains("ScrollArea::vertical()"));
+        assert!(editor_source.contains(".id_salt(id.with(\"scroll\"))"));
+        assert!(editor_source.contains(".max_height(inner_rect.height())"));
+        assert!(editor_source.contains(".auto_shrink([false, false])"));
     }
 
     #[test]

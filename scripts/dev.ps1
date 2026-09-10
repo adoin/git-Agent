@@ -24,6 +24,47 @@ $diffExe = Join-Path $root "target\debug\git-agent-diff.exe"
 
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 
+function Add-DevLogLine {
+    param(
+        [string]$Path,
+        [string]$Line
+    )
+
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $encoding = New-Object System.Text.UTF8Encoding($false)
+            $writer = New-Object System.IO.StreamWriter($stream, $encoding)
+            $writer.WriteLine($Line)
+            $writer.Flush()
+            return $true
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -lt 8) {
+                Start-Sleep -Milliseconds (25 * $attempt)
+            }
+        }
+        finally {
+            if ($writer) {
+                $writer.Dispose()
+            }
+            elseif ($stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+
+    Write-Warning "[dev] unable to append log after retries: $Path"
+    return $false
+}
+
 function Write-DevLog {
     param(
         [string]$Message,
@@ -32,9 +73,9 @@ function Write-DevLog {
     )
     $line = "[dev] $(Get-Date -Format o) [$Level] $Message"
     Write-Host $line
-    $line | Add-Content -Path $stdoutLog
+    Add-DevLogLine -Path $stdoutLog -Line $line | Out-Null
     if ($Level -eq "ERROR") {
-        $line | Add-Content -Path $stderrLog
+        Add-DevLogLine -Path $stderrLog -Line $line | Out-Null
     }
 }
 

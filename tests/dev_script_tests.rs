@@ -124,3 +124,17 @@ fn dev_script_uses_daily_files_and_explicit_log_levels() {
     assert!(script.contains("[$Level] $Message"));
     assert!(script.contains("if ($Level -eq \"ERROR\")"));
 }
+
+#[test]
+fn dev_script_log_sharing_never_terminates_the_watcher() {
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev.ps1");
+    let script = fs::read_to_string(script_path).expect("dev.ps1 should be readable");
+
+    assert!(script.contains("function Add-DevLogLine"));
+    assert!(script.contains("[System.IO.FileMode]::Append"));
+    assert!(script.contains("[System.IO.FileShare]::ReadWrite"));
+    assert!(script.contains("catch [System.IO.IOException]"));
+    assert!(script.contains("$attempt -le 8"));
+    assert!(script.contains("unable to append log after retries"));
+    assert!(!script.contains("$line | Add-Content"));
+}

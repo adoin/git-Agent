@@ -26,6 +26,13 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>1.4.7 — 2026-09-10</h2>
+<h3>修复</h3>
+<ul>
+<li>提交操作行固定在提交面板底部，较长或 AI 生成的多行提交信息不再把“提交”按钮及提交选项挤出可视区域。</li>
+<li>提交信息编辑器改为在固定视口内纵向滚动，不再随着输入行数增加而撑开外围布局。</li>
+<li>Windows 开发监视器的每日日志被其他进程短暂打开时不再直接退出。日志追加现在允许并发读取、会重试临时共享冲突，最终写入失败也只警告而不会终止自动重编译。</li>
+</ul>
 <h2>1.4.6 — 2026-09-10</h2>
 <h3>改进</h3>
 <ul>
@@ -101,6 +108,13 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>1.4.7 — 2026-09-10</h2>
+<h3>Fixed</h3>
+<ul>
+<li>Kept the commit action row anchored to the bottom of the commit panel, so long or AI-generated multi-line commit messages can no longer push the Commit button and commit options out of view.</li>
+<li>Made the commit-message editor scroll vertically inside its fixed viewport instead of expanding the surrounding layout as more lines are entered.</li>
+<li>Prevented the Windows development watcher from exiting when its daily log is briefly opened by another process. Log appends now allow concurrent readers, retry transient sharing violations, and degrade to a warning instead of terminating automatic rebuilds.</li>
+</ul>
 <h2>1.4.6 — 2026-09-10</h2>
 <h3>Changed</h3>
 <ul>

@@ -5,6 +5,14 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.7 — 2026-09-10
+
+### Fixed
+
+- Kept the commit action row anchored to the bottom of the commit panel, so long or AI-generated multi-line commit messages can no longer push the Commit button and commit options out of view.
+- Made the commit-message editor scroll vertically inside its fixed viewport instead of expanding the surrounding layout as more lines are entered.
+- Prevented the Windows development watcher from exiting when its daily log is briefly opened by another process. Log appends now allow concurrent readers, retry transient sharing violations, and degrade to a warning instead of terminating automatic rebuilds.
+
 ## 1.4.6 — 2026-09-10
 
 ### Changed
