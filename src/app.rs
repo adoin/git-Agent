@@ -3414,18 +3414,6 @@ fn normalized_ai_base_url(base_url: &str) -> Result<String, String> {
     Ok(base_url.to_owned())
 }
 
-fn ai_test_endpoint(provider: AiProviderKind, base_url: &str) -> Result<String, String> {
-    let base_url = normalized_ai_base_url(base_url)?;
-    let suffix = match provider {
-        AiProviderKind::OpenAiCompatible => "chat/completions",
-        // Providers usually accept a root URL (for example DeepSeek's `/anthropic`), while
-        // Anthropic itself is commonly configured with an already-versioned `/v1` URL.
-        AiProviderKind::Claude if base_url.ends_with("/v1") => "messages",
-        AiProviderKind::Claude => "v1/messages",
-    };
-    Ok(format!("{base_url}/{suffix}"))
-}
-
 fn test_ai_provider_settings(
     provider: AiProviderKind,
     settings: LlmModelSettings,
@@ -3436,45 +3424,15 @@ fn test_ai_provider_settings(
     if settings.model_id.trim().is_empty() {
         return Err("Model ID is required".to_owned());
     }
-    let endpoint = ai_test_endpoint(provider, &settings.base_url)?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(12))
-        .build();
-    let request = match provider {
-        AiProviderKind::OpenAiCompatible => agent
-            .post(&endpoint)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", settings.api_key.trim()),
-            )
-            .set("Content-Type", "application/json"),
-        AiProviderKind::Claude => agent
-            .post(&endpoint)
-            .set("x-api-key", settings.api_key.trim())
-            .set("anthropic-version", "2023-06-01")
-            .set("Content-Type", "application/json"),
-    };
-    let payload = match provider {
-        AiProviderKind::OpenAiCompatible => serde_json::json!({
-            "model": settings.model_id.trim(),
-            "messages": [{ "role": "user", "content": "Reply with OK." }],
-            "max_tokens": 1,
-            "temperature": 0,
-        }),
-        AiProviderKind::Claude => serde_json::json!({
-            "model": settings.model_id.trim(),
-            "max_tokens": 1,
-            "messages": [{ "role": "user", "content": "Reply with OK." }],
-        }),
-    };
-    let response = request.send_json(payload).map_err(|error| match error {
-        ureq::Error::Status(status, _) => format!("Server returned HTTP {status}"),
-        ureq::Error::Transport(error) => format!("Connection failed: {error}"),
-    })?;
-    let _: serde_json::Value = response
-        .into_json()
-        .map_err(|_| "Server returned an invalid model response".to_owned())?;
-    Ok(())
+    normalized_ai_base_url(&settings.base_url)?;
+    crate::commit_ai::test_provider(&MergeAiModelConfig {
+        name: settings.name,
+        api_format: match provider {
+            AiProviderKind::OpenAiCompatible => MergeAiApiFormat::OpenAiCompatible,
+            AiProviderKind::Claude => MergeAiApiFormat::Claude,
+        },
+        base_url: settings.base_url, api_key: settings.api_key, model_id: settings.model_id,
+    })
 }
 
 fn validate_llm_model_settings(settings: &LlmModelSettings) -> Result<(), String> {
@@ -39633,23 +39591,12 @@ mod ui_tests {
     }
 
     #[test]
-    fn ai_test_endpoints_follow_the_selected_api_protocol() {
-        assert_eq!(
-            ai_test_endpoint(
-                AiProviderKind::OpenAiCompatible,
-                "https://api.openai.com/v1",
-            )
-            .unwrap(),
-            "https://api.openai.com/v1/chat/completions"
-        );
-        assert_eq!(
-            ai_test_endpoint(AiProviderKind::Claude, "https://api.anthropic.com/v1").unwrap(),
-            "https://api.anthropic.com/v1/messages"
-        );
-        assert_eq!(
-            ai_test_endpoint(AiProviderKind::Claude, "https://api.deepseek.com/anthropic").unwrap(),
-            "https://api.deepseek.com/anthropic/v1/messages"
-        );
+    fn ai_settings_validation_exercises_commit_generation_protocol() {
+        let source = include_str!("app.rs");
+        let validation = source.split("fn test_ai_provider_settings(").nth(1).unwrap()
+            .split("fn validate_llm_model_settings(").next().unwrap();
+        assert!(validation.contains("crate::commit_ai::test_provider"));
+        assert!(!validation.contains("Reply with OK"));
     }
 
     #[test]

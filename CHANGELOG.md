@@ -5,6 +5,20 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 1.4.6 — 2026-09-10
+
+### Changed
+
+- AI model validation now exercises the real semantic commit-generation protocol instead of accepting a provider after only a minimal text completion.
+- Claude-compatible commit and merge requests no longer send the deprecated `temperature` parameter, improving compatibility with newer Claude models routed through AWS Bedrock and third-party gateways.
+
+### Fixed
+
+- AI commit generation now accepts standards-compatible tool arguments encoded as objects or JSON strings, as well as validated JSON or text fallbacks returned by compatibility gateways.
+- Multiple `read_file` and `search` tool calls returned in one model response are executed as one bounded batch and fed back together, preserving cross-file business context instead of rejecting legitimate parallel tool use.
+- Merge AI responses containing multiple `submit_merge_suggestions` tool calls are combined before the existing uniqueness, target-coverage, and safety checks, preventing complex merges from losing all but the first suggestion batch.
+- AI request failures now include bilingual summaries and safely truncated server details or response-structure diagnostics instead of an opaque HTTP status or unsupported-tool error.
+
 ## 1.4.5 — 2026-09-07
 
 ### Changed

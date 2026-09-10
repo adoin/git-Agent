@@ -3145,7 +3145,6 @@ fn send_merge_ai_tool_request(
             .send_json(serde_json::json!({
                 "model": config.model_id.trim(),
                 "max_tokens": 4096,
-                "temperature": 0.1,
                 "thinking": { "type": "disabled" },
                 "system": merge_ai_system_prompt(),
                 "messages": [{ "role": "user", "content": prompt }],
@@ -3256,7 +3255,6 @@ fn request_merge_ai_suggestions(
             .send_json(serde_json::json!({
                 "model": config.model_id.trim(),
                 "max_tokens": 4096,
-                "temperature": 0.1,
                 // Merge suggestions are a compact machine-readable result. Disabling extended
                 // thinking prevents compatible providers whose thinking defaults to on from
                 // spending the whole output budget before emitting the final text block.
@@ -3566,51 +3564,67 @@ fn merge_ai_response_payload(
 }
 
 fn merge_ai_openai_tool_arguments(response: &serde_json::Value) -> Option<Result<String, String>> {
-    let function = response
+    let functions = response
         .pointer("/choices/0/message/tool_calls")
         .and_then(serde_json::Value::as_array)
-        .and_then(|calls| {
-            calls.iter().find_map(|call| {
+        .map(|calls| {
+            calls.iter().filter_map(|call| {
                 let function = call.get("function")?;
                 (function.get("name").and_then(serde_json::Value::as_str)
                     == Some(MERGE_AI_TOOL_NAME))
                 .then_some(function)
-            })
+            }).collect::<Vec<_>>()
         })
+        .filter(|functions| !functions.is_empty())
         .or_else(|| {
             let function = response.pointer("/choices/0/message/function_call")?;
             (function.get("name").and_then(serde_json::Value::as_str) == Some(MERGE_AI_TOOL_NAME))
-                .then_some(function)
+                .then_some(vec![function])
         })?;
-    Some(merge_ai_tool_arguments_value(function.get("arguments")))
+    Some(merge_ai_combine_tool_payloads(
+        functions.into_iter().map(|function| function.get("arguments")),
+    ))
 }
 
 fn merge_ai_claude_tool_input(response: &serde_json::Value) -> Option<Result<String, String>> {
-    let input = response
+    let inputs = response
         .get("content")
         .and_then(serde_json::Value::as_array)?
         .iter()
-        .find_map(|block| {
+        .filter_map(|block| {
             (block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
                 && block.get("name").and_then(serde_json::Value::as_str)
                     == Some(MERGE_AI_TOOL_NAME))
             .then(|| block.get("input"))
             .flatten()
-        })?;
-    Some(
-        serde_json::to_string(input)
-            .map_err(|error| format!("unable to encode Anthropic tool input: {error}")),
-    )
+        })
+        .map(Some)
+        .collect::<Vec<_>>();
+    (!inputs.is_empty()).then(|| merge_ai_combine_tool_payloads(inputs))
 }
 
-fn merge_ai_tool_arguments_value(value: Option<&serde_json::Value>) -> Result<String, String> {
+fn merge_ai_tool_payload_value(value: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
     let value = value.ok_or_else(|| "missing function arguments".to_owned())?;
     if let Some(arguments) = value.as_str() {
-        serde_json::from_str::<serde_json::Value>(arguments)
-            .map_err(|error| format!("function arguments are not valid JSON: {error}"))?;
-        return Ok(arguments.to_owned());
+        return serde_json::from_str(arguments)
+            .map_err(|error| format!("function arguments are not valid JSON: {error}"));
     }
-    serde_json::to_string(value).map_err(|error| format!("unable to encode arguments: {error}"))
+    Ok(value.clone())
+}
+
+fn merge_ai_combine_tool_payloads<'a>(
+    values: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+) -> Result<String, String> {
+    let mut suggestions = Vec::new();
+    for value in values {
+        let value = merge_ai_tool_payload_value(value)?;
+        let items = value.get("suggestions").and_then(serde_json::Value::as_array)
+            .or_else(|| value.as_array())
+            .ok_or_else(|| "tool arguments did not contain a suggestions array".to_owned())?;
+        suggestions.extend(items.iter().cloned());
+    }
+    serde_json::to_string(&serde_json::json!({"suggestions": suggestions}))
+        .map_err(|error| format!("unable to encode combined tool arguments: {error}"))
 }
 
 fn merge_ai_content_value_text(value: &serde_json::Value) -> Option<String> {
@@ -11341,6 +11355,47 @@ export function quote(total: number): number {
     }
 
     #[test]
+    fn multiple_merge_tool_calls_are_combined_before_coverage_validation() {
+        let suggestion = |index: usize, choice: &str| serde_json::json!({
+            "suggestions": [{
+                "target_type": "conflict", "target_index": index, "choice": choice,
+                "reason_zh": format!("冲突 {index}"), "reason_en": format!("conflict {index}")
+            }]
+        });
+        let claude = serde_json::json!({
+            "stop_reason": "tool_use",
+            "content": [
+                {"type":"tool_use","name":MERGE_AI_TOOL_NAME,"input":suggestion(0, "left")},
+                {"type":"tool_use","name":MERGE_AI_TOOL_NAME,"input":suggestion(1, "right")},
+                {"type":"tool_use","name":MERGE_AI_TOOL_NAME,"input":suggestion(2, "manual")}
+            ]
+        });
+        let openai = serde_json::json!({
+            "choices": [{"message":{"tool_calls":[
+                {"function":{"name":MERGE_AI_TOOL_NAME,"arguments":suggestion(0, "left").to_string()}},
+                {"function":{"name":MERGE_AI_TOOL_NAME,"arguments":suggestion(1, "right")}}
+            ]}}]
+        });
+
+        let (claude_payload, _) = merge_ai_response_payload(
+            crate::app::MergeAiApiFormat::Claude, &claude,
+        ).unwrap();
+        let (openai_payload, _) = merge_ai_response_payload(
+            crate::app::MergeAiApiFormat::OpenAiCompatible, &openai,
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&claude_payload).unwrap()["suggestions"]
+                .as_array().unwrap().len(),
+            3,
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&openai_payload).unwrap()["suggestions"]
+                .as_array().unwrap().len(),
+            2,
+        );
+    }
+
+    #[test]
     fn merge_suggestion_tool_schema_exposes_confirmable_middle_edits_without_file_writes() {
         let schema = merge_ai_suggestions_input_schema();
         assert_eq!(
@@ -11656,6 +11711,7 @@ export function quote(total: number): number {
         assert!(request.contains("\"tools\""));
         assert!(request.contains("MERGE_AI_TOOL_NAME"));
         assert!(request.contains("\"tool_choice\""));
+        assert_eq!(request.matches("\"temperature\": 0.1").count(), 1);
         assert!(!request.contains("\"response_format\""));
         assert!(request.contains("response.structure"));
     }
