@@ -55,6 +55,7 @@ const KOFI_SUPPORT_URL: &str = "https://ko-fi.com/adoin";
 use crate::tutorials::BASIC_STEPS as BEGINNER_TUTORIAL_STEPS;
 
 struct CommitAiTask {
+    branch: String,
     root: PathBuf,
     original_draft: String,
     cancelled: std::sync::Arc<AtomicBool>,
@@ -842,6 +843,210 @@ fn log_layout_debug_once(flag: &AtomicBool, label: &str, rects: &[(&str, Rect)])
     }
 }
 
+// Repository-owned tasks are never dropped when another repository becomes visible.
+// `current` is the projection used by UI handlers and one root's completion handlers;
+// select() atomically parks/restores the entire state, including chained actions.
+#[derive(Default)]
+struct RepositoryOperations {
+    current: RepositoryOperationState,
+    parked: HashMap<String, RepositoryOperationState>,
+}
+
+struct RepositoryOperationState {
+    root: Option<PathBuf>,
+    completion_error: Option<String>,
+    commit_ai_task: Option<CommitAiTask>,
+    background_remote_git_task: Option<Receiver<BackgroundRemoteGitTaskResult>>,
+    background_remote_git_root: Option<PathBuf>,
+    remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
+    remote_git_status_key: Option<&'static str>,
+    remote_git_root: Option<PathBuf>,
+    repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
+    repository_undo_root: Option<PathBuf>,
+    credential_login_task: Option<Receiver<anyhow::Result<()>>>,
+    credential_login_root: Option<PathBuf>,
+    credential_retry_in_progress: bool,
+    branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
+    branch_checkout_root: Option<PathBuf>,
+    pending_branch_checkout: Option<String>,
+    merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
+    merge_tool_root: Option<PathBuf>,
+    conflict_merge_reload_root: Option<PathBuf>,
+    external_diff_tool_task: Option<Receiver<ExternalDiffToolTaskResult>>,
+    external_diff_tool_root: Option<PathBuf>,
+    create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
+    create_patch_root: Option<PathBuf>,
+    repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
+    repository_benchmark_root: Option<PathBuf>,
+    repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
+    repo_gitignore_save_task: Option<Receiver<(PathBuf, anyhow::Result<()>)>>,
+    repo_gitignore_save_root: Option<PathBuf>,
+    repo_gitignore_close_after_save: bool,
+    pending_credential_retry: Option<PendingCredentialRetryAction>,
+    pending_credential_retry_root: Option<PathBuf>,
+    pending_non_fast_forward_push: Option<PushAfterPullPlan>,
+    pending_push_after_pull: Option<PushAfterPullPlan>,
+    pending_push_recovery_candidate: Option<PushAfterPullPlan>,
+    pending_rewritten_history_prompt_root: Option<PathBuf>,
+    pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
+    pending_pull_request_open_after_push: Option<PullRequestOpenAfterPush>,
+    next_background_remote_refresh_at: Instant,
+}
+
+impl Default for RepositoryOperationState {
+    fn default() -> Self {
+        Self {
+            root: None,
+            completion_error: None,
+            commit_ai_task: None,
+            background_remote_git_task: None,
+            background_remote_git_root: None,
+            remote_git_task: None,
+            remote_git_status_key: None,
+            remote_git_root: None,
+            repository_undo_task: None,
+            repository_undo_root: None,
+            credential_login_task: None,
+            credential_login_root: None,
+            credential_retry_in_progress: false,
+            branch_checkout_task: None,
+            branch_checkout_root: None,
+            pending_branch_checkout: None,
+            merge_tool_task: None,
+            merge_tool_root: None,
+            conflict_merge_reload_root: None,
+            external_diff_tool_task: None,
+            external_diff_tool_root: None,
+            create_patch_task: None,
+            create_patch_root: None,
+            repository_benchmark_task: None,
+            repository_benchmark_root: None,
+            repository_benchmark_progress: None,
+            repo_gitignore_save_task: None,
+            repo_gitignore_save_root: None,
+            repo_gitignore_close_after_save: false,
+            pending_credential_retry: None,
+            pending_credential_retry_root: None,
+            pending_non_fast_forward_push: None,
+            pending_push_after_pull: None,
+            pending_push_recovery_candidate: None,
+            pending_rewritten_history_prompt_root: None,
+            pending_rewritten_history_prompt: None,
+            pending_pull_request_open_after_push: None,
+            next_background_remote_refresh_at: Instant::now()
+                + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY,
+        }
+    }
+}
+
+impl RepositoryOperationState {
+    fn has_running_task(&self) -> bool {
+        self.commit_ai_task.is_some()
+            || self.remote_git_task.is_some()
+            || self.background_remote_git_task.is_some()
+            || self.repository_undo_task.is_some()
+            || self.branch_checkout_task.is_some()
+            || self.credential_login_task.is_some()
+            || self.merge_tool_task.is_some()
+            || self.external_diff_tool_task.is_some()
+            || self.create_patch_task.is_some()
+            || self.repository_benchmark_task.is_some()
+            || self.repo_gitignore_save_task.is_some()
+    }
+
+    fn suppresses_automatic_snapshot(&self) -> bool {
+        self.remote_git_task.is_some()
+            || self.background_remote_git_task.is_some()
+            || self.repository_undo_task.is_some()
+            || self.branch_checkout_task.is_some()
+            || self.pending_branch_checkout.is_some()
+            || self.repo_gitignore_save_task.is_some()
+    }
+
+    fn blocks_refresh(&self) -> bool {
+        self.remote_git_task.is_some()
+            || self.background_remote_git_task.is_some()
+            || self.repository_undo_task.is_some()
+            || self.branch_checkout_task.is_some()
+            || self.pending_branch_checkout.is_some()
+            || self.merge_tool_task.is_some()
+            || self.conflict_merge_reload_root.is_some()
+            || self.repo_gitignore_save_task.is_some()
+    }
+}
+
+impl RepositoryOperations {
+    fn select(&mut self, root: PathBuf) {
+        let key = repo_state_key(&root);
+        if self
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|current| repo_state_key(current) == key)
+        {
+            return;
+        }
+        let mut next = self.parked.remove(&key).unwrap_or_default();
+        next.root = Some(root);
+        let previous = std::mem::replace(&mut self.current, next);
+        if let Some(root) = &previous.root {
+            self.parked.insert(repo_state_key(root), previous);
+        }
+    }
+
+    fn get(&self, root: &Path) -> Option<&RepositoryOperationState> {
+        if self
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|current| repo_state_key(current) == repo_state_key(root))
+        {
+            Some(&self.current)
+        } else {
+            self.parked.get(&repo_state_key(root))
+        }
+    }
+
+    fn get_mut(&mut self, root: &Path) -> Option<&mut RepositoryOperationState> {
+        if self
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|current| repo_state_key(current) == repo_state_key(root))
+        {
+            Some(&mut self.current)
+        } else {
+            self.parked.get_mut(&repo_state_key(root))
+        }
+    }
+
+    fn pending_task_roots(&self) -> Vec<PathBuf> {
+        self.parked
+            .values()
+            .chain(std::iter::once(&self.current))
+            .filter(|state| state.has_running_task())
+            .filter_map(|state| state.root.clone())
+            .collect()
+    }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        self.parked
+            .values()
+            .chain(std::iter::once(&self.current))
+            .filter_map(|state| state.root.clone())
+            .collect()
+    }
+
+    fn blocked_keys(&self) -> HashSet<String> {
+        self.parked
+            .values()
+            .chain(std::iter::once(&self.current))
+            .filter(|state| state.blocks_refresh())
+            .filter_map(|state| state.root.as_ref().map(|root| repo_state_key(root)))
+            .collect()
+    }
+}
+
 pub struct GitAgentApp {
     plugins: crate::plugins::PluginRuntime,
     plugin_repository_events: HashMap<PathBuf, &'static str>,
@@ -890,6 +1095,8 @@ pub struct GitAgentApp {
     repository_refresh_scheduler: RepositoryRefreshScheduler,
     last_repository_refresh_schedule: Option<RepositoryRefreshSchedule>,
     automatic_repository_refresh_results: Receiver<RepoTaskResult>,
+    operations: RepositoryOperations,
+    activated_repositories: HashSet<String>,
     repo_tasks: HashMap<String, Receiver<RepoTaskResult>>,
     repo_history_tasks: HashMap<String, Receiver<RepoHistoryTaskResult>>,
     queued_repo_history_loads: HashMap<String, HistoryLoadRequest>,
@@ -902,21 +1109,8 @@ pub struct GitAgentApp {
     inactive_repo_refresh_seconds: u64,
     background_remote_refresh_enabled: bool,
     remote_repo_refresh_seconds: u64,
-    next_background_remote_refresh_at: Instant,
-    background_remote_git_task: Option<Receiver<BackgroundRemoteGitTaskResult>>,
-    background_remote_git_root: Option<PathBuf>,
-    remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
-    remote_git_status_key: Option<&'static str>,
-    remote_git_root: Option<PathBuf>,
-    repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
-    repository_undo_root: Option<PathBuf>,
     undo_entries: HashMap<String, RepositoryUndoEntry>,
     redo_entries: HashMap<String, RepositoryUndoEntry>,
-    create_patch_task: Option<Receiver<CreatePatchTaskResult>>,
-    create_patch_root: Option<PathBuf>,
-    repository_benchmark_task: Option<Receiver<RepositoryBenchmarkTaskResult>>,
-    repository_benchmark_root: Option<PathBuf>,
-    repository_benchmark_progress: Option<git::RepositoryBenchmarkStepProgress>,
     ssh_tool_task: Option<Receiver<SshToolTaskResult>>,
     ssh_tool_action: Option<SshToolAction>,
     update_task: Option<Receiver<UpdateTaskResult>>,
@@ -927,16 +1121,6 @@ pub struct GitAgentApp {
     ssh_agent_status_open: bool,
     ssh_load_key_prompt_open: bool,
     ssh_agent_status: Option<SshAgentStatus>,
-    credential_login_task: Option<Receiver<anyhow::Result<()>>>,
-    credential_login_root: Option<PathBuf>,
-    credential_retry_in_progress: bool,
-    branch_checkout_task: Option<Receiver<BranchCheckoutTaskResult>>,
-    branch_checkout_root: Option<PathBuf>,
-    merge_tool_task: Option<Receiver<MergeToolTaskResult>>,
-    merge_tool_root: Option<PathBuf>,
-    conflict_merge_reload_root: Option<PathBuf>,
-    external_diff_tool_task: Option<Receiver<ExternalDiffToolTaskResult>>,
-    external_diff_tool_root: Option<PathBuf>,
     repo_source_task: Option<Receiver<anyhow::Result<PathBuf>>>,
     details_task: Option<Receiver<anyhow::Result<CommitDetails>>>,
     diff_task: Option<Receiver<anyhow::Result<FileDiff>>>,
@@ -975,7 +1159,6 @@ pub struct GitAgentApp {
     loading_diff_key: Option<String>,
     toolbar_background_status: Option<(String, Instant)>,
     toolbar_background_status_root: Option<PathBuf>,
-    pending_branch_checkout: Option<String>,
     pending_commit_action: Option<CommitActionDialog>,
     pending_commit_identity_warning: Option<CommitIdentityWarningDialog>,
     last_notice: Option<String>,
@@ -988,15 +1171,7 @@ pub struct GitAgentApp {
     pending_pull_action: Option<PullActionDialog>,
     pending_push_action: Option<PushActionDialog>,
     pending_force_push_confirm: Option<ConfirmForcePushDialog>,
-    pending_non_fast_forward_push: Option<PushAfterPullPlan>,
-    pending_push_after_pull: Option<PushAfterPullPlan>,
-    pending_push_recovery_candidate: Option<PushAfterPullPlan>,
-    pending_rewritten_history_prompt_root: Option<PathBuf>,
-    pending_rewritten_history_prompt: Option<RewrittenHistoryPrompt>,
-    pending_credential_retry: Option<PendingCredentialRetryAction>,
-    pending_credential_retry_root: Option<PathBuf>,
     pending_create_pull_request: Option<CreatePullRequestDialog>,
-    pending_pull_request_open_after_push: Option<PullRequestOpenAfterPush>,
     pending_archive_action: Option<ArchiveActionDialog>,
     pending_merge_action: Option<MergeActionDialog>,
     pending_interactive_rebase_action: Option<InteractiveRebaseActionDialog>,
@@ -1007,7 +1182,6 @@ pub struct GitAgentApp {
     pending_lfs_action: Option<LfsActionDialog>,
     pending_git_flow_action: Option<GitFlowActionDialog>,
     commit_message: String,
-    commit_ai_task: Option<CommitAiTask>,
     commit_message_drafts: HashMap<String, String>,
     commit_state: RepoCommitState,
     focus_commit_message: bool,
@@ -1042,9 +1216,6 @@ pub struct GitAgentApp {
     repo_settings_open: bool,
     repo_settings_tab: SettingsTab,
     repo_gitignore_editor: Option<RepoGitignoreEditorState>,
-    repo_gitignore_save_task: Option<Receiver<(PathBuf, anyhow::Result<()>)>>,
-    repo_gitignore_save_root: Option<PathBuf>,
-    repo_gitignore_close_after_save: bool,
     pending_repo_remote_action: Option<RepoRemoteActionDialog>,
     pending_commit_text_link: Option<CommitTextLinkDialog>,
     compiled_commit_text_links: Vec<CompiledCommitTextLink>,
@@ -1280,6 +1451,8 @@ struct RepositoryExclusiveRequest {
     granted_sender: Sender<()>,
 }
 
+const MAX_REPOSITORY_OPERATIONS: usize = 3;
+
 fn repository_refresh_scheduler_loop(
     command_receiver: Receiver<RepositoryRefreshSchedulerCommand>,
     automatic_result_sender: Sender<RepoTaskResult>,
@@ -1375,6 +1548,7 @@ fn repository_refresh_scheduler_loop(
         );
         if let Some(index) =
             next_repository_exclusive_request_index(&pending_exclusive, &unavailable_keys)
+                .filter(|_| exclusive_keys.len() < MAX_REPOSITORY_OPERATIONS)
         {
             let request = pending_exclusive.swap_remove(index);
             exclusive_keys.insert(request.key.clone());
@@ -1497,6 +1671,10 @@ fn apply_repository_refresh_scheduler_command(
                 .map(|repository| repository.key.clone())
                 .collect::<HashSet<_>>();
             scheduled.retain(|key, _| repository_keys.contains(key));
+            pending.retain(|request| {
+                request.priority == RepositoryRefreshPriority::Foreground
+                    || repository_keys.contains(&request.key)
+            });
             let now = Instant::now();
             let inactive_count = repositories
                 .iter()
@@ -4197,7 +4375,18 @@ fn finish_pending_checkout_reload(
 }
 
 fn repo_state_key(path: &Path) -> String {
-    path.display().to_string()
+    // Keys must agree for Git's slash-separated paths and native Windows paths.
+    // Do not canonicalize here: this identity is queried repeatedly on UI frames.
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    let value = value.replace('\\', "/").to_lowercase();
+    #[cfg(not(windows))]
+    let value = value.into_owned();
+    if value.len() > 3 {
+        value.trim_end_matches('/').to_owned()
+    } else {
+        value
+    }
 }
 
 fn commit_message_draft_key(path: &Path, branch: &str) -> String {
@@ -4421,7 +4610,22 @@ impl RepoTabsState {
         fs::read_to_string(path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
+            .map(|mut state: Self| {
+                state.normalize_repository_keys();
+                state
+            })
             .unwrap_or_default()
+    }
+
+    fn normalize_repository_keys(&mut self) {
+        self.tab_aliases = std::mem::take(&mut self.tab_aliases)
+            .into_iter()
+            .map(|(path, alias)| (repo_state_key(Path::new(&path)), alias))
+            .collect();
+        self.sidebar_tree_states = std::mem::take(&mut self.sidebar_tree_states)
+            .into_iter()
+            .map(|(path, state)| (repo_state_key(Path::new(&path)), state))
+            .collect();
     }
 
     fn from_app(app: &GitAgentApp) -> Self {
@@ -4774,6 +4978,8 @@ impl GitAgentApp {
             repository_refresh_scheduler,
             last_repository_refresh_schedule: None,
             automatic_repository_refresh_results,
+            operations: RepositoryOperations::default(),
+            activated_repositories: HashSet::new(),
             repo_tasks: HashMap::new(),
             repo_history_tasks: HashMap::new(),
             queued_repo_history_loads: HashMap::new(),
@@ -4786,22 +4992,8 @@ impl GitAgentApp {
             inactive_repo_refresh_seconds,
             background_remote_refresh_enabled,
             remote_repo_refresh_seconds,
-            next_background_remote_refresh_at: Instant::now()
-                + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY,
-            background_remote_git_task: None,
-            background_remote_git_root: None,
-            remote_git_task: None,
-            remote_git_status_key: None,
-            remote_git_root: None,
-            repository_undo_task: None,
-            repository_undo_root: None,
             undo_entries: HashMap::new(),
             redo_entries: HashMap::new(),
-            create_patch_task: None,
-            create_patch_root: None,
-            repository_benchmark_task: None,
-            repository_benchmark_root: None,
-            repository_benchmark_progress: None,
             ssh_tool_task: None,
             ssh_tool_action: None,
             update_task: None,
@@ -4812,16 +5004,6 @@ impl GitAgentApp {
             ssh_agent_status_open: false,
             ssh_load_key_prompt_open: false,
             ssh_agent_status: None,
-            credential_login_task: None,
-            credential_login_root: None,
-            credential_retry_in_progress: false,
-            branch_checkout_task: None,
-            branch_checkout_root: None,
-            merge_tool_task: None,
-            merge_tool_root: None,
-            conflict_merge_reload_root: None,
-            external_diff_tool_task: None,
-            external_diff_tool_root: None,
             repo_source_task: None,
             details_task: None,
             diff_task: None,
@@ -4860,7 +5042,6 @@ impl GitAgentApp {
             loading_diff_key: None,
             toolbar_background_status: None,
             toolbar_background_status_root: None,
-            pending_branch_checkout: None,
             pending_commit_action: None,
             pending_commit_identity_warning: None,
             last_notice: None,
@@ -4873,15 +5054,7 @@ impl GitAgentApp {
             pending_pull_action: None,
             pending_push_action: None,
             pending_force_push_confirm: None,
-            pending_non_fast_forward_push: None,
-            pending_push_after_pull: None,
-            pending_push_recovery_candidate: None,
-            pending_rewritten_history_prompt_root: None,
-            pending_rewritten_history_prompt: None,
-            pending_credential_retry: None,
-            pending_credential_retry_root: None,
             pending_create_pull_request: None,
-            pending_pull_request_open_after_push: None,
             pending_archive_action: None,
             pending_merge_action: None,
             pending_interactive_rebase_action: None,
@@ -4892,7 +5065,6 @@ impl GitAgentApp {
             pending_lfs_action: None,
             pending_git_flow_action: None,
             commit_message: String::new(),
-            commit_ai_task: None,
             commit_message_drafts: HashMap::new(),
             commit_state: RepoCommitState::default(),
             focus_commit_message: false,
@@ -4931,9 +5103,6 @@ impl GitAgentApp {
                 == Some("1"),
             repo_settings_tab: SettingsTab::RepoRemotes,
             repo_gitignore_editor: None,
-            repo_gitignore_save_task: None,
-            repo_gitignore_save_root: None,
-            repo_gitignore_close_after_save: false,
             pending_repo_remote_action: None,
             pending_commit_text_link: None,
             compiled_commit_text_links: Vec::new(),
@@ -5093,10 +5262,9 @@ impl GitAgentApp {
             self.reset_search_view_state();
         }
         self.ensure_repo_tab(path.clone());
-        if repository_transition && self.background_remote_refresh_enabled {
-            self.next_background_remote_refresh_at =
-                Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
-        }
+        self.operations.select(path.clone());
+        self.activated_repositories.insert(repo_state_key(&path));
+        let completion_error = self.operations.current.completion_error.take();
         self.load_commit_state_for_active_repo();
         self.load_commit_message_draft_for_active_repo();
         let applied_cached_snapshot = use_cache && self.apply_cached_snapshot_for(&path);
@@ -5118,6 +5286,9 @@ impl GitAgentApp {
         }
         self.loading_repo = self.active_repo_has_pending_load();
         self.error = None;
+        if completion_error.is_some() {
+            self.error = completion_error;
+        }
     }
 
     fn spawn_repository_snapshot_load(
@@ -5318,6 +5489,12 @@ impl GitAgentApp {
             .iter()
             .enumerate()
             .filter_map(|(index, tab)| {
+                if !self
+                    .activated_repositories
+                    .contains(&repo_state_key(&tab.root))
+                {
+                    return None;
+                }
                 let snapshot = self.workspace_repository_snapshot_for(&tab.root);
                 if snapshot.is_some_and(|snapshot| !snapshot.config.auto_refresh) {
                     return None;
@@ -5335,19 +5512,7 @@ impl GitAgentApp {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        for root in [
-            self.remote_git_root.as_deref(),
-            self.background_remote_git_root.as_deref(),
-            self.branch_checkout_root.as_deref(),
-            self.repository_undo_root.as_deref(),
-            self.merge_tool_root.as_deref(),
-            self.conflict_merge_reload_root.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            blocked_keys.insert(repo_state_key(root));
-        }
+        blocked_keys.extend(self.operations.blocked_keys());
         let schedule = RepositoryRefreshSchedule {
             repositories,
             active_interval: self.active_repo_refresh_duration(),
@@ -5377,20 +5542,23 @@ impl GitAgentApp {
         }
 
         let now = Instant::now();
-        if now < self.next_background_remote_refresh_at {
-            ctx.request_repaint_after(self.next_background_remote_refresh_at - now);
+        if now < self.operations.current.next_background_remote_refresh_at {
+            ctx.request_repaint_after(
+                self.operations.current.next_background_remote_refresh_at - now,
+            );
             return;
         }
 
         let interval = remote_repo_refresh_duration(self.remote_repo_refresh_seconds);
         if self.branch_actions_busy() {
-            self.next_background_remote_refresh_at = now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
+            self.operations.current.next_background_remote_refresh_at =
+                now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
             ctx.request_repaint_after(BACKGROUND_REMOTE_REFRESH_BUSY_RETRY);
             return;
         }
 
         let Some(active_root) = self.active_repo_root() else {
-            self.next_background_remote_refresh_at = now + interval;
+            self.operations.current.next_background_remote_refresh_at = now + interval;
             ctx.request_repaint_after(interval);
             return;
         };
@@ -5399,17 +5567,18 @@ impl GitAgentApp {
             .as_ref()
             .filter(|snapshot| paths_equal(&snapshot.root, &active_root))
         else {
-            self.next_background_remote_refresh_at = now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
+            self.operations.current.next_background_remote_refresh_at =
+                now + BACKGROUND_REMOTE_REFRESH_BUSY_RETRY;
             ctx.request_repaint_after(BACKGROUND_REMOTE_REFRESH_BUSY_RETRY);
             return;
         };
         if snapshot.remotes.is_empty() {
-            self.next_background_remote_refresh_at = now + interval;
+            self.operations.current.next_background_remote_refresh_at = now + interval;
             ctx.request_repaint_after(interval);
             return;
         }
         if !snapshot.config.background_remote_refresh {
-            self.next_background_remote_refresh_at = now + interval;
+            self.operations.current.next_background_remote_refresh_at = now + interval;
             ctx.request_repaint_after(interval);
             return;
         }
@@ -5419,9 +5588,9 @@ impl GitAgentApp {
         let known_tag_refs = git::repository_snapshot_tag_refs_fingerprint(snapshot);
         let prune_tags = snapshot.remotes.len() == 1;
         let (sender, receiver) = mpsc::channel();
-        self.background_remote_git_task = Some(receiver);
-        self.background_remote_git_root = Some(root.clone());
-        self.next_background_remote_refresh_at = now + interval;
+        self.operations.current.background_remote_git_task = Some(receiver);
+        self.operations.current.background_remote_git_root = Some(root.clone());
+        self.operations.current.next_background_remote_refresh_at = now + interval;
         self.pending_toolbar_single_click = None;
         let plugin_context = self.plugin_context_for(snapshot);
         self.plugins.begin_remote_sync(
@@ -5435,6 +5604,10 @@ impl GitAgentApp {
         let scheduler_key = repo_state_key(&root);
         let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
         thread::spawn(move || {
+            let _span = diagnostics::span(
+                "repository.background_fetch",
+                format!("root={}", root.display()),
+            );
             let result = exclusive_access
                 .recv()
                 .map_err(|_| {
@@ -5972,11 +6145,18 @@ impl GitAgentApp {
     }
 
     fn maybe_prepare_rewritten_history_prompt(&mut self, snapshot: &RepositorySnapshot) {
-        let Some(root) = self.pending_rewritten_history_prompt_root.take() else {
+        let Some(root) = self
+            .operations
+            .current
+            .pending_rewritten_history_prompt_root
+            .take()
+        else {
             return;
         };
         if !paths_equal(&root, &snapshot.root) {
-            self.pending_rewritten_history_prompt_root = Some(root);
+            self.operations
+                .current
+                .pending_rewritten_history_prompt_root = Some(root);
             return;
         }
         let Some(upstream) = snapshot.upstream.as_ref() else {
@@ -5984,13 +6164,14 @@ impl GitAgentApp {
         };
         if upstream.ahead > 0 && upstream.behind > 0 {
             if let Some(branch) = current_named_local_branch(snapshot) {
-                self.pending_rewritten_history_prompt = Some(RewrittenHistoryPrompt {
-                    root: snapshot.root.clone(),
-                    branch: branch.name.clone(),
-                    upstream: upstream.name.clone(),
-                    ahead: upstream.ahead,
-                    behind: upstream.behind,
-                });
+                self.operations.current.pending_rewritten_history_prompt =
+                    Some(RewrittenHistoryPrompt {
+                        root: snapshot.root.clone(),
+                        branch: branch.name.clone(),
+                        upstream: upstream.name.clone(),
+                        ahead: upstream.ahead,
+                        behind: upstream.behind,
+                    });
             }
         }
     }
@@ -6614,15 +6795,15 @@ impl GitAgentApp {
         &mut self,
         action: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        if self.external_diff_tool_task.is_some() {
+        if self.operations.current.external_diff_tool_task.is_some() {
             return;
         }
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
             return;
         };
         let (sender, receiver) = mpsc::channel();
-        self.external_diff_tool_task = Some(receiver);
-        self.external_diff_tool_root = Some(root.clone());
+        self.operations.current.external_diff_tool_task = Some(receiver);
+        self.operations.current.external_diff_tool_root = Some(root.clone());
         self.error = None;
         self.last_notice = None;
         diagnostics::app_info("diff_tool.request", &format!("root={}", root.display()));
@@ -7214,7 +7395,8 @@ impl GitAgentApp {
     }
 
     fn start_repo_gitignore_save(&mut self, close_after_save: bool) {
-        if self.branch_actions_busy() || self.repo_gitignore_save_task.is_some() {
+        if self.branch_actions_busy() || self.operations.current.repo_gitignore_save_task.is_some()
+        {
             return;
         }
         self.ensure_repo_gitignore_editor();
@@ -7229,9 +7411,9 @@ impl GitAgentApp {
         let expected_original = editor.original_text.clone();
         let document = editor.document.clone();
         let (sender, receiver) = mpsc::channel();
-        self.repo_gitignore_save_task = Some(receiver);
-        self.repo_gitignore_save_root = Some(root.clone());
-        self.repo_gitignore_close_after_save = close_after_save;
+        self.operations.current.repo_gitignore_save_task = Some(receiver);
+        self.operations.current.repo_gitignore_save_root = Some(root.clone());
+        self.operations.current.repo_gitignore_close_after_save = close_after_save;
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -7259,13 +7441,20 @@ impl GitAgentApp {
         });
     }
 
+    fn active_repository_operation(&self) -> Option<&RepositoryOperationState> {
+        self.active_repo_root()
+            .as_deref()
+            .and_then(|root| self.operations.get(root))
+    }
+
     fn active_repo_gitignore_save_busy(&self) -> bool {
-        self.repo_gitignore_save_task.is_some()
-            && self.task_root_matches_active_repo(self.repo_gitignore_save_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.repo_gitignore_save_task.is_some())
     }
 
     fn branch_checkout_busy(&self) -> bool {
-        self.branch_checkout_task.is_some() || self.pending_branch_checkout.is_some()
+        self.operations.current.branch_checkout_task.is_some()
+            || self.operations.current.pending_branch_checkout.is_some()
     }
 
     fn task_root_matches_active_repo(&self, root: Option<&Path>) -> bool {
@@ -7273,26 +7462,37 @@ impl GitAgentApp {
     }
 
     fn checkout_worker_in_flight_for(&self, root: &Path) -> bool {
-        (self.branch_checkout_task.is_some()
-            && self
-                .branch_checkout_root
-                .as_deref()
-                .is_some_and(|owner| paths_equal(owner, root)))
-            || (self.repository_undo_task.is_some()
-                && self
-                    .repository_undo_root
-                    .as_deref()
-                    .is_some_and(|owner| paths_equal(owner, root)))
+        self.operations.get(root).is_some_and(|state| {
+            state.branch_checkout_task.is_some() || state.repository_undo_task.is_some()
+        })
+    }
+
+    fn finish_repository_checkout_reload(
+        &mut self,
+        root: &Path,
+        branch: Option<&str>,
+        still_pending: bool,
+    ) -> bool {
+        self.operations.get_mut(root).is_some_and(|state| {
+            finish_pending_checkout_reload(
+                &mut state.pending_branch_checkout,
+                &mut state.branch_checkout_root,
+                root,
+                branch,
+                still_pending,
+            )
+        })
     }
 
     fn active_branch_checkout_busy(&self) -> bool {
-        self.branch_checkout_busy()
-            && self.task_root_matches_active_repo(self.branch_checkout_root.as_deref())
+        self.active_repository_operation().is_some_and(|state| {
+            state.branch_checkout_task.is_some() || state.pending_branch_checkout.is_some()
+        })
     }
 
     fn active_remote_git_busy(&self) -> bool {
-        self.remote_git_busy()
-            && self.task_root_matches_active_repo(self.remote_git_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.remote_git_task.is_some())
     }
 
     fn active_remote_sync_busy(&self) -> bool {
@@ -7301,84 +7501,84 @@ impl GitAgentApp {
     }
 
     fn active_background_remote_git_busy(&self) -> bool {
-        self.background_remote_git_task.is_some()
-            && self.task_root_matches_active_repo(self.background_remote_git_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.background_remote_git_task.is_some())
     }
 
     fn active_repository_undo_busy(&self) -> bool {
-        self.repository_undo_busy()
-            && self.task_root_matches_active_repo(self.repository_undo_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.repository_undo_task.is_some())
     }
 
     fn active_credential_login_busy(&self) -> bool {
-        self.credential_login_task.is_some()
-            && self.task_root_matches_active_repo(self.credential_login_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.credential_login_task.is_some())
     }
 
     fn merge_tool_busy(&self) -> bool {
-        self.merge_tool_task.is_some() || self.conflict_merge_reload_root.is_some()
+        self.operations.current.merge_tool_task.is_some()
+            || self.operations.current.conflict_merge_reload_root.is_some()
     }
 
     fn active_merge_tool_busy(&self) -> bool {
-        self.active_merge_tool_process_busy()
-            || self.task_root_matches_active_repo(self.conflict_merge_reload_root.as_deref())
+        self.active_repository_operation().is_some_and(|state| {
+            state.merge_tool_task.is_some() || state.conflict_merge_reload_root.is_some()
+        })
     }
 
     fn active_merge_tool_process_busy(&self) -> bool {
-        self.merge_tool_task.is_some()
-            && self.task_root_matches_active_repo(self.merge_tool_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.merge_tool_task.is_some())
     }
 
     fn active_create_patch_busy(&self) -> bool {
-        self.create_patch_task.is_some()
-            && self.task_root_matches_active_repo(self.create_patch_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.create_patch_task.is_some())
     }
 
     fn active_repository_benchmark_busy(&self) -> bool {
-        self.repository_benchmark_task.is_some()
-            && self.task_root_matches_active_repo(self.repository_benchmark_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.repository_benchmark_task.is_some())
     }
 
     fn finish_conflict_merge_reload_for(&mut self, root: &Path) {
-        if self
-            .conflict_merge_reload_root
-            .as_deref()
-            .is_some_and(|pending_root| paths_equal(pending_root, root))
-        {
-            self.conflict_merge_reload_root = None;
+        if let Some(state) = self.operations.get_mut(root) {
+            state.conflict_merge_reload_root = None;
         }
     }
 
     fn finish_conflict_merge_reload_for_key(&mut self, key: &str) {
-        if self
-            .conflict_merge_reload_root
-            .as_ref()
-            .is_some_and(|pending_root| repo_state_key(pending_root) == key)
+        if let Some(root) = self
+            .operations
+            .roots()
+            .into_iter()
+            .find(|root| repo_state_key(root) == key)
         {
-            self.conflict_merge_reload_root = None;
+            self.finish_conflict_merge_reload_for(&root);
         }
     }
 
     fn active_external_diff_tool_busy(&self) -> bool {
-        self.external_diff_tool_task.is_some()
-            && self.task_root_matches_active_repo(self.external_diff_tool_root.as_deref())
+        self.active_repository_operation()
+            .is_some_and(|state| state.external_diff_tool_task.is_some())
     }
-
     fn start_repository_benchmark(&mut self) {
-        if self.repository_benchmark_task.is_some() || self.branch_actions_busy() {
+        if self.operations.current.repository_benchmark_task.is_some() || self.branch_actions_busy()
+        {
             return;
         }
         let Some(root) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
             return;
         };
         let (sender, receiver) = mpsc::channel();
-        self.repository_benchmark_task = Some(receiver);
-        self.repository_benchmark_root = Some(root.clone());
-        self.repository_benchmark_progress = Some(git::RepositoryBenchmarkStepProgress {
-            completed: 0,
-            total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
-            label_key: "benchmark.running",
-        });
+        self.operations.current.repository_benchmark_task = Some(receiver);
+        self.operations.current.repository_benchmark_root = Some(root.clone());
+        self.operations.current.repository_benchmark_progress =
+            Some(git::RepositoryBenchmarkStepProgress {
+                completed: 0,
+                total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
+                label_key: "benchmark.running",
+            });
         self.error = None;
         self.last_notice = None;
         thread::spawn(move || {
@@ -7427,16 +7627,15 @@ impl GitAgentApp {
     }
 
     fn active_commit_ai_busy(&self) -> bool {
-        self.commit_ai_task
+        self.operations
+            .current
+            .commit_ai_task
             .as_ref()
             .is_some_and(|task| self.active_repo_root_matches(&task.root))
     }
 
     fn branch_actions_busy(&self) -> bool {
-        self.credential_login_task.is_some()
-            || self.repository_undo_busy()
-            || self.remote_git_busy()
-            || self.active_repo_has_pending_load()
+        self.active_repo_has_pending_load()
             || (self.history_reference.is_some()
                 && self.active_repo_root().is_some_and(|root| {
                     self.foreground_repo_history_loads
@@ -7483,6 +7682,8 @@ impl GitAgentApp {
         }
         if self.active_remote_git_busy() {
             return self
+                .operations
+                .current
                 .remote_git_status_key
                 .map(|key| self.tr(key))
                 .unwrap_or_else(|| self.tr("status.running_git_action"));
@@ -7516,7 +7717,9 @@ impl GitAgentApp {
         }
         if self.active_remote_git_busy() {
             return Some(
-                self.remote_git_status_key
+                self.operations
+                    .current
+                    .remote_git_status_key
                     .map(|key| self.tr(key))
                     .unwrap_or_else(|| self.tr("status.running_git_action")),
             );
@@ -7944,7 +8147,7 @@ impl GitAgentApp {
         );
         self.invalidate_branch_sensitive_tasks(&root);
         diagnostics::trace("branch.invalidate.end", &format!("root={}", root.display()));
-        self.branch_checkout_root = Some(root.clone());
+        self.operations.current.branch_checkout_root = Some(root.clone());
         if strategy == BranchCheckoutStrategy::PreserveLocalChanges && !has_local_changes {
             let checkout_name = name.clone();
             self.start_undoable_git_action_without_post_status(
@@ -7958,13 +8161,13 @@ impl GitAgentApp {
                     git::checkout_branch(root, &checkout_name)
                 },
             );
-            self.pending_branch_checkout = Some(name);
+            self.operations.current.pending_branch_checkout = Some(name);
             return;
         }
 
         let (sender, receiver) = mpsc::channel();
-        self.branch_checkout_task = Some(receiver);
-        self.pending_branch_checkout = Some(name.clone());
+        self.operations.current.branch_checkout_task = Some(receiver);
+        self.operations.current.pending_branch_checkout = Some(name.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -8016,13 +8219,13 @@ impl GitAgentApp {
     }
 
     fn remote_git_busy(&self) -> bool {
-        self.remote_git_task.is_some()
-            || self.background_remote_git_task.is_some()
-            || self.credential_login_task.is_some()
+        self.operations.current.remote_git_task.is_some()
+            || self.operations.current.background_remote_git_task.is_some()
+            || self.operations.current.credential_login_task.is_some()
     }
 
     fn repository_undo_busy(&self) -> bool {
-        self.repository_undo_task.is_some()
+        self.operations.current.repository_undo_task.is_some()
     }
 
     fn active_repository_undo_key(&self) -> Option<String> {
@@ -8076,8 +8279,8 @@ impl GitAgentApp {
         };
 
         let (sender, receiver) = mpsc::channel();
-        self.repository_undo_task = Some(receiver);
-        self.repository_undo_root = Some(root.clone());
+        self.operations.current.repository_undo_task = Some(receiver);
+        self.operations.current.repository_undo_root = Some(root.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -8168,8 +8371,8 @@ impl GitAgentApp {
 
         let root = entry.root.clone();
         let (sender, receiver) = mpsc::channel();
-        self.repository_undo_task = Some(receiver);
-        self.repository_undo_root = Some(root.clone());
+        self.operations.current.repository_undo_task = Some(receiver);
+        self.operations.current.repository_undo_root = Some(root.clone());
         self.loading_repo = true;
         self.error = None;
         self.last_notice = None;
@@ -8230,11 +8433,11 @@ impl GitAgentApp {
     }
 
     fn create_patch_busy(&self) -> bool {
-        self.create_patch_task.is_some()
+        self.operations.current.create_patch_task.is_some()
     }
 
     fn start_github_credential_login(&mut self) {
-        if self.credential_login_task.is_some()
+        if self.operations.current.credential_login_task.is_some()
             || self.remote_git_busy()
             || self.loading_repo
             || self.active_commit_ai_busy()
@@ -8243,17 +8446,24 @@ impl GitAgentApp {
         }
 
         let Some(root) = self
+            .operations
+            .current
             .pending_credential_retry
             .as_ref()
-            .and(self.pending_credential_retry_root.clone())
+            .and(
+                self.operations
+                    .current
+                    .pending_credential_retry_root
+                    .clone(),
+            )
             .or_else(|| self.active_repo_root())
         else {
             return;
         };
 
         let (sender, receiver) = mpsc::channel();
-        self.credential_login_task = Some(receiver);
-        self.credential_login_root = Some(root);
+        self.operations.current.credential_login_task = Some(receiver);
+        self.operations.current.credential_login_root = Some(root);
         self.loading_repo = true;
         self.last_notice = None;
 
@@ -8279,19 +8489,34 @@ impl GitAgentApp {
         action: PendingCredentialRetryAction,
         after_login: bool,
     ) {
-        if self.remote_git_busy() || self.credential_login_task.is_some() {
+        if !self
+            .operations
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|owner| paths_equal(owner, &root))
+        {
+            let previous = self.operations.current.root.clone();
+            self.operations.select(root.clone());
+            self.start_credential_retry_action_for_root(root, action, after_login);
+            if let Some(previous) = previous {
+                self.operations.select(previous);
+            }
             return;
         }
-        self.pending_credential_retry_root = Some(root.clone());
+        if self.remote_git_busy() || self.operations.current.credential_login_task.is_some() {
+            return;
+        }
+        self.operations.current.pending_credential_retry_root = Some(root.clone());
         match action.clone() {
             PendingCredentialRetryAction::Push {
                 remote,
                 branches,
                 options,
             } => {
-                self.pending_pull_request_open_after_push = None;
-                self.pending_credential_retry = Some(action);
-                self.credential_retry_in_progress = after_login;
+                self.operations.current.pending_pull_request_open_after_push = None;
+                self.operations.current.pending_credential_retry = Some(action);
+                self.operations.current.credential_retry_in_progress = after_login;
                 self.start_remote_git_action_for_root_with_status(
                     root,
                     "status.pushing",
@@ -8303,8 +8528,8 @@ impl GitAgentApp {
                 local_branch,
                 remote_branch,
             } => {
-                self.pending_credential_retry = Some(action);
-                self.credential_retry_in_progress = after_login;
+                self.operations.current.pending_credential_retry = Some(action);
+                self.operations.current.credential_retry_in_progress = after_login;
                 self.start_remote_git_action_for_root_with_status(
                     root,
                     "status.pushing",
@@ -8322,7 +8547,7 @@ impl GitAgentApp {
         branches: Vec<git::PushBranchSpec>,
         options: git::PushOptions,
     ) {
-        self.pending_push_recovery_candidate =
+        self.operations.current.pending_push_recovery_candidate =
             self.selected_push_after_pull_plan(&remote, &branches, options);
         self.start_credential_retry_action(
             PendingCredentialRetryAction::Push {
@@ -8371,11 +8596,17 @@ impl GitAgentApp {
 
     fn push_recovery_plan_for_error(&mut self, root: &Path) -> Option<PushAfterPullPlan> {
         if self
+            .operations
+            .current
             .pending_push_recovery_candidate
             .as_ref()
             .is_some_and(|plan| paths_equal(&plan.root, root))
         {
-            return self.pending_push_recovery_candidate.take();
+            return self
+                .operations
+                .current
+                .pending_push_recovery_candidate
+                .take();
         }
 
         self.snapshot
@@ -8385,7 +8616,7 @@ impl GitAgentApp {
     }
 
     fn resume_push_after_pull(&mut self, plan: PushAfterPullPlan) {
-        self.pending_push_recovery_candidate = None;
+        self.operations.current.pending_push_recovery_candidate = None;
         match plan.retry {
             PushAfterPullRetry::Quick => {
                 self.start_remote_git_action_for_root_with_status(
@@ -8459,6 +8690,21 @@ impl GitAgentApp {
         status_key: &'static str,
         action: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
     ) {
+        if !self
+            .operations
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|owner| paths_equal(owner, &root))
+        {
+            let previous = self.operations.current.root.clone();
+            self.operations.select(root.clone());
+            self.start_remote_git_action_for_root_with_status(root, status_key, action);
+            if let Some(previous) = previous {
+                self.operations.select(previous);
+            }
+            return;
+        }
         if self.remote_git_busy() {
             return;
         }
@@ -8467,9 +8713,9 @@ impl GitAgentApp {
             self.pending_toolbar_single_click = None;
         }
         let (sender, receiver) = mpsc::channel();
-        self.remote_git_task = Some(receiver);
-        self.remote_git_status_key = Some(status_key);
-        self.remote_git_root = Some(root.clone());
+        self.operations.current.remote_git_task = Some(receiver);
+        self.operations.current.remote_git_status_key = Some(status_key);
+        self.operations.current.remote_git_root = Some(root.clone());
         if self.active_repo_root_matches(&root) {
             self.loading_repo = true;
             self.error = None;
@@ -8501,6 +8747,10 @@ impl GitAgentApp {
         let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
+            let _span = diagnostics::span(
+                "repository.remote",
+                format!("root={} action={status_key}", root.display()),
+            );
             let result = exclusive_access
                 .recv()
                 .map_err(|_| {
@@ -8526,8 +8776,8 @@ impl GitAgentApp {
         };
 
         let (sender, receiver) = mpsc::channel();
-        self.create_patch_task = Some(receiver);
-        self.create_patch_root = Some(root.clone());
+        self.operations.current.create_patch_task = Some(receiver);
+        self.operations.current.create_patch_root = Some(root.clone());
         self.error = None;
         self.last_notice = None;
 
@@ -8813,12 +9063,12 @@ impl GitAgentApp {
         self.pending_pull_action = None;
         self.pending_push_action = None;
         self.pending_force_push_confirm = None;
-        self.pending_non_fast_forward_push = None;
-        self.pending_push_after_pull = None;
-        self.pending_push_recovery_candidate = None;
+        self.operations.current.pending_non_fast_forward_push = None;
+        self.operations.current.pending_push_after_pull = None;
+        self.operations.current.pending_push_recovery_candidate = None;
         self.pending_merge_action = None;
         self.pending_interactive_rebase_action = None;
-        self.pending_rewritten_history_prompt = None;
+        self.operations.current.pending_rewritten_history_prompt = None;
         self.pending_create_pull_request = None;
     }
 
@@ -8841,7 +9091,7 @@ impl GitAgentApp {
         let branch = current_branch.name.clone();
         let has_upstream = current_branch.upstream.is_some() || snapshot.upstream.is_some();
         let remote = self.default_remote_name();
-        self.pending_push_recovery_candidate = has_upstream
+        self.operations.current.pending_push_recovery_candidate = has_upstream
             .then(|| self.quick_push_after_pull_plan())
             .flatten();
         self.start_remote_git_action_with_status("status.pushing", move |root| {
@@ -9031,13 +9281,693 @@ impl GitAgentApp {
         }
     }
 
+    fn poll_repository_operations(&mut self, ctx: &egui::Context) {
+        let selected = self
+            .active_repo_root()
+            .or_else(|| self.operations.current.root.clone());
+        let roots = self.operations.pending_task_roots();
+        for root in roots {
+            let active = self.active_repo_root_matches(&root);
+            let feedback = (!active).then(|| {
+                (
+                    self.error.clone(),
+                    self.last_notice.clone(),
+                    self.toast_notice.clone(),
+                )
+            });
+            self.operations.select(root);
+            self.poll_repository_operation_tasks(ctx);
+            if let Some((error, notice, toast)) = feedback {
+                if self.error != error && self.error.is_some() {
+                    self.operations.current.completion_error = self.error.take();
+                }
+                self.error = error;
+                self.last_notice = notice;
+                self.toast_notice = toast;
+            }
+        }
+        if let Some(root) = selected {
+            self.operations.select(root);
+        }
+    }
+
+    fn poll_repository_operation_tasks(&mut self, ctx: &egui::Context) {
+        // Keep a completed suggestion with its original draft while its tab is inactive.
+        // It is consumed once that repository is active, never applied to another view.
+        if self
+            .operations
+            .current
+            .root
+            .as_ref()
+            .is_some_and(|root| self.active_repo_root_matches(root))
+        {
+            self.poll_commit_ai_task(ctx);
+        }
+        if let Some(receiver) = self.operations.current.branch_checkout_task.take() {
+            match receiver.try_recv() {
+                Ok((root, name, _, Ok(()))) => {
+                    diagnostics::trace(
+                        "checkout.result",
+                        &format!("root={} target={} outcome=success", root.display(), name),
+                    );
+                    self.error = None;
+                    self.last_notice = None;
+                    self.operations.current.pending_branch_checkout = Some(name);
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, name, strategy, Err(error))) => {
+                    diagnostics::finish_branch_switch(
+                        "checkout_error",
+                        &format!("target={} strategy={strategy:?} error={error:#}", name),
+                    );
+                    self.operations.current.branch_checkout_task = None;
+                    self.operations.current.pending_branch_checkout = None;
+                    if self
+                        .operations
+                        .current
+                        .branch_checkout_root
+                        .as_deref()
+                        .is_some_and(|owner| paths_equal(owner, &root))
+                    {
+                        self.operations.current.branch_checkout_root = None;
+                    }
+                    self.load_repository_uncached(root.clone());
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if self.active_repo_root_matches(&root)
+                        && strategy == BranchCheckoutStrategy::PreserveLocalChanges
+                        && git::checkout_error_requires_local_change_recovery(&error.to_string())
+                    {
+                        self.pending_branch_action = Some(BranchActionDialog::CheckoutRecovery {
+                            name,
+                            checkout_error: error.to_string(),
+                            discard_changes: false,
+                        });
+                        self.error = None;
+                    } else {
+                        self.error =
+                            Some(self.repository_operation_error_message(&root, error.to_string()));
+                    }
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.branch_checkout_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    diagnostics::finish_branch_switch("checkout_disconnected", "");
+                    self.operations.current.pending_branch_checkout = None;
+                    if let Some(root) = self.operations.current.branch_checkout_root.take() {
+                        self.load_repository_uncached(root);
+                    }
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    self.error = Some("Branch checkout stopped unexpectedly".to_owned());
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.repository_undo_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(RepositoryUndoTaskOutcome::Recorded(entry)))) => {
+                    self.operations.current.repository_undo_root = None;
+                    diagnostics::trace(
+                        "undo.result",
+                        &format!("root={} outcome=recorded", root.display()),
+                    );
+                    if self.active_repo_root_matches(&root) {
+                        self.show_action_toast(
+                            self.undo_redo_toast_message("undo.toast.ready", &entry.label),
+                        );
+                    }
+                    let key = repo_state_key(&entry.root);
+                    self.undo_entries.insert(key.clone(), entry);
+                    self.redo_entries.remove(&key);
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction }))) => {
+                    self.operations.current.repository_undo_root = None;
+                    match direction {
+                        RepositoryUndoDirection::Undo => {
+                            let message =
+                                self.undo_redo_toast_message("undo.toast.completed", &entry.label);
+                            let key = repo_state_key(&entry.root);
+                            self.undo_entries.remove(&key);
+                            self.redo_entries.insert(key, entry);
+                            if self.active_repo_root_matches(&root) {
+                                self.show_action_toast(message);
+                            }
+                        }
+                        RepositoryUndoDirection::Redo => {
+                            let message =
+                                self.undo_redo_toast_message("redo.toast.completed", &entry.label);
+                            let key = repo_state_key(&entry.root);
+                            self.undo_entries.insert(key.clone(), entry);
+                            self.redo_entries.remove(&key);
+                            if self.active_repo_root_matches(&root) {
+                                self.show_action_toast(message);
+                            }
+                        }
+                    }
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.operations.current.repository_undo_root = None;
+                    diagnostics::finish_branch_switch(
+                        "undo_error",
+                        &format!("root={} error={error:#}", root.display()),
+                    );
+                    self.finish_repository_checkout_reload(&root, None, false);
+                    if self.active_repo_root_matches(&root)
+                        && git::repository_rebase_in_progress(&root)
+                    {
+                        self.dismiss_rebase_blocked_dialogs();
+                        self.pending_rebase_control_action = Some(RebaseControlDialog {
+                            message: Some(error.to_string()),
+                        });
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                    } else {
+                        if self
+                            .operations
+                            .current
+                            .pending_rewritten_history_prompt_root
+                            .as_ref()
+                            .is_some_and(|pending_root| paths_equal(pending_root, &root))
+                        {
+                            self.operations
+                                .current
+                                .pending_rewritten_history_prompt_root = None;
+                        }
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.load_repository_uncached(root.clone());
+                        self.error =
+                            Some(self.repository_operation_error_message(&root, error.to_string()));
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.repository_undo_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(root) = self.operations.current.repository_undo_root.take() {
+                        self.finish_repository_checkout_reload(&root, None, false);
+                        self.load_repository_uncached(root);
+                    }
+                    diagnostics::finish_branch_switch("undo_disconnected", "");
+                    self.operations
+                        .current
+                        .pending_rewritten_history_prompt_root = None;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    self.error = Some("Repository undo task stopped unexpectedly".to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.repository_benchmark_task.take() {
+            let mut keep_receiver = true;
+            loop {
+                match receiver.try_recv() {
+                    Ok(RepositoryBenchmarkTaskMessage::Progress(progress)) => {
+                        self.operations.current.repository_benchmark_progress = Some(progress);
+                        ctx.request_repaint();
+                    }
+                    Ok(RepositoryBenchmarkTaskMessage::Finished(root, Ok(report))) => {
+                        keep_receiver = false;
+                        self.operations.current.repository_benchmark_root = None;
+                        self.operations.current.repository_benchmark_progress = None;
+                        self.error = None;
+                        self.save_repository_benchmark_report(&root, &report);
+                        ctx.request_repaint();
+                        break;
+                    }
+                    Ok(RepositoryBenchmarkTaskMessage::Finished(_, Err(error))) => {
+                        keep_receiver = false;
+                        self.operations.current.repository_benchmark_root = None;
+                        self.operations.current.repository_benchmark_progress = None;
+                        self.error = Some(error.to_string());
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        keep_receiver = false;
+                        self.operations.current.repository_benchmark_root = None;
+                        self.operations.current.repository_benchmark_progress = None;
+                        self.error = Some(self.tr("benchmark.stopped").to_owned());
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        break;
+                    }
+                }
+            }
+            if keep_receiver {
+                self.operations.current.repository_benchmark_task = Some(receiver);
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.create_patch_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(paths))) => {
+                    self.operations.current.create_patch_root = None;
+                    self.pending_create_patch_action = None;
+                    self.error = None;
+                    self.last_notice = None;
+                    let destination = paths
+                        .first()
+                        .map(|path| user_facing_path_string(path))
+                        .unwrap_or_else(|| user_facing_path_string(&root));
+                    self.show_toast(format!("{} {destination}", self.tr("patch.create.success")));
+                    ctx.request_repaint();
+                }
+                Ok((_, Err(error))) => {
+                    self.operations.current.create_patch_root = None;
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.create_patch_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.operations.current.create_patch_root = None;
+                    self.error = Some(self.tr("patch.create.disconnected").to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.background_remote_git_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(snapshot))) => {
+                    self.operations.current.background_remote_git_root = None;
+                    let plugin_context = snapshot
+                        .as_ref()
+                        .or_else(|| self.snapshot_cache.get(&repo_state_key(&root)))
+                        .map(|snapshot| self.plugin_context_for(snapshot));
+                    if let Some(snapshot) = snapshot {
+                        let active_repo = self.active_repo_root_matches(&root);
+                        let unchanged = active_repo
+                            && self.active_snapshot_matches_background_core_refresh(&snapshot);
+                        self.cache_repository_snapshot(&snapshot);
+                        if active_repo && !unchanged {
+                            self.apply_repository_snapshot(snapshot);
+                        }
+                    }
+                    if let Some(context) = plugin_context {
+                        self.plugins.notify(
+                            "repository.fetch.completed",
+                            context,
+                            self.selected_ai_model.clone(),
+                            ctx,
+                            false,
+                        );
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.operations.current.background_remote_git_root = None;
+                    diagnostics::repository_refresh_trace(
+                        "remote.error",
+                        &format!("root={} error={error:#}", root.display()),
+                    );
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.background_remote_git_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.operations.current.background_remote_git_root = None;
+                    diagnostics::repository_refresh_trace(
+                        "remote.disconnected",
+                        "background remote refresh worker stopped unexpectedly",
+                    );
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.remote_git_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(()))) => {
+                    if let Some(event) = match self.operations.current.remote_git_status_key {
+                        Some("status.fetching") => Some("repository.fetch.completed"),
+                        Some("status.pulling") => Some("repository.pull.completed"),
+                        Some("status.pushing") => Some("repository.push.completed"),
+                        _ => None,
+                    } {
+                        self.plugin_repository_events.insert(root.clone(), event);
+                    }
+                    self.operations.current.remote_git_status_key = None;
+                    self.operations.current.remote_git_root = None;
+                    if self
+                        .operations
+                        .current
+                        .pending_push_after_pull
+                        .as_ref()
+                        .is_some_and(|plan| paths_equal(&plan.root, &root))
+                    {
+                        let plan = self
+                            .operations
+                            .current
+                            .pending_push_after_pull
+                            .take()
+                            .expect("push plan exists");
+                        self.operations.current.pending_push_recovery_candidate = None;
+                        self.operations.current.pending_credential_retry = None;
+                        self.operations.current.credential_retry_in_progress = false;
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        if self.active_repo_root_matches(&root) {
+                            self.error = None;
+                            self.last_notice = None;
+                        }
+                        self.resume_push_after_pull(plan);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    self.operations.current.pending_push_recovery_candidate = None;
+                    let pull_request_to_open = self
+                        .operations
+                        .current
+                        .pending_pull_request_open_after_push
+                        .take()
+                        .filter(|pending| paths_equal(&pending.root, &root));
+                    self.operations.current.pending_credential_retry = None;
+                    self.operations.current.credential_retry_in_progress = false;
+                    if self.active_repo_root_matches(&root) {
+                        self.error = None;
+                        self.last_notice = None;
+                    }
+                    self.load_repository_uncached(root);
+                    if let Some(pending) = pull_request_to_open {
+                        let url = branch_pull_request_url(&pending.base_url, &pending.branch);
+                        if let Err(error) = open_url(&url) {
+                            self.error =
+                                Some(format!("{}: {error}", self.tr("repo.remote.failed")));
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.operations.current.remote_git_status_key = None;
+                    self.operations.current.remote_git_root = None;
+                    if let Some(partial) =
+                        error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()
+                    {
+                        let message = if self.language == Language::Chinese {
+                            format!(
+                                "本地分支 {} 已删除，但关联远端分支 {} 删除失败。请检查远端权限或连接后单独重试删除远端分支。\n\n{}",
+                                partial.local_branch, partial.remote_branch, partial.diagnostic
+                            )
+                        } else {
+                            partial.to_string()
+                        };
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.load_repository_uncached(root.clone());
+                        self.error = Some(self.repository_operation_error_message(&root, message));
+                        self.last_notice = None;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let failed_pull_request_root = self
+                        .operations
+                        .current
+                        .pending_pull_request_open_after_push
+                        .as_ref()
+                        .is_some_and(|pending| paths_equal(&pending.root, &root));
+                    if self
+                        .operations
+                        .current
+                        .pending_rewritten_history_prompt_root
+                        .as_ref()
+                        .is_some_and(|pending_root| paths_equal(pending_root, &root))
+                    {
+                        self.operations
+                            .current
+                            .pending_rewritten_history_prompt_root = None;
+                    }
+                    if self.active_repo_root_matches(&root)
+                        && git::repository_rebase_in_progress(&root)
+                    {
+                        self.dismiss_rebase_blocked_dialogs();
+                        self.pending_rebase_control_action = Some(RebaseControlDialog {
+                            message: Some(error.to_string()),
+                        });
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if let Some(conflict) = error.downcast_ref::<git::PullConflictError>() {
+                        self.operations.current.pending_push_after_pull = None;
+                        self.operations.current.pending_push_recovery_candidate = None;
+                        self.operations.current.pending_credential_retry = None;
+                        self.operations.current.credential_retry_in_progress = false;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.loading_repo = self.active_repo_has_pending_load();
+                        self.error = Some(pull_conflict_error_message(
+                            self.language,
+                            conflict.diagnostic(),
+                        ));
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    let mut message =
+                        self.repository_operation_error_message(&root, error.to_string());
+                    let auth_error = github_authentication_error(&message);
+                    if !auth_error && non_fast_forward_push_error(&message) {
+                        if let Some(plan) = self.push_recovery_plan_for_error(&root) {
+                            self.operations.current.pending_non_fast_forward_push = Some(plan);
+                            self.load_repository_uncached(root.clone());
+                            self.operations.current.pending_credential_retry = None;
+                            self.operations.current.credential_retry_in_progress = false;
+                            self.error = None;
+                            self.last_notice = None;
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                    self.operations.current.pending_push_recovery_candidate = None;
+                    let pull_after_push_failed = self
+                        .operations
+                        .current
+                        .pending_push_after_pull
+                        .as_ref()
+                        .is_some_and(|plan| paths_equal(&plan.root, &root));
+                    if pull_after_push_failed && git::repository_merge_in_progress(&root) {
+                        self.operations.current.pending_push_after_pull = None;
+                        self.operations.current.pending_credential_retry = None;
+                        self.operations.current.credential_retry_in_progress = false;
+                        if self.active_repo_root_matches(&root) {
+                            self.active_view = MainView::Workspace;
+                        }
+                        self.error = None;
+                        self.last_notice = None;
+                        self.load_repository_uncached(root);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if pull_after_push_failed {
+                        self.operations.current.pending_push_after_pull = None;
+                    }
+                    let was_login_retry = self.operations.current.credential_retry_in_progress;
+                    self.operations.current.credential_retry_in_progress = false;
+                    if was_login_retry && auth_error {
+                        self.operations.current.pending_credential_retry = None;
+                        if failed_pull_request_root {
+                            self.operations.current.pending_pull_request_open_after_push = None;
+                        }
+                        message.push_str("\n\n");
+                        message.push_str(self.tr("credentials.github_retry_failed"));
+                    } else if !auth_error {
+                        self.operations.current.pending_credential_retry = None;
+                        if failed_pull_request_root {
+                            self.operations.current.pending_pull_request_open_after_push = None;
+                        }
+                    }
+                    self.load_repository_uncached(root);
+                    self.error = Some(message);
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.remote_git_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let interrupted_root = self.operations.current.remote_git_root.clone();
+                    self.operations.current.remote_git_status_key = None;
+                    self.operations.current.remote_git_root = None;
+                    self.operations
+                        .current
+                        .pending_rewritten_history_prompt_root = None;
+                    self.operations.current.pending_pull_request_open_after_push = None;
+                    self.operations.current.pending_non_fast_forward_push = None;
+                    self.operations.current.pending_push_after_pull = None;
+                    self.operations.current.pending_push_recovery_candidate = None;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if let Some(root) = interrupted_root {
+                        self.load_repository_uncached(root);
+                    }
+                    self.error = Some("Remote Git action stopped unexpectedly".to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(receiver) = self.operations.current.credential_login_task.take() {
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    let login_root = self.operations.current.credential_login_root.take();
+                    self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if let Some(retry) = self.operations.current.pending_credential_retry.take() {
+                        if let Some(root) = login_root {
+                            self.start_credential_retry_action_for_root(root, retry, true);
+                        }
+                    } else {
+                        self.error =
+                            Some(self.tr("credentials.github_login_done_message").to_owned());
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.operations.current.credential_login_root = None;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    self.error = Some(error.to_string());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.credential_login_task = Some(receiver);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.operations.current.credential_login_root = None;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    self.error = Some("Credential login stopped unexpectedly".to_owned());
+                    self.last_notice = None;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        self.poll_external_diff_tool_task(ctx);
+        self.poll_merge_tool_task(ctx);
+
+        if let Some(receiver) = self.operations.current.repo_gitignore_save_task.take() {
+            match receiver.try_recv() {
+                Ok((root, Ok(()))) => {
+                    self.operations.current.repo_gitignore_save_root = None;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if let Some(editor) = self
+                        .repo_gitignore_editor
+                        .as_mut()
+                        .filter(|editor| paths_equal(&editor.root, &root))
+                    {
+                        editor.original_text = editor.document.to_text();
+                        editor.error = None;
+                    }
+                    let close_after_save = self.operations.current.repo_gitignore_close_after_save;
+                    self.operations.current.repo_gitignore_close_after_save = false;
+                    if self.active_repo_root_matches(&root) {
+                        self.show_toast(self.tr("repo.settings.ignore_saved"));
+                    }
+                    if close_after_save && self.active_repo_root_matches(&root) {
+                        self.repo_settings_open = false;
+                        self.repo_gitignore_editor = None;
+                    }
+                    self.load_repository_uncached(root);
+                    ctx.request_repaint();
+                }
+                Ok((root, Err(error))) => {
+                    self.operations.current.repo_gitignore_save_root = None;
+                    self.operations.current.repo_gitignore_close_after_save = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    if let Some(editor) = self
+                        .repo_gitignore_editor
+                        .as_mut()
+                        .filter(|editor| paths_equal(&editor.root, &root))
+                    {
+                        editor.error = Some(error.to_string());
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.operations.current.repo_gitignore_save_task = Some(receiver);
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let owner = self.operations.current.repo_gitignore_save_root.take();
+                    self.operations.current.repo_gitignore_close_after_save = false;
+                    self.loading_repo = self.active_repo_has_pending_load();
+                    let message = self.tr("repo.settings.ignore_save_disconnected").to_owned();
+                    if let Some(editor) = self.repo_gitignore_editor.as_mut().filter(|editor| {
+                        owner
+                            .as_ref()
+                            .is_some_and(|root| paths_equal(root, &editor.root))
+                    }) {
+                        editor.error = Some(message);
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    fn request_selected_details(&mut self) {
+        self.request_commit_details_for(self.selected_commit);
+    }
+
+    fn request_selected_search_details(&mut self) {
+        self.request_commit_details_for(self.search_selected_commit);
+    }
+
     fn poll_tasks(&mut self, ctx: &egui::Context) {
         self.repository_browser.poll();
         if self.repository_browser.busy() {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         self.plugins.poll(ctx);
-        self.poll_commit_ai_task(ctx);
+        self.poll_repository_operations(ctx);
         let mut repository_load_activity = false;
         if let Some(receiver) = self.workspace_repository_status_task.take() {
             match receiver.try_recv() {
@@ -9058,14 +9988,10 @@ impl GitAgentApp {
         while let Ok(result) = self.automatic_repository_refresh_results.try_recv() {
             let key = repo_state_key(&result.0);
             if self.foreground_repo_loads.contains(&key)
-                || [
-                    self.remote_git_root.as_deref(),
-                    self.repository_undo_root.as_deref(),
-                    self.branch_checkout_root.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .any(|root| paths_equal(root, &result.0))
+                || self
+                    .operations
+                    .get(&result.0)
+                    .is_some_and(|state| state.suppresses_automatic_snapshot())
             {
                 continue;
             }
@@ -9115,14 +10041,14 @@ impl GitAgentApp {
                         );
                         self.repo_snapshot_retry_attempts.remove(&repo_task_key);
                         let active_repo = self.active_repo_root_matches(&requested_root);
-                        let belongs_to_pending_checkout = self
-                            .branch_checkout_root
-                            .as_deref()
-                            .is_some_and(|root| paths_equal(root, &requested_root))
-                            && self.pending_branch_checkout.is_some();
-                        let matches_pending_checkout = belongs_to_pending_checkout
-                            && self.pending_branch_checkout.as_deref()
-                                == Some(snapshot.branch.as_str());
+                        let pending_checkout = self
+                            .operations
+                            .get(&requested_root)
+                            .and_then(|state| state.pending_branch_checkout.as_deref())
+                            .map(str::to_owned);
+                        let belongs_to_pending_checkout = pending_checkout.is_some();
+                        let matches_pending_checkout =
+                            pending_checkout.as_deref() == Some(snapshot.branch.as_str());
                         // A final explicit post-operation read is authoritative even
                         // if another tool changed HEAD again after our checkout.
                         let authoritative_checkout_snapshot = belongs_to_pending_checkout
@@ -9149,7 +10075,7 @@ impl GitAgentApp {
                                     "root={} branch={} pending={}",
                                     requested_root.display(),
                                     snapshot.branch,
-                                    self.pending_branch_checkout.as_deref().unwrap_or_default()
+                                    pending_checkout.as_deref().unwrap_or_default()
                                 ),
                             );
                         }
@@ -9172,9 +10098,7 @@ impl GitAgentApp {
                                 ),
                             );
                         }
-                        if finish_pending_checkout_reload(
-                            &mut self.pending_branch_checkout,
-                            &mut self.branch_checkout_root,
+                        if self.finish_repository_checkout_reload(
                             &requested_root,
                             if authoritative_checkout_snapshot {
                                 None
@@ -9219,9 +10143,7 @@ impl GitAgentApp {
                         if was_foreground {
                             self.finish_conflict_merge_reload_for(&requested_root);
                         }
-                        if finish_pending_checkout_reload(
-                            &mut self.pending_branch_checkout,
-                            &mut self.branch_checkout_root,
+                        if self.finish_repository_checkout_reload(
                             &requested_root,
                             None,
                             queued_reload.is_some() || retry_queued || checkout_worker_running,
@@ -9264,18 +10186,13 @@ impl GitAgentApp {
                     self.finish_conflict_merge_reload_for_key(&key);
                 }
                 if let Some(root) = self
-                    .branch_checkout_root
-                    .clone()
-                    .filter(|root| repo_state_key(root) == key)
+                    .operations
+                    .roots()
+                    .into_iter()
+                    .find(|root| repo_state_key(root) == key)
                 {
                     let worker_running = self.checkout_worker_in_flight_for(&root);
-                    if finish_pending_checkout_reload(
-                        &mut self.pending_branch_checkout,
-                        &mut self.branch_checkout_root,
-                        &root,
-                        None,
-                        worker_running,
-                    ) {
+                    if self.finish_repository_checkout_reload(&root, None, worker_running) {
                         diagnostics::finish_branch_switch(
                             "snapshot_disconnected",
                             &format!("root={}", root.display()),
@@ -9387,237 +10304,6 @@ impl GitAgentApp {
             self.loading_repo = self.active_repo_has_pending_load();
         }
 
-        if let Some(receiver) = self.branch_checkout_task.take() {
-            match receiver.try_recv() {
-                Ok((root, name, _, Ok(()))) => {
-                    diagnostics::trace(
-                        "checkout.result",
-                        &format!("root={} target={} outcome=success", root.display(), name),
-                    );
-                    self.error = None;
-                    self.last_notice = None;
-                    self.pending_branch_checkout = Some(name);
-                    self.load_repository_uncached(root);
-                    ctx.request_repaint();
-                }
-                Ok((root, name, strategy, Err(error))) => {
-                    diagnostics::finish_branch_switch(
-                        "checkout_error",
-                        &format!("target={} strategy={strategy:?} error={error:#}", name),
-                    );
-                    self.branch_checkout_task = None;
-                    self.pending_branch_checkout = None;
-                    if self
-                        .branch_checkout_root
-                        .as_deref()
-                        .is_some_and(|owner| paths_equal(owner, &root))
-                    {
-                        self.branch_checkout_root = None;
-                    }
-                    self.load_repository_uncached(root.clone());
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    if self.active_repo_root_matches(&root)
-                        && strategy == BranchCheckoutStrategy::PreserveLocalChanges
-                        && git::checkout_error_requires_local_change_recovery(&error.to_string())
-                    {
-                        self.pending_branch_action = Some(BranchActionDialog::CheckoutRecovery {
-                            name,
-                            checkout_error: error.to_string(),
-                            discard_changes: false,
-                        });
-                        self.error = None;
-                    } else {
-                        self.error =
-                            Some(self.repository_operation_error_message(&root, error.to_string()));
-                    }
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.branch_checkout_task = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    diagnostics::finish_branch_switch("checkout_disconnected", "");
-                    self.pending_branch_checkout = None;
-                    if let Some(root) = self.branch_checkout_root.take() {
-                        self.load_repository_uncached(root);
-                    }
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    self.error = Some("Branch checkout stopped unexpectedly".to_owned());
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        if let Some(receiver) = self.repository_undo_task.take() {
-            match receiver.try_recv() {
-                Ok((root, Ok(RepositoryUndoTaskOutcome::Recorded(entry)))) => {
-                    self.repository_undo_root = None;
-                    diagnostics::trace(
-                        "undo.result",
-                        &format!("root={} outcome=recorded", root.display()),
-                    );
-                    if self.active_repo_root_matches(&root) {
-                        self.show_action_toast(
-                            self.undo_redo_toast_message("undo.toast.ready", &entry.label),
-                        );
-                    }
-                    let key = repo_state_key(&entry.root);
-                    self.undo_entries.insert(key.clone(), entry);
-                    self.redo_entries.remove(&key);
-                    if self.active_repo_root_matches(&root) {
-                        self.error = None;
-                        self.last_notice = None;
-                    }
-                    self.load_repository_uncached(root);
-                    ctx.request_repaint();
-                }
-                Ok((root, Ok(RepositoryUndoTaskOutcome::Replayed { entry, direction }))) => {
-                    self.repository_undo_root = None;
-                    match direction {
-                        RepositoryUndoDirection::Undo => {
-                            let message =
-                                self.undo_redo_toast_message("undo.toast.completed", &entry.label);
-                            let key = repo_state_key(&entry.root);
-                            self.undo_entries.remove(&key);
-                            self.redo_entries.insert(key, entry);
-                            if self.active_repo_root_matches(&root) {
-                                self.show_action_toast(message);
-                            }
-                        }
-                        RepositoryUndoDirection::Redo => {
-                            let message =
-                                self.undo_redo_toast_message("redo.toast.completed", &entry.label);
-                            let key = repo_state_key(&entry.root);
-                            self.undo_entries.insert(key.clone(), entry);
-                            self.redo_entries.remove(&key);
-                            if self.active_repo_root_matches(&root) {
-                                self.show_action_toast(message);
-                            }
-                        }
-                    }
-                    if self.active_repo_root_matches(&root) {
-                        self.error = None;
-                        self.last_notice = None;
-                    }
-                    self.load_repository_uncached(root);
-                    ctx.request_repaint();
-                }
-                Ok((root, Err(error))) => {
-                    self.repository_undo_root = None;
-                    diagnostics::finish_branch_switch(
-                        "undo_error",
-                        &format!("root={} error={error:#}", root.display()),
-                    );
-                    finish_pending_checkout_reload(
-                        &mut self.pending_branch_checkout,
-                        &mut self.branch_checkout_root,
-                        &root,
-                        None,
-                        false,
-                    );
-                    if self.active_repo_root_matches(&root)
-                        && git::repository_rebase_in_progress(&root)
-                    {
-                        self.dismiss_rebase_blocked_dialogs();
-                        self.pending_rebase_control_action = Some(RebaseControlDialog {
-                            message: Some(error.to_string()),
-                        });
-                        if self.active_repo_root_matches(&root) {
-                            self.active_view = MainView::Workspace;
-                        }
-                        self.error = None;
-                        self.last_notice = None;
-                        self.load_repository_uncached(root);
-                        ctx.request_repaint();
-                    } else {
-                        if self
-                            .pending_rewritten_history_prompt_root
-                            .as_ref()
-                            .is_some_and(|pending_root| paths_equal(pending_root, &root))
-                        {
-                            self.pending_rewritten_history_prompt_root = None;
-                        }
-                        self.loading_repo = self.active_repo_has_pending_load();
-                        self.load_repository_uncached(root.clone());
-                        self.error =
-                            Some(self.repository_operation_error_message(&root, error.to_string()));
-                        self.last_notice = None;
-                        ctx.request_repaint();
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.repository_undo_task = Some(receiver);
-                    ctx.request_repaint_after(Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if let Some(root) = self.repository_undo_root.take() {
-                        finish_pending_checkout_reload(
-                            &mut self.pending_branch_checkout,
-                            &mut self.branch_checkout_root,
-                            &root,
-                            None,
-                            false,
-                        );
-                        self.load_repository_uncached(root);
-                    }
-                    diagnostics::finish_branch_switch("undo_disconnected", "");
-                    self.pending_rewritten_history_prompt_root = None;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    self.error = Some("Repository undo task stopped unexpectedly".to_owned());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        if let Some(receiver) = self.repository_benchmark_task.take() {
-            let mut keep_receiver = true;
-            loop {
-                match receiver.try_recv() {
-                    Ok(RepositoryBenchmarkTaskMessage::Progress(progress)) => {
-                        self.repository_benchmark_progress = Some(progress);
-                        ctx.request_repaint();
-                    }
-                    Ok(RepositoryBenchmarkTaskMessage::Finished(root, Ok(report))) => {
-                        keep_receiver = false;
-                        self.repository_benchmark_root = None;
-                        self.repository_benchmark_progress = None;
-                        self.error = None;
-                        self.save_repository_benchmark_report(&root, &report);
-                        ctx.request_repaint();
-                        break;
-                    }
-                    Ok(RepositoryBenchmarkTaskMessage::Finished(_, Err(error))) => {
-                        keep_receiver = false;
-                        self.repository_benchmark_root = None;
-                        self.repository_benchmark_progress = None;
-                        self.error = Some(error.to_string());
-                        self.last_notice = None;
-                        ctx.request_repaint();
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        keep_receiver = false;
-                        self.repository_benchmark_root = None;
-                        self.repository_benchmark_progress = None;
-                        self.error = Some(self.tr("benchmark.stopped").to_owned());
-                        self.last_notice = None;
-                        ctx.request_repaint();
-                        break;
-                    }
-                }
-            }
-            if keep_receiver {
-                self.repository_benchmark_task = Some(receiver);
-            }
-        }
-
         if let Some(receiver) = self.ssh_tool_task.take() {
             match receiver.try_recv() {
                 Ok((action, Ok(output))) => {
@@ -9724,333 +10410,6 @@ impl GitAgentApp {
                 }
             }
         }
-
-        if let Some(receiver) = self.create_patch_task.take() {
-            match receiver.try_recv() {
-                Ok((root, Ok(paths))) => {
-                    self.create_patch_root = None;
-                    self.pending_create_patch_action = None;
-                    self.error = None;
-                    self.last_notice = None;
-                    let destination = paths
-                        .first()
-                        .map(|path| user_facing_path_string(path))
-                        .unwrap_or_else(|| user_facing_path_string(&root));
-                    self.show_toast(format!("{} {destination}", self.tr("patch.create.success")));
-                    ctx.request_repaint();
-                }
-                Ok((_, Err(error))) => {
-                    self.create_patch_root = None;
-                    self.error = Some(error.to_string());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.create_patch_task = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.create_patch_root = None;
-                    self.error = Some(self.tr("patch.create.disconnected").to_owned());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        if let Some(receiver) = self.background_remote_git_task.take() {
-            match receiver.try_recv() {
-                Ok((root, Ok(snapshot))) => {
-                    self.background_remote_git_root = None;
-                    let plugin_context = snapshot
-                        .as_ref()
-                        .or_else(|| self.snapshot_cache.get(&repo_state_key(&root)))
-                        .map(|snapshot| self.plugin_context_for(snapshot));
-                    if let Some(snapshot) = snapshot {
-                        let active_repo = self.active_repo_root_matches(&root);
-                        let unchanged = active_repo
-                            && self.active_snapshot_matches_background_core_refresh(&snapshot);
-                        self.cache_repository_snapshot(&snapshot);
-                        if active_repo && !unchanged {
-                            self.apply_repository_snapshot(snapshot);
-                        }
-                    }
-                    if let Some(context) = plugin_context {
-                        self.plugins.notify(
-                            "repository.fetch.completed",
-                            context,
-                            self.selected_ai_model.clone(),
-                            ctx,
-                            false,
-                        );
-                    }
-                    ctx.request_repaint();
-                }
-                Ok((root, Err(error))) => {
-                    self.background_remote_git_root = None;
-                    diagnostics::repository_refresh_trace(
-                        "remote.error",
-                        &format!("root={} error={error:#}", root.display()),
-                    );
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.background_remote_git_task = Some(receiver);
-                    ctx.request_repaint_after(Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.background_remote_git_root = None;
-                    diagnostics::repository_refresh_trace(
-                        "remote.disconnected",
-                        "background remote refresh worker stopped unexpectedly",
-                    );
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        if let Some(receiver) = self.remote_git_task.take() {
-            match receiver.try_recv() {
-                Ok((root, Ok(()))) => {
-                    if let Some(event) = match self.remote_git_status_key {
-                        Some("status.fetching") => Some("repository.fetch.completed"),
-                        Some("status.pulling") => Some("repository.pull.completed"),
-                        Some("status.pushing") => Some("repository.push.completed"),
-                        _ => None,
-                    } {
-                        self.plugin_repository_events.insert(root.clone(), event);
-                    }
-                    self.remote_git_status_key = None;
-                    self.remote_git_root = None;
-                    if self
-                        .pending_push_after_pull
-                        .as_ref()
-                        .is_some_and(|plan| paths_equal(&plan.root, &root))
-                    {
-                        let plan = self
-                            .pending_push_after_pull
-                            .take()
-                            .expect("push plan exists");
-                        self.pending_push_recovery_candidate = None;
-                        self.pending_credential_retry = None;
-                        self.credential_retry_in_progress = false;
-                        self.loading_repo = self.active_repo_has_pending_load();
-                        if self.active_repo_root_matches(&root) {
-                            self.error = None;
-                            self.last_notice = None;
-                        }
-                        self.resume_push_after_pull(plan);
-                        ctx.request_repaint();
-                        return;
-                    }
-                    self.pending_push_recovery_candidate = None;
-                    let pull_request_to_open = self
-                        .pending_pull_request_open_after_push
-                        .take()
-                        .filter(|pending| paths_equal(&pending.root, &root));
-                    self.pending_credential_retry = None;
-                    self.credential_retry_in_progress = false;
-                    if self.active_repo_root_matches(&root) {
-                        self.error = None;
-                        self.last_notice = None;
-                    }
-                    self.load_repository_uncached(root);
-                    if let Some(pending) = pull_request_to_open {
-                        let url = branch_pull_request_url(&pending.base_url, &pending.branch);
-                        if let Err(error) = open_url(&url) {
-                            self.error =
-                                Some(format!("{}: {error}", self.tr("repo.remote.failed")));
-                        }
-                    }
-                    ctx.request_repaint();
-                }
-                Ok((root, Err(error))) => {
-                    self.remote_git_status_key = None;
-                    self.remote_git_root = None;
-                    if let Some(partial) =
-                        error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()
-                    {
-                        let message = if self.language == Language::Chinese {
-                            format!(
-                                "本地分支 {} 已删除，但关联远端分支 {} 删除失败。请检查远端权限或连接后单独重试删除远端分支。\n\n{}",
-                                partial.local_branch, partial.remote_branch, partial.diagnostic
-                            )
-                        } else {
-                            partial.to_string()
-                        };
-                        self.loading_repo = self.active_repo_has_pending_load();
-                        self.load_repository_uncached(root.clone());
-                        self.error = Some(self.repository_operation_error_message(&root, message));
-                        self.last_notice = None;
-                        ctx.request_repaint();
-                        return;
-                    }
-                    let failed_pull_request_root = self
-                        .pending_pull_request_open_after_push
-                        .as_ref()
-                        .is_some_and(|pending| paths_equal(&pending.root, &root));
-                    if self
-                        .pending_rewritten_history_prompt_root
-                        .as_ref()
-                        .is_some_and(|pending_root| paths_equal(pending_root, &root))
-                    {
-                        self.pending_rewritten_history_prompt_root = None;
-                    }
-                    if self.active_repo_root_matches(&root)
-                        && git::repository_rebase_in_progress(&root)
-                    {
-                        self.dismiss_rebase_blocked_dialogs();
-                        self.pending_rebase_control_action = Some(RebaseControlDialog {
-                            message: Some(error.to_string()),
-                        });
-                        if self.active_repo_root_matches(&root) {
-                            self.active_view = MainView::Workspace;
-                        }
-                        self.loading_repo = self.active_repo_has_pending_load();
-                        self.error = None;
-                        self.last_notice = None;
-                        self.load_repository_uncached(root);
-                        ctx.request_repaint();
-                        return;
-                    }
-                    if let Some(conflict) = error.downcast_ref::<git::PullConflictError>() {
-                        self.pending_push_after_pull = None;
-                        self.pending_push_recovery_candidate = None;
-                        self.pending_credential_retry = None;
-                        self.credential_retry_in_progress = false;
-                        if self.active_repo_root_matches(&root) {
-                            self.active_view = MainView::Workspace;
-                        }
-                        self.loading_repo = self.active_repo_has_pending_load();
-                        self.error = Some(pull_conflict_error_message(
-                            self.language,
-                            conflict.diagnostic(),
-                        ));
-                        self.last_notice = None;
-                        self.load_repository_uncached(root);
-                        ctx.request_repaint();
-                        return;
-                    }
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    let mut message =
-                        self.repository_operation_error_message(&root, error.to_string());
-                    let auth_error = github_authentication_error(&message);
-                    if !auth_error && non_fast_forward_push_error(&message) {
-                        if let Some(plan) = self.push_recovery_plan_for_error(&root) {
-                            self.pending_non_fast_forward_push = Some(plan);
-                            self.load_repository_uncached(root.clone());
-                            self.pending_credential_retry = None;
-                            self.credential_retry_in_progress = false;
-                            self.error = None;
-                            self.last_notice = None;
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                    self.pending_push_recovery_candidate = None;
-                    let pull_after_push_failed = self
-                        .pending_push_after_pull
-                        .as_ref()
-                        .is_some_and(|plan| paths_equal(&plan.root, &root));
-                    if pull_after_push_failed && git::repository_merge_in_progress(&root) {
-                        self.pending_push_after_pull = None;
-                        self.pending_credential_retry = None;
-                        self.credential_retry_in_progress = false;
-                        if self.active_repo_root_matches(&root) {
-                            self.active_view = MainView::Workspace;
-                        }
-                        self.error = None;
-                        self.last_notice = None;
-                        self.load_repository_uncached(root);
-                        ctx.request_repaint();
-                        return;
-                    }
-                    if pull_after_push_failed {
-                        self.pending_push_after_pull = None;
-                    }
-                    let was_login_retry = self.credential_retry_in_progress;
-                    self.credential_retry_in_progress = false;
-                    if was_login_retry && auth_error {
-                        self.pending_credential_retry = None;
-                        if failed_pull_request_root {
-                            self.pending_pull_request_open_after_push = None;
-                        }
-                        message.push_str("\n\n");
-                        message.push_str(self.tr("credentials.github_retry_failed"));
-                    } else if !auth_error {
-                        self.pending_credential_retry = None;
-                        if failed_pull_request_root {
-                            self.pending_pull_request_open_after_push = None;
-                        }
-                    }
-                    self.load_repository_uncached(root);
-                    self.error = Some(message);
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.remote_git_task = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let interrupted_root = self.remote_git_root.clone();
-                    self.remote_git_status_key = None;
-                    self.remote_git_root = None;
-                    self.pending_rewritten_history_prompt_root = None;
-                    self.pending_pull_request_open_after_push = None;
-                    self.pending_non_fast_forward_push = None;
-                    self.pending_push_after_pull = None;
-                    self.pending_push_recovery_candidate = None;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    if let Some(root) = interrupted_root {
-                        self.load_repository_uncached(root);
-                    }
-                    self.error = Some("Remote Git action stopped unexpectedly".to_owned());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        if let Some(receiver) = self.credential_login_task.take() {
-            match receiver.try_recv() {
-                Ok(Ok(())) => {
-                    let login_root = self.credential_login_root.take();
-                    self.last_notice = Some(self.tr("credentials.github_login_done").to_owned());
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    if let Some(retry) = self.pending_credential_retry.take() {
-                        if let Some(root) = login_root {
-                            self.start_credential_retry_action_for_root(root, retry, true);
-                        }
-                    } else {
-                        self.error =
-                            Some(self.tr("credentials.github_login_done_message").to_owned());
-                    }
-                    ctx.request_repaint();
-                }
-                Ok(Err(error)) => {
-                    self.credential_login_root = None;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    self.error = Some(error.to_string());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.credential_login_task = Some(receiver);
-                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.credential_login_root = None;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    self.error = Some("Credential login stopped unexpectedly".to_owned());
-                    self.last_notice = None;
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        self.poll_external_diff_tool_task(ctx);
-        self.poll_merge_tool_task(ctx);
 
         if let Some(receiver) = self.repo_source_task.take() {
             match receiver.try_recv() {
@@ -10286,69 +10645,6 @@ impl GitAgentApp {
                 }
             }
         }
-
-        if let Some(receiver) = self.repo_gitignore_save_task.take() {
-            match receiver.try_recv() {
-                Ok((root, Ok(()))) => {
-                    self.repo_gitignore_save_root = None;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    if let Some(editor) = self
-                        .repo_gitignore_editor
-                        .as_mut()
-                        .filter(|editor| paths_equal(&editor.root, &root))
-                    {
-                        editor.original_text = editor.document.to_text();
-                        editor.error = None;
-                    }
-                    let close_after_save = self.repo_gitignore_close_after_save;
-                    self.repo_gitignore_close_after_save = false;
-                    if self.active_repo_root_matches(&root) {
-                        self.show_toast(self.tr("repo.settings.ignore_saved"));
-                    }
-                    if close_after_save && self.active_repo_root_matches(&root) {
-                        self.repo_settings_open = false;
-                        self.repo_gitignore_editor = None;
-                    }
-                    self.load_repository_uncached(root);
-                    ctx.request_repaint();
-                }
-                Ok((root, Err(error))) => {
-                    self.repo_gitignore_save_root = None;
-                    self.repo_gitignore_close_after_save = false;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    if let Some(editor) = self
-                        .repo_gitignore_editor
-                        .as_mut()
-                        .filter(|editor| paths_equal(&editor.root, &root))
-                    {
-                        editor.error = Some(error.to_string());
-                    }
-                    ctx.request_repaint();
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.repo_gitignore_save_task = Some(receiver);
-                    ctx.request_repaint_after(Duration::from_millis(80));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.repo_gitignore_save_root = None;
-                    self.repo_gitignore_close_after_save = false;
-                    self.loading_repo = self.active_repo_has_pending_load();
-                    let message = self.tr("repo.settings.ignore_save_disconnected").to_owned();
-                    if let Some(editor) = self.repo_gitignore_editor.as_mut() {
-                        editor.error = Some(message);
-                    }
-                    ctx.request_repaint();
-                }
-            }
-        }
-    }
-
-    fn request_selected_details(&mut self) {
-        self.request_commit_details_for(self.selected_commit);
-    }
-
-    fn request_selected_search_details(&mut self) {
-        self.request_commit_details_for(self.search_selected_commit);
     }
 
     fn request_commit_details_for(&mut self, selected_commit: Option<usize>) {
@@ -10718,7 +11014,7 @@ impl GitAgentApp {
     }
 
     fn can_start_tutorial(&self) -> bool {
-        self.repo_gitignore_save_task.is_none()
+        self.operations.current.repo_gitignore_save_task.is_none()
             && !self
                 .repo_gitignore_editor
                 .as_ref()
@@ -11000,7 +11296,7 @@ impl GitAgentApp {
         if self.background_remote_refresh_enabled != enabled {
             self.background_remote_refresh_enabled = enabled;
             if enabled {
-                self.next_background_remote_refresh_at =
+                self.operations.current.next_background_remote_refresh_at =
                     Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
             }
             self.save_app_settings();
@@ -11011,7 +11307,7 @@ impl GitAgentApp {
         let seconds = sanitize_remote_repo_refresh_seconds(seconds);
         if self.remote_repo_refresh_seconds != seconds {
             self.remote_repo_refresh_seconds = seconds;
-            self.next_background_remote_refresh_at =
+            self.operations.current.next_background_remote_refresh_at =
                 Instant::now() + remote_repo_refresh_duration(seconds);
             self.save_app_settings();
         }
@@ -11049,7 +11345,7 @@ impl GitAgentApp {
             self.cache_repository_snapshot(&snapshot);
         }
         if enabled && self.background_remote_refresh_enabled {
-            self.next_background_remote_refresh_at =
+            self.operations.current.next_background_remote_refresh_at =
                 Instant::now() + BACKGROUND_REMOTE_REFRESH_INITIAL_DELAY;
         }
     }
@@ -11298,7 +11594,7 @@ impl GitAgentApp {
             } else {
                 "status.committing"
             };
-            self.pending_push_recovery_candidate = if push_immediately
+            self.operations.current.pending_push_recovery_candidate = if push_immediately
                 && push_target
                     .as_ref()
                     .is_some_and(|(_, _, has_upstream)| *has_upstream)
@@ -12383,13 +12679,16 @@ impl GitAgentApp {
             return;
         }
         compact_action_dialog(ctx, self.tr("benchmark.title"), 360.0, |ui| {
-            let progress = self.repository_benchmark_progress.clone().unwrap_or(
-                git::RepositoryBenchmarkStepProgress {
+            let progress = self
+                .operations
+                .current
+                .repository_benchmark_progress
+                .clone()
+                .unwrap_or(git::RepositoryBenchmarkStepProgress {
                     completed: 0,
                     total: git::REPOSITORY_BENCHMARK_TOTAL_STEPS,
                     label_key: "benchmark.running",
-                },
-            );
+                });
             let fraction = if progress.total == 0 {
                 0.0
             } else {
@@ -12455,9 +12754,10 @@ impl GitAgentApp {
                 {
                     ui.ctx().copy_text(message.clone());
                 }
-                if github_authentication_error(&message) && self.pending_credential_retry.is_some()
+                if github_authentication_error(&message)
+                    && self.operations.current.pending_credential_retry.is_some()
                 {
-                    let login_running = self.credential_login_task.is_some();
+                    let login_running = self.operations.current.credential_login_task.is_some();
                     let login_label = if login_running {
                         self.tr("credentials.github_login_running")
                     } else {
@@ -14890,6 +15190,8 @@ impl GitAgentApp {
 
         let branch_actions_enabled = !self.branch_actions_busy();
         let pending_branch_checkout = self
+            .operations
+            .current
             .pending_branch_checkout
             .clone()
             .filter(|_| self.active_branch_checkout_busy());
@@ -16654,6 +16956,8 @@ impl GitAgentApp {
             .collect::<Vec<_>>();
         let branch_actions_enabled = !self.branch_actions_busy();
         let pending_branch_checkout = self
+            .operations
+            .current
             .pending_branch_checkout
             .clone()
             .filter(|_| self.active_branch_checkout_busy());
@@ -16936,12 +17240,12 @@ impl GitAgentApp {
     }
 
     fn poll_external_diff_tool_task(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = self.external_diff_tool_task.take() else {
+        let Some(receiver) = self.operations.current.external_diff_tool_task.take() else {
             return;
         };
         match receiver.try_recv() {
             Ok((root, Ok(()))) => {
-                self.external_diff_tool_root = None;
+                self.operations.current.external_diff_tool_root = None;
                 diagnostics::app_info(
                     "diff_tool.result",
                     &format!("root={} outcome=launched", root.display()),
@@ -16949,7 +17253,7 @@ impl GitAgentApp {
                 ctx.request_repaint();
             }
             Ok((root, Err(error))) => {
-                self.external_diff_tool_root = None;
+                self.operations.current.external_diff_tool_root = None;
                 diagnostics::app_error(
                     "diff_tool.result",
                     &format!("root={} outcome=error error={error:#}", root.display()),
@@ -16958,11 +17262,11 @@ impl GitAgentApp {
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Empty) => {
-                self.external_diff_tool_task = Some(receiver);
+                self.operations.current.external_diff_tool_task = Some(receiver);
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.external_diff_tool_root = None;
+                self.operations.current.external_diff_tool_root = None;
                 diagnostics::app_error("diff_tool.result", "outcome=disconnected");
                 self.error = Some("Diff tool launch stopped unexpectedly".to_owned());
                 ctx.request_repaint();
@@ -16971,12 +17275,12 @@ impl GitAgentApp {
     }
 
     fn poll_merge_tool_task(&mut self, ctx: &egui::Context) {
-        if let Some(receiver) = self.merge_tool_task.take() {
+        if let Some(receiver) = self.operations.current.merge_tool_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(true))) => {
-                    self.merge_tool_root = None;
+                    self.operations.current.merge_tool_root = None;
                     self.last_notice = None;
-                    self.conflict_merge_reload_root = Some(root.clone());
+                    self.operations.current.conflict_merge_reload_root = Some(root.clone());
                     self.load_repository_uncached(root);
                     ctx.request_repaint();
                 }
@@ -16985,25 +17289,25 @@ impl GitAgentApp {
                     // the repository untouched, so an uncached reload is both unnecessary and
                     // actively harmful for large repositories: it keeps this dialog gated long
                     // after the child process has already exited.
-                    self.merge_tool_root = None;
-                    self.conflict_merge_reload_root = None;
+                    self.operations.current.merge_tool_root = None;
+                    self.operations.current.conflict_merge_reload_root = None;
                     self.last_notice = None;
                     ctx.request_repaint();
                 }
                 Ok((_, Err(error))) => {
-                    self.merge_tool_root = None;
-                    self.conflict_merge_reload_root = None;
+                    self.operations.current.merge_tool_root = None;
+                    self.operations.current.conflict_merge_reload_root = None;
                     self.error = Some(error.to_string());
                     self.last_notice = None;
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    self.merge_tool_task = Some(receiver);
+                    self.operations.current.merge_tool_task = Some(receiver);
                     ctx.request_repaint_after(Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.merge_tool_root = None;
-                    self.conflict_merge_reload_root = None;
+                    self.operations.current.merge_tool_root = None;
+                    self.operations.current.conflict_merge_reload_root = None;
                     self.last_notice = None;
                     self.error = Some("Merge tool stopped unexpectedly".to_owned());
                     ctx.request_repaint();
@@ -17097,8 +17401,8 @@ impl GitAgentApp {
 
         let root_for_reload = root.clone();
         let (sender, receiver) = mpsc::channel();
-        self.merge_tool_root = Some(root.clone());
-        self.merge_tool_task = Some(receiver);
+        self.operations.current.merge_tool_root = Some(root.clone());
+        self.operations.current.merge_tool_task = Some(receiver);
         thread::spawn(move || {
             let result = child
                 .wait()
@@ -17379,7 +17683,10 @@ impl GitAgentApp {
     }
 
     fn start_commit_ai(&mut self, ctx: &egui::Context) {
-        if self.branch_actions_busy() || self.commit_ai_task.is_some() || self.commit_state.amend {
+        if self.branch_actions_busy()
+            || self.operations.current.commit_ai_task.is_some()
+            || self.commit_state.amend
+        {
             return;
         }
         let Some(root) = self.active_repo_root() else {
@@ -17389,7 +17696,16 @@ impl GitAgentApp {
         let chinese = self.ai_commit_language == Language::Chinese;
         let (sender, receiver) = mpsc::channel();
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        self.commit_ai_task = Some(CommitAiTask {
+        let Some(branch) = self
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| paths_equal(&snapshot.root, &root))
+            .map(|snapshot| snapshot.branch.clone())
+        else {
+            return;
+        };
+        self.operations.current.commit_ai_task = Some(CommitAiTask {
+            branch,
             root: root.clone(),
             original_draft: self.commit_message.clone(),
             receiver,
@@ -17406,13 +17722,19 @@ impl GitAgentApp {
     }
 
     fn poll_commit_ai_task(&mut self, ctx: &egui::Context) {
-        let Some(task) = self.commit_ai_task.take() else {
+        let Some(task) = self.operations.current.commit_ai_task.take() else {
             return;
         };
         match task.receiver.try_recv() {
             Ok(_) if task.cancelled.load(Ordering::Relaxed) => {}
             Ok(Ok(suggestion)) => {
-                if self.active_repo_root_matches(&task.root) && suggestion.root == task.root {
+                if self.active_repo_root_matches(&task.root)
+                    && suggestion.root == task.root
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.branch == task.branch)
+                {
                     if !self.commit_state.amend
                         && replace_unchanged_commit_draft(
                             &mut self.commit_message,
@@ -17432,7 +17754,7 @@ impl GitAgentApp {
                 self.error = Some(self.tr("commit.ai_disconnected").into())
             }
             Err(mpsc::TryRecvError::Empty) => {
-                self.commit_ai_task = Some(task);
+                self.operations.current.commit_ai_task = Some(task);
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
@@ -17440,12 +17762,21 @@ impl GitAgentApp {
 
     fn commit_ai_controls(&mut self, ui: &mut Ui, staged_count: usize) {
         if self
+            .operations
+            .current
             .commit_ai_task
             .as_ref()
             .is_some_and(|task| self.active_repo_root_matches(&task.root))
         {
             ui.spinner();
-            let cancelled = self.commit_ai_task.as_ref().unwrap().cancelled.clone();
+            let cancelled = self
+                .operations
+                .current
+                .commit_ai_task
+                .as_ref()
+                .unwrap()
+                .cancelled
+                .clone();
             if cancelled.load(Ordering::Relaxed) {
                 ui.label(self.tr("commit.ai_stopping"));
             } else {
@@ -17458,7 +17789,7 @@ impl GitAgentApp {
         }
         let enabled = staged_count > 0
             && !self.branch_actions_busy()
-            && self.commit_ai_task.is_none()
+            && self.operations.current.commit_ai_task.is_none()
             && !self.commit_state.amend;
         let hint = commit_ai_hover_text(self.language, self.selected_ai_model.as_deref());
         let disabled_hint = format!("{hint}\n\n{}", self.tr("commit.ai_hint"));
@@ -17685,7 +18016,9 @@ impl GitAgentApp {
             RebaseControlAction::Continue | RebaseControlAction::Skip
         ) {
             if let Some(snapshot) = self.snapshot.as_ref() {
-                self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+                self.operations
+                    .current
+                    .pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
             }
         }
 
@@ -18196,7 +18529,7 @@ impl GitAgentApp {
             self.save_commit_state_for_active_repo();
         }
         if let Some(action) = execute {
-            self.pending_push_after_pull = push_after_success;
+            self.operations.current.pending_push_after_pull = push_after_success;
             self.execute_git_action(action);
         }
         if close_after {
@@ -18432,12 +18765,12 @@ impl GitAgentApp {
     }
 
     fn non_fast_forward_push_modal(&mut self, ctx: &egui::Context) {
-        let Some(plan) = self.pending_non_fast_forward_push.take() else {
+        let Some(plan) = self.operations.current.pending_non_fast_forward_push.take() else {
             return;
         };
 
         if !self.active_repo_root_matches(&plan.root) {
-            self.pending_non_fast_forward_push = Some(plan);
+            self.operations.current.pending_non_fast_forward_push = Some(plan);
             return;
         }
         let actions_enabled = !self.branch_actions_busy();
@@ -18484,7 +18817,7 @@ impl GitAgentApp {
             let remote = plan.remote.clone();
             let remote_branch = plan.remote_branch.clone();
             let root = plan.root.clone();
-            self.pending_push_after_pull = Some(plan);
+            self.operations.current.pending_push_after_pull = Some(plan);
             self.start_remote_git_action_for_root_with_status(
                 root,
                 "status.pulling",
@@ -18499,7 +18832,7 @@ impl GitAgentApp {
             );
         }
         if keep_open {
-            self.pending_non_fast_forward_push = Some(plan);
+            self.operations.current.pending_non_fast_forward_push = Some(plan);
         }
     }
 
@@ -18706,7 +19039,7 @@ impl GitAgentApp {
                             } else if let (Some(snapshot), Some(base_url)) =
                                 (self.snapshot.as_ref(), base_url)
                             {
-                                self.pending_pull_request_open_after_push =
+                                self.operations.current.pending_pull_request_open_after_push =
                                     Some(PullRequestOpenAfterPush {
                                         root: snapshot.root.clone(),
                                         base_url,
@@ -20399,7 +20732,9 @@ impl GitAgentApp {
         }
         if let Some(action) = execute {
             if let Some(snapshot) = self.snapshot.as_ref() {
-                self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+                self.operations
+                    .current
+                    .pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
             }
             self.start_undoable_git_action(
                 self.tr("interactive_rebase.title").to_owned(),
@@ -20951,7 +21286,9 @@ impl GitAgentApp {
         if let Some(action) = execute {
             if mark_rewrite_prompt {
                 if let Some(snapshot) = self.snapshot.as_ref() {
-                    self.pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
+                    self.operations
+                        .current
+                        .pending_rewritten_history_prompt_root = Some(snapshot.root.clone());
                 }
             }
             self.execute_git_action(action);
@@ -20965,12 +21302,17 @@ impl GitAgentApp {
     }
 
     fn rewritten_history_prompt_modal(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = self.pending_rewritten_history_prompt.take() else {
+        let Some(prompt) = self
+            .operations
+            .current
+            .pending_rewritten_history_prompt
+            .take()
+        else {
             return;
         };
 
         if !self.active_repo_root_matches(&prompt.root) {
-            self.pending_rewritten_history_prompt = Some(prompt);
+            self.operations.current.pending_rewritten_history_prompt = Some(prompt);
             return;
         }
         let actions_enabled = !self.branch_actions_busy();
@@ -21016,7 +21358,7 @@ impl GitAgentApp {
             self.open_push_dialog_with_force(Some(prompt.branch.clone()), None, true);
         }
         if keep_open {
-            self.pending_rewritten_history_prompt = Some(prompt);
+            self.operations.current.pending_rewritten_history_prompt = Some(prompt);
         }
     }
 
@@ -22999,7 +23341,7 @@ impl GitAgentApp {
             return;
         }
 
-        let saving_ignore_rules = self.repo_gitignore_save_task.is_some();
+        let saving_ignore_rules = self.operations.current.repo_gitignore_save_task.is_some();
         if !saving_ignore_rules && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.repo_settings_open = false;
             self.repo_gitignore_editor = None;
@@ -24635,7 +24977,7 @@ impl GitAgentApp {
     fn repo_ignore_rules_settings_page(&mut self, ui: &mut Ui) {
         self.ensure_repo_gitignore_editor();
         let language = self.language;
-        let saving = self.repo_gitignore_save_task.is_some();
+        let saving = self.operations.current.repo_gitignore_save_task.is_some();
         let mut remove_index = None;
         let mut save_requested = false;
         let Some(editor) = self.repo_gitignore_editor.as_mut() else {
@@ -27215,7 +27557,9 @@ pub(crate) fn with_toolbar_button_style<R>(
         widgets.active.bg_fill = toolbar_button_hover_fill();
         widgets.active.weak_bg_fill = toolbar_button_hover_fill();
         widgets.noninteractive.bg_fill = toolbar_button_normal_fill();
-        widgets.noninteractive.weak_bg_fill = toolbar_button_normal_fill();
+        // egui uses this color as the disabled painter fade target. Transparent hides
+        // all disabled widgets, including their captions and SVGs.
+        widgets.noninteractive.weak_bg_fill = theme::panel();
         contents(ui)
     })
 }
@@ -41248,12 +41592,274 @@ fn strip_git_suffix(value: &str) -> &str {
 
 #[cfg(test)]
 mod ui_tests {
+    fn app_contract_source() -> &'static str {
+        static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SOURCE
+            .get_or_init(|| {
+                let source = include_str!("app.rs");
+                let operations =
+                    regex::Regex::new(r"self\s*\.\s*operations\s*\.\s*current\s*\.\s*").unwrap();
+                let source = operations.replace_all(source, "self.operations.current.");
+                regex::Regex::new(r"self\s*\.\s*")
+                    .unwrap()
+                    .replace_all(&source, "self.")
+                    .into_owned()
+            })
+            .as_str()
+    }
+
     // Architecture checks should survive rustfmt; behavioral tests use real data and UI shapes.
     fn source_token(value: &str) -> String {
         value.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     use super::*;
+
+    #[cfg(windows)]
+    #[cfg(windows)]
+    #[test]
+    fn normalized_repository_keys_preserve_saved_tab_aliases_and_sidebar_preferences() {
+        let mut state = RepoTabsState::default();
+        state
+            .tab_aliases
+            .insert(r"D:\workspace\Project".into(), "My project".into());
+        state
+            .sidebar_tree_states
+            .insert("D:/workspace/Project".into(), SidebarTreeState::default());
+        state.normalize_repository_keys();
+        let key = repo_state_key(Path::new("d:/workspace/project/"));
+        assert_eq!(
+            state.tab_aliases.get(&key).map(String::as_str),
+            Some("My project")
+        );
+        assert!(state.sidebar_tree_states.contains_key(&key));
+    }
+
+    #[test]
+    fn repository_operation_keys_match_windows_git_path_spellings_without_filesystem_io() {
+        let native = PathBuf::from(r"D:\not-a-real-repository\Project");
+        let git = PathBuf::from("d:/not-a-real-repository/project/");
+        assert_eq!(repo_state_key(&native), repo_state_key(&git));
+        let mut operations = RepositoryOperations::default();
+        operations.select(native);
+        operations.current.pending_branch_checkout = Some("in-flight".into());
+        operations.select(git.clone());
+        assert!(
+            operations.parked.is_empty(),
+            "same repository must not acquire a second task slot"
+        );
+        assert!(
+            operations
+                .get(&git)
+                .unwrap()
+                .pending_branch_checkout
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn repository_operations_retain_independent_workers_and_continuations_after_navigation() {
+        let a = PathBuf::from("repo-a");
+        let b = PathBuf::from("repo-b");
+        let mut operations = RepositoryOperations::default();
+        operations.select(a.clone());
+        let (a_sender, a_receiver) = mpsc::channel();
+        operations.current.remote_git_task = Some(a_receiver);
+        operations.current.remote_git_root = Some(a.clone());
+        operations.current.remote_git_status_key = Some("status.fetching");
+        operations.current.pending_branch_checkout = Some("feature-a".into());
+        let next_refresh = operations.current.next_background_remote_refresh_at;
+        operations.select(b.clone());
+        assert!(
+            operations.current.remote_git_task.is_none(),
+            "A must not make B busy"
+        );
+        assert!(operations.current.pending_branch_checkout.is_none());
+        let (b_sender, b_receiver) = mpsc::channel();
+        operations.current.repository_undo_task = Some(b_receiver);
+        operations.current.repository_undo_root = Some(b.clone());
+        assert_eq!(operations.pending_task_roots().len(), 2);
+        a_sender.send((a.clone(), Ok(()))).unwrap();
+        operations.select(a.clone());
+        assert_eq!(
+            operations.current.next_background_remote_refresh_at,
+            next_refresh
+        );
+        assert_eq!(
+            operations.current.pending_branch_checkout.as_deref(),
+            Some("feature-a")
+        );
+        let result = operations
+            .current
+            .remote_git_task
+            .take()
+            .unwrap()
+            .try_recv()
+            .unwrap();
+        assert!(paths_equal(&result.0, &a));
+        operations.current.remote_git_root = None;
+        assert!(operations.get(&b).unwrap().repository_undo_task.is_some());
+        drop(b_sender);
+        operations.select(b.clone());
+        assert!(matches!(
+            operations
+                .current
+                .repository_undo_task
+                .take()
+                .unwrap()
+                .try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(operations.pending_task_roots().is_empty());
+        assert!(
+            operations.blocked_keys().contains(&repo_state_key(&a)),
+            "A's pending checkout remains gated until its own fresh reload"
+        );
+        assert!(operations.get_mut(&a).is_some_and(|state| {
+            state.branch_checkout_root = Some(a.clone());
+            finish_pending_checkout_reload(
+                &mut state.pending_branch_checkout,
+                &mut state.branch_checkout_root,
+                &a,
+                Some("feature-a"),
+                false,
+            )
+        }));
+        assert!(!operations.blocked_keys().contains(&repo_state_key(&a)));
+    }
+
+    #[test]
+    fn repository_operations_preserve_credential_retries_and_error_feedback_per_root() {
+        let a = PathBuf::from("repo-a");
+        let b = PathBuf::from("repo-b");
+        let mut operations = RepositoryOperations::default();
+        operations.select(a.clone());
+        operations.current.pending_credential_retry_root = Some(a.clone());
+        operations.current.pending_credential_retry =
+            Some(PendingCredentialRetryAction::PullRequestPush {
+                remote: "origin".into(),
+                local_branch: "a-local".into(),
+                remote_branch: "a-remote".into(),
+            });
+        operations.current.completion_error = Some("A failed".into());
+        operations.select(b.clone());
+        assert!(operations.current.pending_credential_retry.is_none());
+        assert!(operations.current.completion_error.is_none());
+        operations.current.completion_error = Some("B failed".into());
+        operations.select(a.clone());
+        assert_eq!(
+            operations.current.completion_error.as_deref(),
+            Some("A failed")
+        );
+        assert!(
+            matches!(&operations.current.pending_credential_retry, Some(PendingCredentialRetryAction::PullRequestPush {local_branch, ..}) if local_branch == "a-local")
+        );
+        assert_eq!(
+            operations.get(&b).unwrap().completion_error.as_deref(),
+            Some("B failed")
+        );
+    }
+
+    #[test]
+    fn disabled_toolbar_buttons_keep_their_captions_and_deny_clicks() {
+        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            egui_extras::install_image_loaders(&ctx);
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        assert!(!toolbar_button(ui, "pull", "Pull disabled", false).enabled());
+                        assert!(!toolbar_button(ui, "branch", "Branch disabled", false).clicked());
+                        let image = egui::Image::new(egui::include_image!(
+                            "../tests/fixtures/plugin-contract/assets/pull-request.svg"
+                        ));
+                        let button = toolbar_image_button(
+                            ui,
+                            image,
+                            "Plugin disabled",
+                            theme::muted(),
+                            false,
+                        );
+                        assert!(
+                            !with_toolbar_button_style(ui, |ui| ui.add_enabled(false, button))
+                                .inner
+                                .enabled()
+                        );
+                    });
+                });
+            });
+            let captions = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for caption in ["Pull disabled", "Branch disabled", "Plugin disabled"] {
+                assert!(
+                    captions.contains(&caption),
+                    "disabled control must still paint {caption}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repository_operation_concurrency_is_bounded_without_a_global_busy_gate() {
+        let (scheduler, _) = RepositoryRefreshScheduler::new(egui::Context::default());
+        for index in 0..MAX_REPOSITORY_OPERATIONS {
+            scheduler
+                .acquire_exclusive(format!("held-{index}"))
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        let queued = scheduler.acquire_exclusive("queued".into());
+        assert!(matches!(
+            queued.recv_timeout(Duration::from_millis(160)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        scheduler.release_exclusive("held-0".into());
+        queued.recv_timeout(Duration::from_secs(5)).unwrap();
+        for index in 1..MAX_REPOSITORY_OPERATIONS {
+            scheduler.release_exclusive(format!("held-{index}"));
+        }
+        scheduler.release_exclusive("queued".into());
+    }
+
+    #[test]
+    fn automatic_refresh_only_tracks_activated_tabs_and_blocks_each_operation_owner() {
+        let source = app_contract_source();
+        let schedule = source
+            .split("    fn sync_repository_refresh_scheduler(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(schedule.contains("self.activated_repositories"));
+        assert!(schedule.contains("blocked_keys.extend(self.operations.blocked_keys())"));
+        let load = source
+            .split("    fn load_repository_with_cache_mode(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(load.contains("self.operations.select(path.clone())"));
+        assert!(load.contains("self.activated_repositories.insert(repo_state_key(&path))"));
+        let poll = source
+            .split("    fn poll_repository_operations(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(poll.contains("self.operations.pending_task_roots()"));
+        assert!(poll.contains("self.poll_repository_operation_tasks(ctx)"));
+        assert!(poll.contains("self.operations.current.completion_error"));
+    }
 
     #[test]
     fn disabled_primary_buttons_render_the_same_palette_as_commit() {
@@ -41383,7 +41989,7 @@ mod ui_tests {
             let settings: AppSettings = serde_json::from_str(json).unwrap();
             assert_eq!(settings.effective_ai_commit_language(), expected);
         }
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source
             .split("fn start_commit_ai(")
             .nth(1)
@@ -41422,7 +42028,7 @@ mod ui_tests {
                 }
             });
         });
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let button = source
             .split("fn commit_ai_generate_button(")
             .nth(1)
@@ -41490,7 +42096,7 @@ mod ui_tests {
                 }
             }
         }
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let panel = source
             .split("fn commit_panel(")
             .nth(1)
@@ -41568,7 +42174,7 @@ mod ui_tests {
 
     #[test]
     fn repository_undo_redo_are_wired_to_safe_local_actions() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
         assert!(implementation.contains(source_token("struct RepositoryUndoEntry").as_str()));
@@ -41606,7 +42212,7 @@ mod ui_tests {
             TOP_BAR_HEIGHT,
             TITLE_BAR_HEIGHT + TOP_BAR_ROW_HEIGHT * 2.0 - TOP_BAR_TAB_TOOL_JOIN_OVERLAP
         );
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let top_bar_start = source
             .find(source_token("fn top_bar_panel(").as_str())
             .unwrap();
@@ -41794,7 +42400,7 @@ mod ui_tests {
 
     #[test]
     fn history_browser_exposes_multi_select_without_duplicating_table() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation.contains("selection_intent: Option<HistorySelectionIntent>"));
         assert!(implementation.contains("history_commit_browser("));
@@ -41804,7 +42410,7 @@ mod ui_tests {
 
     #[test]
     fn create_patch_menu_is_enabled_for_clean_repository() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation
             .find("menu_label(self.language, \"actions_create_patch\")")
@@ -41817,7 +42423,7 @@ mod ui_tests {
 
     #[test]
     fn create_patch_dialog_has_two_localized_tabs_and_selected_worktree_paths() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         for required in [
             "CreatePatchTab::Worktree",
@@ -41833,7 +42439,7 @@ mod ui_tests {
 
     #[test]
     fn create_patch_history_reuses_complete_virtualized_browser() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation.find("fn create_patch_history_tab(").unwrap();
         let body = &implementation[start..];
@@ -41852,7 +42458,7 @@ mod ui_tests {
 
     #[test]
     fn create_patch_history_submits_exact_selected_hashes() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation.contains("CreatePatchRequest::Commits"));
         assert!(implementation.contains("dialog.commit_selection.ordered()"));
@@ -41886,7 +42492,7 @@ mod ui_tests {
 
     #[test]
     fn create_patch_worktree_tab_uses_compact_width_and_footer() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let start = implementation
             .find(source_token("fn create_patch_action_modal(").as_str())
@@ -41912,15 +42518,15 @@ mod ui_tests {
 
     #[test]
     fn create_patch_uses_named_async_task_and_shared_busy_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         for required in [
             "type CreatePatchTaskResult = (PathBuf, anyhow::Result<Vec<PathBuf>>)",
             "create_patch_task: Option<Receiver<CreatePatchTaskResult>>",
             "fn create_patch_busy(&self) -> bool",
             "fn start_create_patch_task(",
-            "self.create_patch_task = Some(receiver)",
-            "self.create_patch_root = Some(root.clone())",
+            "self.operations.current.create_patch_task = Some(receiver)",
+            "self.operations.current.create_patch_root = Some(root.clone())",
             "git::create_patch(&root, &request)",
             "self.active_create_patch_busy()",
         ] {
@@ -41940,13 +42546,13 @@ mod ui_tests {
 
     #[test]
     fn create_patch_task_releases_gate_for_every_terminal_state() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let poll_start = implementation
-            .find("if let Some(receiver) = self.create_patch_task.take()")
+            .find("if let Some(receiver) = self.operations.current.create_patch_task.take()")
             .unwrap();
         let poll_end = implementation[poll_start..]
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let poll = &implementation[poll_start..poll_start + poll_end];
         for required in [
@@ -41955,7 +42561,7 @@ mod ui_tests {
             "Ok((_, Err(error)))",
             "self.error = Some(error.to_string())",
             "mpsc::TryRecvError::Empty",
-            "self.create_patch_task = Some(receiver)",
+            "self.operations.current.create_patch_task = Some(receiver)",
             "mpsc::TryRecvError::Disconnected",
             "patch.create.disconnected",
         ] {
@@ -41965,7 +42571,7 @@ mod ui_tests {
 
     #[test]
     fn layout_uses_custom_titlebar_and_no_side_panel_splitters() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("ViewportCommand::StartDrag"));
         assert!(source.contains("ViewportCommand::Minimized"));
         assert!(source.contains("ViewportCommand::Maximized"));
@@ -41991,7 +42597,7 @@ mod ui_tests {
         assert_ne!(green.panel, blue.panel);
         assert_ne!(green.panel_soft, blue.panel_soft);
         assert_ne!(green.scroll_track, Color32::BLACK);
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let theme_source = include_str!("theme.rs");
         assert!(source.contains("theme::accent_deep()"));
         assert!(source.contains("theme::accent_soft()"));
@@ -42064,7 +42670,7 @@ mod ui_tests {
 
     #[test]
     fn main_layout_outer_panels_use_exact_painted_rects_not_frame_sizing() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let layout_start = implementation_source
@@ -42104,7 +42710,7 @@ mod ui_tests {
 
     #[test]
     fn layout_debug_overlay_can_trace_panel_and_workspace_rects() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         assert!(implementation_source.contains(source_token("GIT_AGENT_LAYOUT_DEBUG").as_str()));
@@ -42139,7 +42745,7 @@ mod ui_tests {
 
     #[test]
     fn worktree_file_rows_show_full_paths_and_gitignore_menu() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation_source.find("fn worktree_file_row(").unwrap();
         let end = implementation_source[start..]
@@ -42163,7 +42769,7 @@ mod ui_tests {
 
     #[test]
     fn worktree_view_toggle_is_icon_only_and_tree_directories_use_folder_states() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source.find("fn workspace_view(").unwrap();
         let workspace_end = implementation_source[workspace_start..]
@@ -42236,7 +42842,7 @@ mod ui_tests {
 
     #[test]
     fn worktree_table_virtualizes_rows_and_bounds_tree_mode() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let table_start = implementation_source.find("fn worktree_table(").unwrap();
         let table_end = implementation_source[table_start..]
@@ -42501,7 +43107,7 @@ mod ui_tests {
 
     #[test]
     fn ai_settings_validation_exercises_commit_generation_protocol() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let validation = source
             .split("fn test_ai_provider_settings(")
             .nth(1)
@@ -42598,7 +43204,7 @@ mod ui_tests {
         assert!(raw.contains("id_ed25519"));
         assert!(raw.contains("ssh.exe"));
         assert!(raw.contains(r#"D:\\code"#));
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let app_settings_default_start = implementation_source
             .find("impl Default for AppSettings")
@@ -42674,7 +43280,7 @@ mod ui_tests {
 
     #[test]
     fn font_settings_use_async_loading_and_wrapped_compact_controls() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn global_font_settings(&mut self").unwrap();
         let end = source[start..]
             .find("fn global_hosting_accounts_settings")
@@ -42745,7 +43351,7 @@ mod ui_tests {
             Some(first_plink)
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         for required in [
             "fn ssh_install_prompt_modal(",
             "self.ssh_install_prompt_modal(ctx);",
@@ -42807,7 +43413,7 @@ mod ui_tests {
             assert!(!message.contains('\u{fffd}'), "{key}: {message}");
         }
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn ensure_openssh_agent_running(").unwrap();
         let end = source[start..].find("fn hidden_command(").unwrap();
         let agent_source = &source[start..start + end];
@@ -42865,7 +43471,7 @@ mod ui_tests {
             &source[start..start + end]
         }
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = section(
             source,
             "fn start_ssh_agent(&mut self)",
@@ -42906,7 +43512,7 @@ mod ui_tests {
         let poll = section(
             source,
             "if let Some(receiver) = self.ssh_tool_task.take()",
-            "if let Some(receiver) = self.create_patch_task.take()",
+            "if let Some(receiver) = self.operations.current.create_patch_task.take()",
         );
         assert!(poll.contains("self.ssh_tool_action = None;"));
         assert!(poll.contains("SshToolTaskOutput::AgentStatus(status)"));
@@ -42958,7 +43564,7 @@ mod ui_tests {
             }
         }
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let set_client = section(source, "fn set_ssh_client(", "fn start_ssh_agent(");
         assert!(set_client.contains("self.refresh_ssh_install_prompt();"));
         assert!(!set_client.contains("if self.ssh_client == client {\n            return;"));
@@ -42972,7 +43578,7 @@ mod ui_tests {
         let poll = section(
             source,
             "if let Some(receiver) = self.ssh_tool_task.take()",
-            "if let Some(receiver) = self.create_patch_task.take()",
+            "if let Some(receiver) = self.operations.current.create_patch_task.take()",
         );
         assert!(poll.contains("self.ssh_tool_action = None;"));
         assert!(poll.contains("self.refresh_ssh_install_prompt();"));
@@ -43022,7 +43628,7 @@ mod ui_tests {
 
     #[test]
     fn alt_accelerators_cover_every_top_level_menu() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn top_menu_accelerator_pressed(").unwrap();
         let end = source[start..].find("fn top_menu_button(").unwrap();
         let accelerator_source = &source[start..start + end];
@@ -43041,7 +43647,7 @@ mod ui_tests {
 
     #[test]
     fn data_layout_uses_global_config_and_per_repo_store_dirs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let app_config_start = source.find("fn app_settings_path()").unwrap();
         let app_config_end = source[app_config_start..]
             .find("fn repo_tabs_path()")
@@ -43059,7 +43665,7 @@ mod ui_tests {
 
     #[test]
     fn repository_snapshots_persist_to_per_repo_store_cache() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("fn repo_snapshot_cache_path_for("));
         assert!(implementation_source.contains("store_dir.join(\"snapshot.json\")"));
@@ -43118,7 +43724,7 @@ mod ui_tests {
         snapshot.status.push("?? generated/overflow".to_owned());
         assert!(!repository_snapshot_is_cacheable(&snapshot));
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let cache_start = implementation_source
             .find("fn cache_repository_snapshot(&mut self")
@@ -43157,7 +43763,7 @@ mod ui_tests {
         assert!(layout.label.left() >= layout.icon.right() + 12.0);
         assert!(layout.action.unwrap().right() <= header_rect.right() - TREE_HEADER_LEFT_INSET);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(!source.contains("small_button(self.tr(\"branch.create\")"));
         assert!(!source.contains("small_button(self.tr(\"tag.create\")"));
 
@@ -43189,7 +43795,7 @@ mod ui_tests {
 
     #[test]
     fn sidebar_scroll_children_preserve_parent_clip_rect() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn allocate_clipped_ui_at_rect("));
@@ -43209,7 +43815,7 @@ mod ui_tests {
 
     #[test]
     fn sidebar_fixed_tree_rows_do_not_run_nested_layouts_inside_row_rects() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for (start_marker, end_marker) in [
@@ -43239,7 +43845,7 @@ mod ui_tests {
 
     #[test]
     fn sidebar_branch_tree_owns_current_branch_state() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let branch_tree_start = implementation_source
@@ -43274,7 +43880,7 @@ mod ui_tests {
 
     #[test]
     fn branch_sync_badges_are_painted_inside_row_right_edge() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
         let branch_row_end = implementation_source[branch_row_start..]
@@ -43328,7 +43934,7 @@ mod ui_tests {
 
     #[test]
     fn branch_names_stay_left_aligned_when_badges_are_right_aligned() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
         let branch_row_end = implementation_source[branch_row_start..]
@@ -43390,7 +43996,7 @@ mod ui_tests {
 
     #[test]
     fn local_branch_rows_double_click_checkout_non_current_branch() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let branch_row_start = source.find("fn branch_row(").unwrap();
         let branch_row_end = source[branch_row_start..]
             .find("#[derive(Clone, Debug, Default)]")
@@ -43406,7 +44012,7 @@ mod ui_tests {
 
     #[test]
     fn branch_sidebar_rows_use_full_row_overlay_interaction() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("fn full_row_click_response("));
 
         for (start_marker, end_marker) in [
@@ -43495,7 +44101,7 @@ mod ui_tests {
         );
         assert_eq!(tree[1].name, "upstream");
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("remote_branch_collapsed_groups: HashSet<String>"));
         assert!(source.contains("remote_branch_tree_rows("));
     }
@@ -43539,7 +44145,7 @@ mod ui_tests {
         );
         assert_eq!(tree[1].full_name.as_deref(), Some("master"));
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("local_branch_collapsed_groups: HashSet<String>"));
         assert!(source.contains("local_branch_tree_rows("));
         assert!(source.contains("branch_row("));
@@ -43558,7 +44164,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_file_selection_opens_resizable_diff_panel() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source.find("fn workspace_view(").unwrap();
         let workspace_end = implementation_source[workspace_start..]
@@ -43613,7 +44219,7 @@ mod ui_tests {
 
     #[test]
     fn worktree_file_menu_opens_files_and_reveals_their_parent_folder() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let row_start = implementation_source.find("fn worktree_file_row(").unwrap();
         let row_end = implementation_source[row_start..]
@@ -43649,7 +44255,7 @@ mod ui_tests {
 
     #[test]
     fn worktree_sections_offer_stage_and_unstage_selected_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let table_start = implementation_source.find("fn worktree_table(").unwrap();
         let table_end = implementation_source[table_start..]
@@ -43672,7 +44278,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_header_uses_compact_spacing_and_smaller_title() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source.find("fn workspace_view(").unwrap();
         let workspace_end = implementation_source[workspace_start..]
@@ -43705,7 +44311,7 @@ mod ui_tests {
 
     #[test]
     fn history_layout_uses_resizable_top_region_and_shadow_splitter() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn history_view(").unwrap();
         let end = source[start..].find("fn history_commit_table(").unwrap();
         let history_view_source = &source[start..start + end];
@@ -43759,7 +44365,7 @@ mod ui_tests {
 
     #[test]
     fn history_scroll_areas_have_distinct_ids() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("history_commit_graph_scroll"));
         assert!(source.contains("self.history_branch_scope"));
         assert!(source.contains("self.history_sort_order"));
@@ -43802,7 +44408,7 @@ mod ui_tests {
                 });
             });
         }
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let helper = source
             .split("fn commit_summary_subject(")
             .nth(1)
@@ -43847,7 +44453,7 @@ mod ui_tests {
                 });
             });
         }
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let helper = source
             .split("fn commit_summary_branches(")
             .nth(1)
@@ -43894,7 +44500,7 @@ mod ui_tests {
             receiver,
         });
         assert!(cancelled.load(Ordering::Relaxed));
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let poll = source
             .split("if let Some(mut task) = self.file_search_task.take()")
             .nth(1)
@@ -43921,7 +44527,7 @@ mod ui_tests {
 
     #[test]
     fn search_view_uses_table_layout_and_history_bottom_pane() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn search_view(").unwrap();
         let end = source[start..].find("fn history_view(").unwrap();
         let search_source = &source[start..start + end];
@@ -44021,7 +44627,7 @@ mod ui_tests {
         ));
         assert!(!file_search_query_looks_like_path("index.vue"));
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let open_start = implementation.find("fn open_file_history(").unwrap();
         let open_end = implementation[open_start..]
@@ -44050,7 +44656,7 @@ mod ui_tests {
 
     #[test]
     fn repository_switch_and_manual_search_entry_clear_all_search_state() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let reset_start = implementation.find("fn reset_search_view_state(").unwrap();
         let reset_end = implementation[reset_start..]
@@ -44114,7 +44720,7 @@ mod ui_tests {
         assert!(range.end > range.start);
         assert!(range.end - range.start <= 16);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let cache_start = source.find("struct HistoryRowsCache").unwrap();
         let cache_end = source[cache_start..].find("impl HistoryRowsCache").unwrap();
         let cache_struct = &source[cache_start..cache_start + cache_end];
@@ -44125,7 +44731,7 @@ mod ui_tests {
 
     #[test]
     fn history_graph_nodes_are_small_and_unbordered_with_wider_lanes() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn draw_history_graph_cell(").unwrap();
         let end = source[start..]
             .find("fn draw_history_description(")
@@ -44138,7 +44744,7 @@ mod ui_tests {
 
     #[test]
     fn history_ref_badges_use_measured_text_and_inner_clip() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation_source
             .find("fn draw_history_description(")
@@ -44217,7 +44823,7 @@ mod ui_tests {
             vec!["main".to_owned(), "origin/main".to_owned()]
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let desc_start = implementation_source
             .find("fn draw_history_description(")
@@ -44265,7 +44871,7 @@ mod ui_tests {
             "\u{5c42}\u{7ea7}\u{6392}\u{5e8f}"
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("history_sort_order: HistorySortOrder::Date"));
         assert!(source.contains("history_branch_scope: HistoryBranchScope::Current"));
         assert_eq!(
@@ -44296,7 +44902,7 @@ mod ui_tests {
 
     #[test]
     fn history_filter_controls_share_one_centered_row() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source
             .find("Vec2::new(ui.available_width(), 28.0)")
             .unwrap();
@@ -44344,7 +44950,7 @@ mod ui_tests {
 
     #[test]
     fn history_supports_batch_cherry_pick_selection_mode() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("history_cherry_pick_mode: bool"));
         assert!(source.contains("selected_cherry_pick_hashes: HashSet<String>"));
         assert!(source.contains("ConfirmCherryPickBatch"));
@@ -44376,7 +44982,7 @@ mod ui_tests {
 
     #[test]
     fn history_cherry_pick_checkboxes_use_shadow_not_border() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let checkbox_start = implementation_source
@@ -44399,7 +45005,7 @@ mod ui_tests {
 
     #[test]
     fn commit_panel_supports_persisted_options_and_message_history() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("struct RepoCommitState"));
         assert!(implementation_source.contains("commit_state: RepoCommitState"));
@@ -44522,7 +45128,7 @@ mod ui_tests {
         let legacy: RepoCommitState = serde_json::from_str("{}").unwrap();
         assert!(legacy.commit_text_links.is_empty());
 
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         for needle in [
             "pending_commit_text_link: Option<CommitTextLinkDialog>",
@@ -44559,7 +45165,7 @@ mod ui_tests {
 
     #[test]
     fn commit_message_draft_is_scoped_per_repository_branch() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let fields_start = implementation_source
@@ -44674,7 +45280,7 @@ mod ui_tests {
 
     #[test]
     fn commit_context_menu_groups_compare_actions_in_submenu() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source
             .find("fn commit_context_menu(")
@@ -44727,7 +45333,7 @@ mod ui_tests {
 
     #[test]
     fn commit_submission_uses_async_loading_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let commit_start = implementation_source
@@ -44757,7 +45363,7 @@ mod ui_tests {
 
     #[test]
     fn commit_panel_switches_to_rebase_controls_during_rebase() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let panel_start = implementation_source.find("fn commit_panel(").unwrap();
@@ -44815,12 +45421,15 @@ mod ui_tests {
         assert!(action_source.contains("git::rebase_skip(root)"));
         assert!(action_source.contains("RebaseControlAction::Abort"));
         assert!(action_source.contains("git::rebase_abort(root)"));
-        assert!(action_source.contains("self.pending_rewritten_history_prompt_root = Some("));
+        assert!(
+            action_source
+                .contains("self.operations.current.pending_rewritten_history_prompt_root = Some(")
+        );
     }
 
     #[test]
     fn generic_git_actions_use_loading_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let action_start = implementation_source
@@ -44850,7 +45459,7 @@ mod ui_tests {
         assert_eq!(action_row.bottom(), content.bottom());
         assert_eq!(action_row.height(), COMMIT_BUTTON_ROW_HEIGHT);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let panel_start = implementation_source.find("fn commit_panel(").unwrap();
         let panel_end = implementation_source[panel_start..]
@@ -44892,7 +45501,7 @@ mod ui_tests {
 
     #[test]
     fn long_commit_messages_scroll_inside_the_editor_instead_of_moving_the_action_row() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let editor_start = implementation_source
             .find("fn commit_message_editor_ui(")
@@ -44909,7 +45518,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_commit_panel_starts_without_wasted_top_gap() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source
             .find("fn workspace_main_panel(")
@@ -44949,7 +45558,7 @@ mod ui_tests {
 
     #[test]
     fn commit_message_editor_uses_theme_text_and_readable_selection() {
-        let app_source = include_str!("app.rs");
+        let app_source = app_contract_source();
         let implementation_source = &app_source[..app_source.find("#[cfg(test)]").unwrap()];
         let editor_start = implementation_source
             .find("fn commit_message_text_edit")
@@ -45010,7 +45619,7 @@ mod ui_tests {
 
     #[test]
     fn editable_text_inputs_have_non_empty_placeholders() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for missing in [
@@ -45040,7 +45649,7 @@ mod ui_tests {
 
     #[test]
     fn commit_checkbox_unchecked_edges_use_theme_shadow_not_white_highlight() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let checkbox_start = implementation_source.find("fn commit_checkbox(").unwrap();
         let checkbox_end = implementation_source[checkbox_start..]
@@ -45058,7 +45667,7 @@ mod ui_tests {
 
     #[test]
     fn repository_source_search_uses_readable_text_input_and_no_top_gap() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let view_start = implementation_source
             .find("fn repository_source_view")
@@ -45114,7 +45723,7 @@ mod ui_tests {
 
     #[test]
     fn source_tabs_leave_empty_tab_strip_available_for_window_drag() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let top_bar_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let top_bar_end = implementation_source[top_bar_start..]
@@ -45202,7 +45811,7 @@ mod ui_tests {
 
     #[test]
     fn source_tab_drag_regions_avoid_hot_path_pointer_diagnostics() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let top_bar_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let top_bar_end = implementation_source[top_bar_start..]
@@ -45254,7 +45863,7 @@ mod ui_tests {
 
     #[test]
     fn custom_title_bar_drag_is_independent_from_active_tab_kind() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let title_bar_start = implementation_source.find("fn custom_title_bar(").unwrap();
         let title_bar_end = implementation_source[title_bar_start..]
@@ -45282,7 +45891,7 @@ mod ui_tests {
 
     #[test]
     fn window_drag_request_keeps_content_painting() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let update_start = implementation_source
             .find("impl App for GitAgentApp")
@@ -45318,7 +45927,7 @@ mod ui_tests {
 
     #[test]
     fn window_size_persistence_never_runs_during_a_primary_pointer_gesture() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let persistence_start = implementation_source
             .find("fn remember_window_size(")
@@ -45349,7 +45958,7 @@ mod ui_tests {
         );
         assert_eq!(window_resize_direction(rect, Pos2::new(680.0, 400.0)), None);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("ViewportCommand::BeginResize(direction)"));
         assert!(
@@ -45375,7 +45984,7 @@ mod ui_tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_native_drag_bypasses_winit_stuck_dragging_state() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let helper_start = implementation_source
             .find("fn post_windows_non_client_pointer_down(")
@@ -45394,7 +46003,7 @@ mod ui_tests {
 
     #[test]
     fn update_skips_reapplying_unchanged_theme_during_window_drag_frames() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let update_start = implementation_source
             .find("impl App for GitAgentApp")
@@ -45410,7 +46019,7 @@ mod ui_tests {
 
     #[test]
     fn repository_source_list_filters_cached_repositories_without_disk_scan() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let app_start = implementation_source
             .find("pub struct GitAgentApp")
@@ -45444,7 +46053,7 @@ mod ui_tests {
 
     #[test]
     fn local_repository_source_groups_repositories_by_workspace_tabs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let known_start = implementation_source
             .find("struct KnownRepository")
@@ -45497,7 +46106,7 @@ mod ui_tests {
 
     #[test]
     fn repository_source_uses_global_workspaces_and_default_folder_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let app_settings_start = implementation_source.find("struct AppSettings").unwrap();
         let app_settings_end = implementation_source[app_settings_start..]
@@ -45551,7 +46160,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_repository_quick_panel_uses_workspace_tabs_and_cached_status() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let app_start = implementation_source
@@ -45758,7 +46367,7 @@ mod ui_tests {
 
     #[test]
     fn repository_source_file_perf_logging_is_removed_after_diagnosis() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(!implementation_source.contains("fn perf_logging_enabled("));
@@ -45789,7 +46398,7 @@ mod ui_tests {
             layout.unstaged_rect.bottom()
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source
             .find("fn workspace_main_panel(")
@@ -45829,7 +46438,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_cards_use_recessed_shadow_inside_raised_workspace() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let table_start = implementation_source.find("fn worktree_table(").unwrap();
         let table_end = implementation_source[table_start..]
@@ -45912,7 +46521,7 @@ mod ui_tests {
 
     #[test]
     fn workspace_inset_shadow_uses_directional_recessed_light() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let frame_start = implementation_source
             .find("fn paint_workspace_card_inset_shadow(")
@@ -46014,7 +46623,7 @@ mod ui_tests {
 
     #[test]
     fn commit_panel_uses_layout_rect_height_not_available_height() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let workspace_start = implementation_source
             .find("fn workspace_main_panel(")
@@ -46042,7 +46651,7 @@ mod ui_tests {
 
     #[test]
     fn commit_workflow_keyboard_shortcuts_are_wired() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("focus_commit_message: bool"));
@@ -46135,7 +46744,7 @@ mod ui_tests {
 
     #[test]
     fn view_menu_owns_refresh_navigation_and_history_label_toggles() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -46211,7 +46820,7 @@ mod ui_tests {
 
     #[test]
     fn repository_menu_exposes_sourcetree_actions_and_known_wirings() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -46371,7 +46980,7 @@ mod ui_tests {
             "pull_request_remote_branch_selector",
             "pull_request_remote_branch_choices(",
             "self.start_pull_request_push_with_credential_retry(",
-            "self.pending_pull_request_open_after_push",
+            "self.operations.current.pending_pull_request_open_after_push",
             "Some(PullRequestOpenAfterPush",
         ] {
             assert!(pr_modal_source.contains(required), "{required}");
@@ -46405,7 +47014,7 @@ mod ui_tests {
 
     #[test]
     fn actions_menu_exposes_sourcetree_style_actions_and_known_wirings() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -46708,7 +47317,7 @@ mod ui_tests {
 
     #[test]
     fn menu_shortcuts_are_displayed_and_dispatched_after_text_input_guard() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -46780,7 +47389,7 @@ mod ui_tests {
 
     #[test]
     fn actions_menu_shortcuts_dispatch_after_text_input_guard() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let shortcut_start = implementation_source
             .find("fn handle_global_shortcuts(")
@@ -46803,7 +47412,7 @@ mod ui_tests {
 
     #[test]
     fn actions_menu_wires_selected_worktree_file_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -46897,7 +47506,10 @@ mod ui_tests {
             .unwrap();
         let task_source = &implementation_source[task_start..task_start + task_end];
         assert!(task_source.contains("scheduler.acquire_exclusive("));
-        assert!(task_source.contains("self.external_diff_tool_task = Some(receiver)"));
+        assert!(
+            task_source
+                .contains("self.operations.current.external_diff_tool_task = Some(receiver)")
+        );
         assert!(!task_source.contains("self.loading_repo = true"));
 
         let history_start = implementation_source
@@ -46960,7 +47572,7 @@ mod ui_tests {
 
     #[test]
     fn custom_actions_persist_in_global_settings_and_feed_actions_menu() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
         let menu_end = implementation_source[menu_start..]
@@ -47019,7 +47631,7 @@ mod ui_tests {
 
     #[test]
     fn top_level_menus_use_no_border_shadow_popup_style() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let top_menu_button_start = implementation_source.find("fn top_menu_button(").unwrap();
         let top_menu_button_end = implementation_source[top_menu_button_start..]
@@ -47113,7 +47725,7 @@ mod ui_tests {
 
     #[test]
     fn custom_row_hover_is_blocked_while_any_popup_is_open() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let helper_start = implementation_source.find("fn row_rect_hovered(").unwrap();
         let helper_end = implementation_source[helper_start..]
@@ -47130,7 +47742,7 @@ mod ui_tests {
 
     #[test]
     fn repository_merge_menu_opens_commit_picker_with_options() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -47197,7 +47809,7 @@ mod ui_tests {
 
     #[test]
     fn repository_interactive_rebase_menu_opens_clean_worktree_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -47273,7 +47885,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_request_waits_for_history_and_continues_after_it_arrives() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -47432,7 +48044,7 @@ mod ui_tests {
 
     #[test]
     fn commit_context_menu_exposes_sourcetree_children_rebase_entry() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let action_start = implementation_source.find("enum CommitMenuAction").unwrap();
@@ -47818,7 +48430,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_plan_preview_reuses_cached_details_and_diff() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source
             .find("#[cfg(test)]")
             .expect("application implementation should precede tests")];
@@ -48023,7 +48635,7 @@ mod ui_tests {
             "\u{5408}\u{5e76}\u{9009}\u{4e2d}\u{5230} newhash2"
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let modal_start = implementation_source
             .find("fn interactive_rebase_action_modal(&mut self")
@@ -48040,7 +48652,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_dialog_exposes_batch_selection_and_disabled_merge_rows() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let struct_start = implementation_source
             .find("struct InteractiveRebaseActionDialog")
@@ -48082,7 +48694,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_action_selector_stays_within_the_history_row() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let row_start = implementation_source
             .find("let action_rect = Rect::from_min_size(")
@@ -48116,7 +48728,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_reword_modal_uses_a_self_contained_nested_surface() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let modal_start = implementation_source
@@ -48144,7 +48756,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_rechecks_stale_in_progress_snapshot_before_prompt() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let open_start = implementation_source
             .find("fn prepare_interactive_rebase_snapshot(&mut self)")
@@ -48169,7 +48781,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_conflict_state_opens_control_dialog_and_reloads() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48204,10 +48816,10 @@ mod ui_tests {
         );
 
         let task_start = implementation_source
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let task_end = implementation_source[task_start..]
-            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .find("if let Some(receiver) = self.operations.current.credential_login_task.take()")
             .unwrap();
         let task_source = &implementation_source[task_start..task_start + task_end];
         assert!(task_source.contains("git::repository_rebase_in_progress(&root)"));
@@ -48222,7 +48834,7 @@ mod ui_tests {
 
     #[test]
     fn interactive_rebase_success_prompts_for_safe_force_push_after_reload() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48245,7 +48857,8 @@ mod ui_tests {
         let interactive_source =
             &implementation_source[interactive_start..interactive_start + interactive_end];
         assert!(
-            interactive_source.contains("self.pending_rewritten_history_prompt_root ="),
+            interactive_source
+                .contains("self.operations.current.pending_rewritten_history_prompt_root ="),
             "interactive rebase execution should mark the repo for post-reload prompt"
         );
         assert!(
@@ -48302,7 +48915,7 @@ mod ui_tests {
 
     #[test]
     fn merge_options_and_action_checkboxes_use_shadow_gap_no_border_style() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let panel_start = implementation_source
@@ -48332,7 +48945,7 @@ mod ui_tests {
 
     #[test]
     fn repository_archive_menu_opens_git_archive_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48388,7 +49001,7 @@ mod ui_tests {
 
     #[test]
     fn repository_menu_opens_submodule_and_subtree_dialogs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48485,7 +49098,7 @@ mod ui_tests {
 
     #[test]
     fn repository_git_lfs_menu_wires_intro_tracking_and_content_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48557,7 +49170,7 @@ mod ui_tests {
 
     #[test]
     fn repository_git_flow_menu_wires_sourcetree_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48699,7 +49312,7 @@ mod ui_tests {
 
     #[test]
     fn git_flow_action_picker_is_single_full_action_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let dialog_start = implementation_source
             .find("fn git_flow_action_modal(&mut self")
@@ -48745,7 +49358,7 @@ mod ui_tests {
 
     #[test]
     fn git_flow_finish_feature_dialog_uses_branch_dropdown_options_and_preview() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let dialog_start = implementation_source
             .find("fn git_flow_action_modal(&mut self")
@@ -48826,7 +49439,7 @@ mod ui_tests {
 
     #[test]
     fn git_flow_finish_release_dialog_uses_tag_push_and_two_target_preview() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -48926,7 +49539,7 @@ mod ui_tests {
 
     #[test]
     fn repository_submenu_dialogs_use_bounded_footer_rows() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for (start, end, expected_count) in [
@@ -48955,7 +49568,7 @@ mod ui_tests {
 
     #[test]
     fn repo_discard_menu_discards_all_changes_with_confirmation() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("ConfirmDiscardAll"));
@@ -48983,7 +49596,7 @@ mod ui_tests {
 
     #[test]
     fn stash_create_dialog_exposes_sourcetree_options() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("StashActionDialog::Create {"));
@@ -49041,7 +49654,7 @@ mod ui_tests {
 
     #[test]
     fn action_dialog_checkboxes_use_painted_theme_control() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let checkbox_start = implementation_source.find("fn action_checkbox(").unwrap();
@@ -49181,7 +49794,7 @@ mod ui_tests {
             None
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let toolbar_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let toolbar_end = implementation_source[toolbar_start..]
@@ -49289,7 +49902,7 @@ mod ui_tests {
             std::cmp::Ordering::Less
         );
 
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let filter_start = source
             .find(source_token("fn filtered_workspace_panel_repositories(").as_str())
             .unwrap();
@@ -49387,7 +50000,7 @@ mod ui_tests {
 
     #[test]
     fn ctrl_shift_c_stage_toggle_uses_reserved_shortcut_path() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let helper_start = implementation_source
@@ -49473,7 +50086,7 @@ mod ui_tests {
 
     #[test]
     fn history_bottom_pane_uses_top_aligned_source_tree_layout() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn history_bottom_pane(").unwrap();
         let end = source[start..]
             .find("fn selected_commit_for_history(")
@@ -49537,7 +50150,7 @@ mod ui_tests {
 
     #[test]
     fn history_diff_header_reserves_path_width_and_uses_buttons() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn history_diff_pane(").unwrap();
         let end = source[start..].find("fn diff_viewer(").unwrap();
         let header_source = &source[start..start + end];
@@ -49575,7 +50188,7 @@ mod ui_tests {
 
     #[test]
     fn history_and_search_diff_bodies_use_parent_panel_background() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let history_start = source.find("fn diff_viewer(").unwrap();
         let history_end = source[history_start..]
             .find("fn search_diff_viewer(")
@@ -49611,7 +50224,7 @@ mod ui_tests {
 
     #[test]
     fn every_in_app_file_diff_uses_the_shared_fill_scroll_area() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         assert_eq!(
@@ -49678,7 +50291,7 @@ mod ui_tests {
 
     #[test]
     fn copied_hash_uses_transient_toast() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("toast_notice: Option<(String, Instant)>"));
         assert!(source.contains("Instant::now() + Duration::from_secs(1)"));
         assert!(source.contains("self.show_toast(self.tr(\"status.hash_copied\"))"));
@@ -49686,7 +50299,7 @@ mod ui_tests {
 
     #[test]
     fn completed_actions_do_not_show_success_noise() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(
             !implementation_source
@@ -49701,7 +50314,7 @@ mod ui_tests {
 
     #[test]
     fn git_errors_use_scrollable_dialog_instead_of_sidebar_footer() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("fn error_modal(&mut self, ctx: &egui::Context)"));
         assert!(implementation_source.contains("self.error_modal(ctx);"));
@@ -49747,7 +50360,7 @@ mod ui_tests {
 
     #[test]
     fn git_error_dialog_uses_shrinking_body_and_fixed_footer_row() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation.find("fn error_modal(").unwrap();
         let end = implementation[start..].find("fn main_layout(").unwrap();
@@ -49770,7 +50383,7 @@ mod ui_tests {
         assert!(chinese.ends_with(diagnostic));
         assert!(english.ends_with(diagnostic));
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let conflict_start = implementation
             .find("error.downcast_ref::<git::PullConflictError>()")
@@ -49779,12 +50392,12 @@ mod ui_tests {
         assert!(conflict_flow.contains("self.active_view = MainView::Workspace"));
         assert!(conflict_flow.contains("self.loading_repo = self.active_repo_has_pending_load()"));
         assert!(conflict_flow.contains("self.load_repository_uncached(root)"));
-        assert!(conflict_flow.contains("self.pending_push_after_pull = None"));
+        assert!(conflict_flow.contains("self.operations.current.pending_push_after_pull = None"));
     }
 
     #[test]
     fn non_fast_forward_pushes_offer_pull_then_push_recovery() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -49854,7 +50467,7 @@ mod ui_tests {
 
     #[test]
     fn github_auth_errors_offer_credential_manager_login() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -49892,7 +50505,9 @@ mod ui_tests {
             .unwrap();
         let modal_source = &implementation_source[modal_start..modal_start + modal_end];
         assert!(modal_source.contains("github_authentication_error(&message)"));
-        assert!(modal_source.contains("self.pending_credential_retry.is_some()"));
+        assert!(
+            modal_source.contains("self.operations.current.pending_credential_retry.is_some()")
+        );
         assert!(modal_source.contains("self.start_github_credential_login();"));
         assert!(modal_source.contains("dialog_primary_button("));
         assert!(modal_source.contains("credentials.github_login_running"));
@@ -49904,7 +50519,7 @@ mod ui_tests {
         assert!(!after_login_call.contains("close_requested = true"));
 
         let credential_task_start = implementation_source
-            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .find("if let Some(receiver) = self.operations.current.credential_login_task.take()")
             .unwrap();
         let credential_task_end = implementation_source[credential_task_start..]
             .find("self.poll_merge_tool_task(ctx);")
@@ -49912,7 +50527,10 @@ mod ui_tests {
         let credential_task_source = &implementation_source
             [credential_task_start..credential_task_start + credential_task_end];
         assert!(credential_task_source.contains("credentials.github_login_done_message"));
-        assert!(credential_task_source.contains("self.pending_credential_retry.take()"));
+        assert!(
+            credential_task_source
+                .contains("self.operations.current.pending_credential_retry.take()")
+        );
         assert!(
             credential_task_source
                 .contains("self.start_credential_retry_action_for_root(root, retry, true);")
@@ -49927,22 +50545,30 @@ mod ui_tests {
             .unwrap();
         let retry_source = &implementation_source[retry_start..retry_start + retry_end];
         assert!(retry_source.contains("PendingCredentialRetryAction::Push"));
-        assert!(retry_source.contains("self.pending_credential_retry = Some(action);"));
-        assert!(retry_source.contains("self.credential_retry_in_progress = after_login;"));
+        assert!(
+            retry_source
+                .contains("self.operations.current.pending_credential_retry = Some(action);")
+        );
+        assert!(
+            retry_source
+                .contains("self.operations.current.credential_retry_in_progress = after_login;")
+        );
         assert!(retry_source.contains("git::push_selected(root, &remote, &branches, options)"));
 
         let remote_task_start = implementation_source
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let remote_task_end = implementation_source[remote_task_start..]
-            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .find("if let Some(receiver) = self.operations.current.credential_login_task.take()")
             .unwrap();
         let remote_task_source =
             &implementation_source[remote_task_start..remote_task_start + remote_task_end];
-        assert!(remote_task_source.contains("self.pending_credential_retry = None;"));
         assert!(
-            remote_task_source.contains("let was_login_retry = self.credential_retry_in_progress")
+            remote_task_source.contains("self.operations.current.pending_credential_retry = None;")
         );
+        assert!(remote_task_source.contains(
+            "let was_login_retry = self.operations.current.credential_retry_in_progress"
+        ));
         assert!(remote_task_source.contains("credentials.github_retry_failed"));
         assert!(remote_task_source.contains("else if !auth_error"));
 
@@ -50005,7 +50631,7 @@ mod ui_tests {
             "git status failed: fatal: not a git repository"
         )));
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("deferred_repo_reloads"));
         assert!(implementation_source.contains("REPOSITORY_SNAPSHOT_RETRY_DELAY"));
@@ -50025,7 +50651,7 @@ mod ui_tests {
         assert!(repository_view_transition_required(Some(b), Some(a), b));
         assert!(repository_view_transition_required(Some(b), None, b));
         assert!(!repository_view_transition_required(Some(b), Some(b), b));
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let load = source
             .split("    fn load_repository_with_cache_mode(")
             .nth(1)
@@ -50214,7 +50840,7 @@ mod ui_tests {
 
     #[test]
     fn repository_completion_and_followups_do_not_retarget_the_selected_tab() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let reload = source
             .split("    fn load_repository_uncached(")
             .nth(1)
@@ -50240,7 +50866,7 @@ mod ui_tests {
             .split("\n    fn ")
             .next()
             .unwrap();
-        assert!(!invalidate.contains("self.repository_undo_task.take()"));
+        assert!(!invalidate.contains("self.operations.current.repository_undo_task.take()"));
         let navigation = source
             .split("    fn load_repository_with_cache_mode(")
             .nth(1)
@@ -50268,7 +50894,7 @@ mod ui_tests {
 
     #[test]
     fn repository_refresh_success_does_not_clear_git_operation_error() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
         let poll_end = implementation_source[poll_start..]
@@ -50282,7 +50908,7 @@ mod ui_tests {
         let repo_ok_source = &poll_source[repo_ok_start..repo_ok_start + repo_ok_end];
 
         assert!(repo_ok_source.contains("self.apply_repository_snapshot(snapshot)"));
-        assert!(repo_ok_source.contains("finish_pending_checkout_reload("));
+        assert!(repo_ok_source.contains("finish_repository_checkout_reload("));
         assert!(
             !repo_ok_source.contains("self.error = None"),
             "successful repository refresh must not erase an unrelated Git error dialog"
@@ -50291,7 +50917,7 @@ mod ui_tests {
 
     #[test]
     fn action_modals_use_compact_borderless_dialog_shell() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(implementation_source.contains("const ACTION_DIALOG_TITLE_HEIGHT: f32 = 34.0"));
         assert!(implementation_source.contains("const ACTION_DIALOG_TITLE_SIZE: f32 = 16.0"));
@@ -50324,7 +50950,7 @@ mod ui_tests {
 
     #[test]
     fn all_in_app_dialogs_share_the_global_top_anchor() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let compact_start = implementation.find("fn compact_action_dialog(").unwrap();
         let compact_end = implementation[compact_start..]
@@ -50359,7 +50985,7 @@ mod ui_tests {
 
     #[test]
     fn action_modals_submit_default_action_on_enter() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         assert!(
@@ -50413,7 +51039,7 @@ mod ui_tests {
 
     #[test]
     fn discard_selected_confirmation_is_localized() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let dialog_start = implementation_source
             .find("WorktreeActionDialog::ConfirmDiscard { targets } =>")
@@ -50445,7 +51071,7 @@ mod ui_tests {
 
     #[test]
     fn unified_diff_uses_single_layer_code_review_colors() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(!implementation_source.contains("fn diff_panel_frame("));
         let history_diff_start = implementation_source.find("fn diff_viewer(").unwrap();
@@ -50472,7 +51098,7 @@ mod ui_tests {
 
     #[test]
     fn unified_diff_rows_have_no_extra_vertical_spacing() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn render_unified_diff(").unwrap();
         let end = source[start..]
             .find("#[derive(Clone, Debug, Eq, PartialEq)]")
@@ -50637,7 +51263,7 @@ index 1111111..2222222 100644
 
     #[test]
     fn unified_diff_hunk_separator_uses_a_borderless_recessed_band() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn diff_gap_row(").unwrap();
         let end = source[start..].find("fn clean_diff_header(").unwrap();
         let gap_source = &source[start..start + end];
@@ -50649,7 +51275,7 @@ index 1111111..2222222 100644
 
     #[test]
     fn unified_diff_draws_indent_guide_dots_inside_rows() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let diff_row_start = source.find("fn diff_row(").unwrap();
         let row_end = source[diff_row_start..]
             .find("fn diff_row_clip_rect(")
@@ -50668,7 +51294,7 @@ index 1111111..2222222 100644
 
     #[test]
     fn unified_diff_rows_clip_background_and_text_to_visible_area() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let diff_row_start = source.find("fn diff_row(").unwrap();
         let row_end = source[diff_row_start..]
             .find("fn diff_row_clip_rect(")
@@ -50708,7 +51334,7 @@ index 1111111..2222222 100644
             "    let value = 1;"
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn diff_row(").unwrap();
         let end = source[start..].find("fn selected_diff_rows_text(").unwrap();
         let diff_row_source = &source[start..start + end];
@@ -50794,7 +51420,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn history_file_selection_defaults_to_diff_blocks() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("history_diff_display_mode: DiffDisplayMode::Blocks"));
         let start = source.find("fn select_changed_file_for_diff(").unwrap();
         let end = source[start..]
@@ -51201,7 +51827,7 @@ diff --git a/file.txt b/file.txt
             "\u{68ee}\u{7cfb}\u{7eff}"
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let settings_start = source.find("fn global_general_settings(&mut self").unwrap();
         let settings_end = source[settings_start..]
             .find("fn repo_remotes_settings_page(")
@@ -51220,7 +51846,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn background_patterns_map_every_accent_and_are_user_toggleable() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let cargo_manifest = source_token(include_str!("../Cargo.toml"));
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
@@ -51466,7 +52092,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn toolbar_branch_button_opens_create_branch_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let panel_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let panel_end = implementation_source[panel_start..]
@@ -51491,7 +52117,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn tags_view_uses_shared_virtual_table_columns_and_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let view_start = implementation_source.find("fn tags_view(").unwrap();
         let view_end = implementation_source[view_start..]
@@ -51551,7 +52177,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn tags_can_push_to_selected_remote_from_create_dialog_or_push_action() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let action_start = implementation_source.find("enum TagMenuAction").unwrap();
         let action_end = implementation_source[action_start..]
@@ -51605,7 +52231,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn clickable_custom_controls_use_pointing_hand_cursor() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("fn pointing_hand_cursor(response: egui::Response)"));
 
         for (start_marker, end_marker) in [
@@ -51654,7 +52280,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn remote_git_toolbar_actions_use_busy_state_without_success_noise() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(
             implementation_source
@@ -51678,10 +52304,13 @@ diff --git a/file.txt b/file.txt
         let remote_action_source =
             &implementation_source[remote_action_start..remote_action_start + remote_action_end];
         assert!(remote_action_source.contains("self.loading_repo = true;"));
-        assert!(remote_action_source.contains("self.remote_git_status_key = Some(status_key);"));
+        assert!(
+            remote_action_source
+                .contains("self.operations.current.remote_git_status_key = Some(status_key);")
+        );
 
         let remote_task_start = implementation_source
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let remote_task_end = implementation_source[remote_task_start..]
             .find("if let Some(receiver) = self.repo_source_task.take()")
@@ -51689,7 +52318,9 @@ diff --git a/file.txt b/file.txt
         let remote_task_source =
             &implementation_source[remote_task_start..remote_task_start + remote_task_end];
         assert!(remote_task_source.contains("self.load_repository_uncached(root)"));
-        assert!(remote_task_source.contains("self.remote_git_status_key = None;"));
+        assert!(
+            remote_task_source.contains("self.operations.current.remote_git_status_key = None;")
+        );
         assert!(
             remote_task_source.contains("self.loading_repo = self.active_repo_has_pending_load()")
         );
@@ -51705,7 +52336,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn pull_action_uses_dialog_with_remote_branch_and_options() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
@@ -51798,7 +52429,10 @@ diff --git a/file.txt b/file.txt
         assert!(modal_source.contains(source_token("push_after_pull_plan.is_some()").as_str()));
         assert!(
             modal_source.contains(
-                source_token("self.pending_push_after_pull = push_after_success").as_str()
+                source_token(
+                    "self.operations.current.pending_push_after_pull = push_after_success"
+                )
+                .as_str()
             )
         );
         assert!(modal_source.contains(source_token("self.execute_git_action(action)").as_str()));
@@ -51972,7 +52606,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn form_style_rows_share_the_centered_labeled_content_component() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for function_name in [
@@ -52276,7 +52910,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn localized_text_actions_use_the_shared_borderless_button_system() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let shared_button_start = implementation_source
             .find("fn text_action_button(")
@@ -52313,7 +52947,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn fetch_action_uses_dialog_with_options_icon_and_loading_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("pending_fetch_action: Option<FetchActionDialog>"));
@@ -52375,7 +53009,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_toolbar_actions_support_double_click_and_shift_shortcut_quick_paths() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("const TOOLBAR_DOUBLE_CLICK_DELAY"));
@@ -52491,7 +53125,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn push_action_uses_dialog_with_branch_rows_options_and_loading_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("pending_push_action: Option<PushActionDialog>"));
@@ -52642,7 +53276,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn push_actions_open_rebase_control_before_detached_head_error() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let quick_push_start = implementation_source
@@ -52703,7 +53337,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn force_with_lease_push_requires_explicit_confirmation() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for required in [
@@ -52751,7 +53385,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_toolbar_loading_replaces_entire_action_row() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn repo_toolbar_loading_busy(&self) -> bool"));
@@ -52850,7 +53484,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn local_branch_checkout_uses_pending_async_state_and_uncached_reload() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains(
@@ -52876,15 +53510,17 @@ diff --git a/file.txt b/file.txt
         );
 
         let branch_task_start = implementation_source
-            .find("if let Some(receiver) = self.branch_checkout_task.take()")
+            .find("if let Some(receiver) = self.operations.current.branch_checkout_task.take()")
             .unwrap();
         let branch_task_end = implementation_source[branch_task_start..]
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let branch_task_source =
             &implementation_source[branch_task_start..branch_task_start + branch_task_end];
-        assert!(branch_task_source.contains("self.pending_branch_checkout = None"));
-        assert!(branch_task_source.contains("self.branch_checkout_root = None"));
+        assert!(
+            branch_task_source.contains("self.operations.current.pending_branch_checkout = None")
+        );
+        assert!(branch_task_source.contains("self.operations.current.branch_checkout_root = None"));
         assert!(branch_task_source.contains("self.load_repository_uncached(root)"));
 
         assert!(implementation_source.contains("snapshot.skip_stale_branch"));
@@ -52895,7 +53531,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn dirty_local_branch_checkout_tries_native_checkout_then_offers_recovery() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
@@ -52979,7 +53615,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_menu_checkout_opens_two_tab_dialog_with_confirmed_detached_head() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("enum CheckoutDialogTab"));
@@ -53114,7 +53750,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn checkout_new_branch_tab_validates_remote_and_local_branch_names() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn validate_checkout_new_branch("));
@@ -53213,7 +53849,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn branch_rows_disable_branch_actions_while_checkout_or_reload_is_busy() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn branch_actions_busy(&self) -> bool"));
@@ -53275,7 +53911,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_task_busy_state_is_scoped_to_the_active_repository() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
 
         for owner in [
@@ -53313,13 +53949,13 @@ diff --git a/file.txt b/file.txt
                 "missing active gate {active_gate}"
             );
         }
-        assert!(busy.contains("self.remote_git_busy()"));
-        assert!(busy.contains("self.repository_undo_busy()"));
+        assert!(!busy.contains("self.remote_git_busy()"));
+        assert!(!busy.contains("self.repository_undo_busy()"));
         for global_gate in [
             "self.branch_checkout_busy()",
             "self.create_patch_busy()",
             "self.merge_tool_busy()",
-            "self.repository_benchmark_task.is_some()",
+            "self.operations.current.repository_benchmark_task.is_some()",
         ] {
             assert!(
                 !busy.contains(global_gate),
@@ -53330,7 +53966,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn conflict_reload_releases_its_owner_even_after_switching_tabs() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation = &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let poll_start = implementation
             .find(source_token("fn poll_tasks(").as_str())
@@ -53348,7 +53984,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn local_branch_context_menu_exposes_sourcetree_style_actions() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let menu_start = implementation_source
@@ -53397,7 +54033,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn local_branch_context_menu_is_shared_by_sidebar_and_table_rows() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let branch_row_start = implementation_source.find("fn branch_row(").unwrap();
@@ -53425,7 +54061,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn branch_menu_actions_wire_to_async_git_operations_and_dialogs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let handler_start = implementation_source
@@ -53470,7 +54106,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn merge_snapshot_message_becomes_default_commit_message() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         assert!(implementation_source.contains("fn apply_merge_commit_message_default("));
@@ -53717,7 +54353,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn combined_branch_deletion_uses_async_busy_gate_and_uncached_partial_refresh() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("    fn branch_action_modal(").unwrap();
         let end = source[start..]
             .find("    fn checkout_dialog_modal(")
@@ -53729,10 +54365,10 @@ diff --git a/file.txt b/file.txt
             r#"self.start_remote_git_action_with_status("status.deleting_branches", action)"#
         ));
         let start = source
-            .find("if let Some(receiver) = self.remote_git_task.take()")
+            .find("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .unwrap();
         let end = source[start..]
-            .find("if let Some(receiver) = self.credential_login_task.take()")
+            .find("if let Some(receiver) = self.operations.current.credential_login_task.take()")
             .unwrap();
         let poll = &source[start..start + end];
         assert!(poll.contains("error.downcast_ref::<git::LocalBranchDeletedRemoteDeleteFailed>()"));
@@ -53866,7 +54502,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_snapshot_preserves_commit_ime_focus_only_when_editor_survives() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
 
@@ -54013,7 +54649,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn branch_checkout_invalidates_stale_branch_sensitive_receivers() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let invalidation_start = implementation_source
@@ -54034,7 +54670,9 @@ diff --git a/file.txt b/file.txt
         ] {
             assert!(invalidation_source.contains(required), "{required}");
         }
-        assert!(!invalidation_source.contains("self.repository_undo_task.take()"));
+        assert!(
+            !invalidation_source.contains("self.operations.current.repository_undo_task.take()")
+        );
 
         let checkout_start = implementation_source
             .find("fn start_branch_checkout(&mut self")
@@ -54048,7 +54686,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn plus_tab_opens_repository_source_page() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("fn open_repository_source_tab("));
         assert!(source.contains("fn repository_source_view("));
         assert!(source.contains("self.open_repository_source_tab();"));
@@ -54115,7 +54753,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn file_clone_new_opens_or_reopens_the_single_repository_source_tab() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
 
         let menu_start = implementation_source.find("fn desktop_menu_bar(").unwrap();
@@ -54188,7 +54826,7 @@ diff --git a/file.txt b/file.txt
     fn dark_top_bar_uses_flat_shell_and_tabs_without_square_shadow_edges() {
         assert_eq!(top_bar_shadow_for_mode(theme::ThemeMode::Dark).color.a(), 0);
         assert!(top_bar_shadow_for_mode(theme::ThemeMode::Light).color.a() > 0);
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let shadow_start = source
             .find("fn paint_connected_tab_shadow_for_state(")
             .unwrap();
@@ -54370,7 +55008,7 @@ diff --git a/file.txt b/file.txt
         assert!(detached_inactive.shadow);
         assert!(detached_inactive.bottom_shadow);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         for required in [
             "enum TabVisualMode",
@@ -54421,7 +55059,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn remote_clone_requires_valid_checked_url_before_destination() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         assert!(source.contains("git::validate_remote_url(&url)"));
         assert!(source.contains("self.clone_destination.clear();"));
         assert!(source.contains("let url_valid = self.clone_url_is_valid();"));
@@ -54435,7 +55073,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn remote_button_opens_repository_url() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let top_bar_start = source.find("fn top_bar_panel(").unwrap();
         let top_bar_end = source[top_bar_start..]
             .find("fn repository_source_view(")
@@ -54493,7 +55131,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn command_button_opens_git_bash_on_windows() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let start = source.find("fn open_command_prompt(").unwrap();
         let end = source[start..].find("fn open_file_manager(").unwrap();
         let command_source = &source[start..start + end];
@@ -54580,7 +55218,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_tab_alias_editor_supports_double_click_submit_and_cancel() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let tab_start = implementation_source
             .find("fn repo_tab_with_close(")
@@ -54599,7 +55237,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn first_launch_only_opens_cwd_when_it_is_git_repository() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let startup_start = source.find("app.refresh_known_repositories();").unwrap();
         let startup_end = source[startup_start..]
             .find("app.save_app_settings();")
@@ -54624,7 +55262,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_tab_overflow_button_is_compact_and_uses_more_icon() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let overflow_button_start = implementation_source
             .find("fn repo_tab_overflow_button(")
@@ -54764,7 +55402,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_tabs_are_draggable_to_reorder_visible_tabs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let top_bar_start = implementation_source.find("fn top_bar_panel(").unwrap();
         let top_bar_end = implementation_source[top_bar_start..]
@@ -54807,7 +55445,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_tab_switch_uses_cached_snapshot_before_async_refresh() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let fields_start = implementation_source
@@ -54938,7 +55576,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn core_snapshot_defers_history_until_a_history_consumer_requests_it() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
         let poll_end = implementation_source[poll_start..]
@@ -54975,7 +55613,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn forced_refresh_keeps_inflight_snapshot_task_until_it_finishes() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation_source
             .find("fn start_repository_snapshot_load_with_priority(")
@@ -54992,7 +55630,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_refresh_scheduler_runs_outside_ui_frame_timers() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
             .find("pub struct GitAgentApp")
@@ -55041,7 +55679,7 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("self.active_repo_refresh_duration()"));
         assert!(refresh_source.contains("self.inactive_repo_refresh_duration()"));
         assert!(refresh_source.contains("ScheduledRepositoryRefresh"));
-        assert!(refresh_source.contains("blocked_keys.insert(repo_state_key(root))"));
+        assert!(refresh_source.contains("blocked_keys.extend(self.operations.blocked_keys())"));
         assert!(refresh_source.contains(".update_schedule(schedule.clone())"));
         assert!(
             refresh_source
@@ -55054,7 +55692,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn cached_repo_refresh_does_not_trigger_loading_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
             .find("pub struct GitAgentApp")
@@ -55107,7 +55745,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn unchanged_background_refresh_preserves_all_active_list_and_diff_state() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(
             implementation_source.contains("fn active_snapshot_matches_background_core_refresh(")
@@ -55186,7 +55824,7 @@ diff --git a/file.txt b/file.txt
     fn toolbar_buttons_allow_multilingual_inline_width() {
         assert_eq!(TOOLBAR_BUTTON_HEIGHT, 18.0);
         assert!(TOOLBAR_BUTTON_MAX_WIDTH > 96.0);
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let button_start = source.find("impl<'a> AppButton<'a>").unwrap();
         let button_end = source[button_start..]
             .find("fn toolbar_button_normal_fill(")
@@ -55307,7 +55945,7 @@ diff --git a/file.txt b/file.txt
                     .all(|section| section.format.color == foreground)
             );
         }
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let helper = source
             .split("pub(crate) fn toolbar_image_button")
             .nth(1)
@@ -55367,7 +56005,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn worktree_conflicts_have_resolve_entry() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let dialog_start = implementation_source
@@ -55527,10 +56165,9 @@ diff --git a/file.txt b/file.txt
             implementation_source
                 .contains(source_token("self.load_repository_uncached(root)").as_str())
         );
-        assert!(
-            implementation_source
-                .contains(source_token("self.merge_tool_task = Some(receiver)").as_str())
-        );
+        assert!(implementation_source.contains(
+            source_token("self.operations.current.merge_tool_task = Some(receiver)").as_str()
+        ));
         assert!(implementation_source.contains(source_token(".arg(\"--repo-root\")").as_str()));
         assert!(implementation_source.contains(source_token(".arg(\"--stage\")").as_str()));
         assert!(implementation_source.contains(source_token(".arg(\"--theme\")").as_str()));
@@ -55602,7 +56239,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn cancelling_merge_tool_releases_gate_without_repository_reload() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let poll_start = implementation.find("fn poll_merge_tool_task(").unwrap();
         let poll_end = implementation[poll_start..]
@@ -55615,10 +56252,14 @@ diff --git a/file.txt b/file.txt
         let applied = &poll[applied_start..cancelled_start];
         let cancelled = &poll[cancelled_start..error_start];
 
-        assert!(applied.contains("self.conflict_merge_reload_root = Some(root.clone())"));
+        assert!(
+            applied.contains(
+                "self.operations.current.conflict_merge_reload_root = Some(root.clone())"
+            )
+        );
         assert!(applied.contains("self.load_repository_uncached(root)"));
-        assert!(cancelled.contains("self.merge_tool_root = None"));
-        assert!(cancelled.contains("self.conflict_merge_reload_root = None"));
+        assert!(cancelled.contains("self.operations.current.merge_tool_root = None"));
+        assert!(cancelled.contains("self.operations.current.conflict_merge_reload_root = None"));
         assert!(!cancelled.contains("self.load_repository_uncached"));
 
         let actions_start = implementation
@@ -55634,7 +56275,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn conflict_dialog_accepts_a_side_and_refreshes_in_place() {
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         let implementation_source =
             &source[..source.find(source_token("#[cfg(test)]").as_str()).unwrap()];
         let dialog_start = implementation_source
@@ -55699,7 +56340,7 @@ diff --git a/file.txt b/file.txt
             "Modified"
         );
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let header_start = implementation_source
             .find("fn conflict_resolution_header(")
@@ -55738,7 +56379,7 @@ diff --git a/file.txt b/file.txt
         let edit = include_str!("../assets/icons/edit.svg");
         let delete_file = include_str!("../assets/icons/delete-file.svg");
         let rename_file = include_str!("../assets/icons/rename-file.svg");
-        let implementation_source = include_str!("app.rs");
+        let implementation_source = app_contract_source();
         assert!(plus.contains("width=\"16\" height=\"16\""));
         assert!(plus.contains("viewBox=\"0 0 16 16\""));
         assert!(!plus.contains("<rect"));
@@ -55849,7 +56490,7 @@ diff --git a/file.txt b/file.txt
         );
         let general_height = global_settings_dialog_height(SettingsTab::General, 2, 0, 0);
         assert_eq!(global_settings_content_max_height(general_height), 424.0);
-        let source = source_token(include_str!("app.rs"));
+        let source = source_token(app_contract_source());
         assert!(source.contains(source_token("fn settings_modal").as_str()));
         assert!(source.contains(source_token("fn repo_settings_modal").as_str()));
         assert!(source.contains(source_token("self.tr(\"options.title\")").as_str()));
@@ -56018,7 +56659,7 @@ diff --git a/file.txt b/file.txt
         let fitted = fit_settings_tab_widths(&preferred, 492.0);
         assert!((settings_tab_content_width(&fitted) - 492.0).abs() < 0.01);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let strip_start = source.find("fn settings_tab_strip(").unwrap();
         let strip_end = source[strip_start..]
             .find("fn settings_tab_button_width(")
@@ -56029,7 +56670,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_settings_dialog_uses_compact_title_and_real_tabs() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let modal_start = implementation_source
             .find("fn repo_settings_modal(&mut self")
@@ -56080,7 +56721,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_settings_tabs_do_not_overlap_from_nested_icon_ui() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let tab_button_start = implementation_source
             .find("fn repo_settings_tab_button(")
@@ -56100,7 +56741,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_settings_remote_add_and_edit_open_action_dialog() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let remotes_start = implementation_source
             .find("fn repo_remotes_settings_page")
@@ -56143,7 +56784,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn global_options_configure_validated_remote_accounts_for_dropdown() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let app_settings_start = implementation_source.find("struct AppSettings").unwrap();
         let app_settings_end = implementation_source[app_settings_start..]
@@ -56199,7 +56840,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn global_options_are_split_into_tabs_and_general_has_refresh_intervals() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let app_settings_start = implementation_source.find("struct AppSettings").unwrap();
         let app_settings_end = implementation_source[app_settings_start..]
@@ -56269,7 +56910,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn background_remote_refresh_is_persisted_throttled_and_shares_the_git_gate() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let refresh_start = implementation_source
             .find("fn maybe_start_background_remote_refresh(")
@@ -56292,7 +56933,7 @@ diff --git a/file.txt b/file.txt
             "git::repository_tag_refs_fingerprint(&root)",
             "git::repository_refresh_fingerprint(&root)",
             "git::open_repository_core(&root).map(Some)",
-            "self.background_remote_git_task.is_some()",
+            "self.operations.current.background_remote_git_task.is_some()",
             "self.active_background_remote_git_busy()",
             "!snapshot.config.auto_refresh",
             "!snapshot.config.background_remote_refresh",
@@ -56309,19 +56950,21 @@ diff --git a/file.txt b/file.txt
         assert!(refresh_source.contains("snapshot.remotes.is_empty()"));
         assert!(refresh_source.contains("BACKGROUND_REMOTE_REFRESH_BUSY_RETRY"));
 
-        let poll_start = implementation_source.find("fn poll_tasks(").unwrap();
+        let poll_start = implementation_source
+            .find("fn poll_repository_operation_tasks(")
+            .unwrap();
         let poll_end = implementation_source[poll_start..]
             .find("fn poll_external_diff_tool_task(")
             .unwrap();
         let poll_source = &implementation_source[poll_start..poll_start + poll_end];
-        assert!(poll_source.contains("self.background_remote_git_task.take()"));
+        assert!(poll_source.contains("self.operations.current.background_remote_git_task.take()"));
         assert!(poll_source.contains("self.cache_repository_snapshot(&snapshot)"));
         assert!(poll_source.contains("self.apply_repository_snapshot(snapshot)"));
     }
 
     #[test]
     fn automatic_refresh_uses_shared_queue_and_pauses_during_git_mutations() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let fields_start = implementation_source
             .find("pub struct GitAgentApp")
@@ -56349,8 +56992,8 @@ diff --git a/file.txt b/file.txt
         assert!(implementation_source.contains("probe_before_full_refresh: true"));
         assert!(implementation_source.contains("git::repository_refresh_fingerprint"));
         assert!(implementation_source.contains("interval.mul_f64("));
-        assert!(refresh_source.contains("self.remote_git_root.as_deref()"));
-        assert!(refresh_source.contains("self.branch_checkout_root.as_deref()"));
+        assert!(refresh_source.contains("blocked_keys.extend(self.operations.blocked_keys())"));
+        assert!(refresh_source.contains("blocked_keys.extend(self.operations.blocked_keys())"));
         assert!(!refresh_source.contains("self.start_foreground_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.restart_repository_snapshot_load"));
         assert!(!refresh_source.contains("self.loading_repo = true"));
@@ -56587,7 +57230,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repository_mutations_acquire_the_same_scheduler_exclusive_permit() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let mut pending = Vec::<RepositoryExclusiveRequest>::new();
         let (first_sender, _first_receiver) = mpsc::channel();
@@ -56629,7 +57272,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn workspace_status_loader_uses_one_lightweight_git_probe() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let start = implementation_source
             .find("fn maybe_start_workspace_repository_status_load(")
@@ -56653,7 +57296,7 @@ diff --git a/file.txt b/file.txt
             &source[start..start + end]
         }
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         assert!(!implementation.contains("process_viewer"));
         assert!(!implementation.contains("process_viewer_modal"));
@@ -56704,7 +57347,7 @@ diff --git a/file.txt b/file.txt
         let poll = section(
             implementation,
             "if let Some(receiver) = self.update_task.take()",
-            "if let Some(receiver) = self.create_patch_task.take()",
+            "if let Some(receiver) = self.repo_source_task.take()",
         );
         assert!(poll.contains("self.update_task_action = None;"));
         assert!(poll.contains("self.update_task = Some(receiver);"));
@@ -56778,7 +57421,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn automatic_update_checks_are_silent_owned_and_never_install() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let automatic = source
             .split("fn maybe_start_automatic_update_check(")
             .nth(1)
@@ -56807,7 +57450,7 @@ diff --git a/file.txt b/file.txt
             .split("if let Some(receiver) = self.update_task.take()")
             .nth(1)
             .unwrap()
-            .split("if let Some(receiver) = self.create_patch_task.take()")
+            .split("if let Some(receiver) = self.repo_source_task.take()")
             .next()
             .unwrap();
         assert!(poll.contains("if !self.update_check_silent || self.auto_check_updates"));
@@ -56842,7 +57485,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn general_settings_put_language_first() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let general = source
             .split("fn global_general_settings(&mut self")
             .nth(1)
@@ -56859,7 +57502,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn update_badge_fits_title_controls_and_is_excluded_from_drag_in_both_languages() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let badge = source
             .split("fn update_available_button(")
             .nth(1)
@@ -57023,7 +57666,7 @@ diff --git a/file.txt b/file.txt
             assert_ne!(i18n::t(Language::English, step.body_key), step.body_key);
         }
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let overlay_start = implementation
             .find("fn beginner_tutorial_overlay(&mut self")
@@ -57117,7 +57760,7 @@ diff --git a/file.txt b/file.txt
             .expect("tutorial seen state should round-trip through local settings");
         assert!(restored.beginner_tutorial_seen);
 
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let first = tutorials::Session::automatic(tutorials::Progress::default(), false);
         assert_eq!(first.current().unwrap().0.id, tutorials::BASIC_ID);
@@ -57131,7 +57774,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn feature_tutorial_gates_background_shortcuts_and_prepares_real_plugin_settings() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let handler = source
             .split("fn handle_global_shortcuts(")
             .nth(1)
@@ -57226,7 +57869,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn settings_pages_use_shared_full_width_recessed_group_panels() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let modal_start = implementation_source
             .find("fn repo_settings_modal(&mut self")
@@ -57352,7 +57995,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn sidebar_branch_trees_are_rebuilt_with_snapshots_not_render_frames() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let sidebar_start = implementation_source
             .find("fn sidebar_content(&mut self")
@@ -57385,7 +58028,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn scheduler_owned_repository_loads_do_not_poll_the_ui_frame() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation_source = &source[..source.find("#[cfg(test)]").unwrap()];
         let scheduler_start = implementation_source
             .find("fn repository_refresh_scheduler_loop(")
@@ -57494,7 +58137,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn commit_identity_guard_is_wired_to_settings_clone_and_commit() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let author_settings_start = implementation
             .find("fn global_commit_authors_settings(")
@@ -57532,7 +58175,7 @@ diff --git a/file.txt b/file.txt
 
     #[test]
     fn repo_ignore_rules_use_localized_deterministic_explanations_and_safe_async_save() {
-        let source = include_str!("app.rs");
+        let source = app_contract_source();
         let implementation = &source[..source.find("#[cfg(test)]").unwrap()];
         let page_start = implementation
             .find("fn repo_ignore_rules_settings_page(")
@@ -57548,7 +58191,9 @@ diff --git a/file.txt b/file.txt
             .find("fn active_repo_gitignore_save_busy(")
             .unwrap();
         let save = &implementation[save_start..save_start + save_end];
-        let poll_start = implementation.find("fn poll_tasks(").unwrap();
+        let poll_start = implementation
+            .find("fn poll_repository_operation_tasks(")
+            .unwrap();
         let poll_end = implementation[poll_start..]
             .find("fn request_selected_details(")
             .unwrap();
@@ -57561,13 +58206,15 @@ diff --git a/file.txt b/file.txt
         assert!(page.contains("editor.document.add_rule()"));
         assert!(page.contains("body.heterogeneous_rows(row_heights.into_iter()"));
         assert!(page.contains(".wrap()"));
-        assert!(save.contains("self.repo_gitignore_save_task = Some(receiver)"));
-        assert!(save.contains("self.repo_gitignore_save_root = Some(root.clone())"));
+        assert!(save.contains("self.operations.current.repo_gitignore_save_task = Some(receiver)"));
+        assert!(
+            save.contains("self.operations.current.repo_gitignore_save_root = Some(root.clone())")
+        );
         assert!(save.contains("self.loading_repo = true"));
         assert!(save.contains("scheduler.acquire_exclusive"));
         assert!(implementation.contains("|| self.active_repo_gitignore_save_busy()"));
-        assert!(poll.contains("self.repo_gitignore_save_task.take()"));
-        assert!(poll.contains("self.repo_gitignore_save_root = None"));
+        assert!(poll.contains("self.operations.current.repo_gitignore_save_task.take()"));
+        assert!(poll.contains("self.operations.current.repo_gitignore_save_root = None"));
         assert!(poll.contains("self.load_repository_uncached(root)"));
     }
 }

@@ -3426,8 +3426,15 @@ mod tests {
             .split("fn ")
             .next()
             .unwrap();
-        let manual = poll
-            .split("if let Some(receiver) = self.remote_git_task.take()")
+        let task_poll = source
+            .split("fn poll_repository_operation_tasks(")
+            .nth(1)
+            .unwrap()
+            .split("fn poll_tasks(")
+            .next()
+            .unwrap();
+        let manual = task_poll
+            .split("if let Some(receiver) = self.operations.current.remote_git_task.take()")
             .nth(1)
             .unwrap();
         assert!(manual.contains("self.plugin_repository_events.insert(root.clone(), event)"));
@@ -3445,7 +3452,7 @@ mod tests {
                 .unwrap()
                 < snapshot.find("self.plugins.notify").unwrap()
         );
-        assert!(poll.contains("self.background_remote_git_task.take()"));
+        assert!(task_poll.contains("self.operations.current.background_remote_git_task.take()"));
     }
     #[test]
     fn failure_releases_scope_and_confirmation() {

@@ -26,6 +26,22 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.2.3-beta.1 — 2026-11-09</h2>
+<h3>修复</h3>
+<ul>
+<li>按仓库独立维护拉取、推送、获取、切分支、撤销、合并工具及其他后台操作，避免一个仓库的长任务锁住其他仓库。切换标签后，任务和后续重试仍归属原仓库。</li>
+<li>后台仓库的操作错误保留到查看对应仓库时显示，避免覆盖当前仓库的错误或提示。</li>
+<li>修复工具栏按钮禁用后完全消失的问题，保留可见的文字和图标。</li>
+<li>AI 提交信息按仓库独立生成；切走后保留结果，并在返回时校验原分支，避免把旧建议应用到其他分支。</li>
+<li>统一 Windows 路径大小写和分隔符对应的仓库状态，保留已有标签别名及侧栏展开偏好。</li>
+</ul>
+<h3>性能</h3>
+<ul>
+<li>仅将本次会话中激活过的仓库加入自动刷新；后台仓库使用较低频率的变化探测，未变化时跳过完整刷新。</li>
+<li>关闭标签或关闭自动刷新时移除尚未执行的自动读取；保留已发起操作及必要的完成刷新。</li>
+<li>限制 Git 重任务并发，减少多仓库同时操作时的资源争抢，并为每个仓库保留独立的后台获取周期。</li>
+</ul>
+<p>此版本用于发布验证，不进入正式版更新提示。</p>
 <h2>2.2.2 — 2026-10-27</h2>
 <h3>修复</h3>
 <ul>
@@ -390,6 +406,22 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.2.3-beta.1 — 2026-11-09</h2>
+<h3>Fixed</h3>
+<ul>
+<li>Keep pull, push, fetch, checkout, undo, merge-tool and other background operation state independent for each repository. A long-running task no longer disables unrelated repositories, and navigation preserves the original task and its retries.</li>
+<li>Keep background operation errors with their repository until it is viewed, preserving the current repository&#x27;s errors and notices.</li>
+<li>Restore visible captions and icons for disabled toolbar buttons.</li>
+<li>Generate AI commit messages independently per repository. Preserve results while its tab is inactive and validate the original branch before applying a deferred suggestion.</li>
+<li>Unify Windows path case and separators for repository state while retaining saved tab aliases and sidebar preferences.</li>
+</ul>
+<h3>Performance</h3>
+<ul>
+<li>Automatically refresh only repositories activated in the current session. Use slower probes for visited background repositories and skip full reads when nothing changed.</li>
+<li>Remove queued automatic reads when a tab is closed or automatic refresh is disabled, while retaining explicit operations and their required completion reloads.</li>
+<li>Bound concurrent Git operations to reduce resource contention and retain a separate background-fetch deadline for each repository.</li>
+</ul>
+<p>This is a prerelease for release validation and is excluded from stable update prompts.</p>
 <h2>2.2.2 — 2026-10-27</h2>
 <h3>Fixed</h3>
 <ul>

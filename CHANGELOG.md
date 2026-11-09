@@ -5,6 +5,24 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.3-beta.1 — 2026-11-09
+
+### Fixed
+
+- Keep pull, push, fetch, checkout, undo, merge-tool and other background operation state independent for each repository. A long-running task no longer disables unrelated repositories, and navigation preserves the original task and its retries.
+- Keep background operation errors with their repository until it is viewed, preserving the current repository's errors and notices.
+- Restore visible captions and icons for disabled toolbar buttons.
+- Generate AI commit messages independently per repository. Preserve results while its tab is inactive and validate the original branch before applying a deferred suggestion.
+- Unify Windows path case and separators for repository state while retaining saved tab aliases and sidebar preferences.
+
+### Performance
+
+- Automatically refresh only repositories activated in the current session. Use slower probes for visited background repositories and skip full reads when nothing changed.
+- Remove queued automatic reads when a tab is closed or automatic refresh is disabled, while retaining explicit operations and their required completion reloads.
+- Bound concurrent Git operations to reduce resource contention and retain a separate background-fetch deadline for each repository.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.2.2 — 2026-10-27
 
 ### Fixed

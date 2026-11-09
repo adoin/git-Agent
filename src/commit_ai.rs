@@ -935,7 +935,7 @@ mod tests {
             .unwrap();
         assert!(
             start
-                .find(source_token("self.commit_ai_task = Some").as_str())
+                .find(source_token("self.operations.current.commit_ai_task = Some").as_str())
                 .unwrap()
                 < start.find(source_token("thread::spawn").as_str()).unwrap()
         );
@@ -950,10 +950,10 @@ mod tests {
             .next()
             .unwrap();
         for token in [
-            "self.commit_ai_task.take()",
+            "self.operations.current.commit_ai_task.take()",
             "TryRecvError::Empty",
             "TryRecvError::Disconnected",
-            "self.commit_ai_task = Some(task)",
+            "self.operations.current.commit_ai_task = Some(task)",
             "self.active_repo_root_matches(&task.root)",
             "!self.commit_state.amend && replace_unchanged_commit_draft(",
             "&mut self.commit_message, &task.original_draft, suggestion.message",
@@ -980,7 +980,7 @@ mod tests {
             .split(source_token("fn branch_actions_busy(").as_str())
             .next()
             .unwrap();
-        assert!(gate.contains(source_token("self.commit_ai_task").as_str()));
+        assert!(gate.contains(source_token("self.operations.current.commit_ai_task").as_str()));
         assert!(gate.contains(source_token("self.active_repo_root_matches(&task.root)").as_str()));
         let mutation = source
             .split(source_token("fn start_remote_git_action_with_status(").as_str())
