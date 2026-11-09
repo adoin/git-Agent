@@ -41615,7 +41615,19 @@ mod ui_tests {
 
     use super::*;
 
-    #[cfg(windows)]
+    #[cfg(not(windows))]
+    #[test]
+    fn repository_operation_keys_preserve_case_on_case_sensitive_platforms() {
+        assert_ne!(
+            repo_state_key(Path::new("/repository/Project")),
+            repo_state_key(Path::new("/repository/project"))
+        );
+        assert_eq!(
+            repo_state_key(Path::new("/repository/project/")),
+            repo_state_key(Path::new("/repository/project"))
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn normalized_repository_keys_preserve_saved_tab_aliases_and_sidebar_preferences() {
@@ -41635,6 +41647,7 @@ mod ui_tests {
         assert!(state.sidebar_tree_states.contains_key(&key));
     }
 
+    #[cfg(windows)]
     #[test]
     fn repository_operation_keys_match_windows_git_path_spellings_without_filesystem_io() {
         let native = PathBuf::from(r"D:\not-a-real-repository\Project");
