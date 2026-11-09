@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "git-agent"
-version = "2.2.3-beta.2"
+version = "2.2.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
