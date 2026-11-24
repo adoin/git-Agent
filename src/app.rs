@@ -858,8 +858,10 @@ struct RepositoryOperationState {
     commit_ai_task: Option<CommitAiTask>,
     background_remote_git_task: Option<Receiver<BackgroundRemoteGitTaskResult>>,
     background_remote_git_root: Option<PathBuf>,
+    background_remote_git_trace: Option<diagnostics::RepositoryTaskTrace>,
     remote_git_task: Option<Receiver<RemoteGitTaskResult>>,
     remote_git_status_key: Option<&'static str>,
+    remote_git_trace: Option<diagnostics::RepositoryTaskTrace>,
     remote_git_root: Option<PathBuf>,
     repository_undo_task: Option<Receiver<RepositoryUndoTaskResult>>,
     repository_undo_root: Option<PathBuf>,
@@ -901,8 +903,10 @@ impl Default for RepositoryOperationState {
             commit_ai_task: None,
             background_remote_git_task: None,
             background_remote_git_root: None,
+            background_remote_git_trace: None,
             remote_git_task: None,
             remote_git_status_key: None,
+            remote_git_trace: None,
             remote_git_root: None,
             repository_undo_task: None,
             repository_undo_root: None,
@@ -1318,6 +1322,7 @@ enum RepositoryRefreshPriority {
 }
 
 struct RepositoryRefreshRequest {
+    trace: Option<diagnostics::RepositoryTaskTrace>,
     path: PathBuf,
     key: String,
     priority: RepositoryRefreshPriority,
@@ -1393,7 +1398,8 @@ impl RepositoryRefreshScheduler {
             });
     }
 
-    fn request(&self, request: RepositoryRefreshRequest) {
+    fn request(&self, mut request: RepositoryRefreshRequest) {
+        attach_refresh_trace(&mut request);
         let _ = self
             .sender
             .send(RepositoryRefreshSchedulerCommand::Request(request));
@@ -1577,12 +1583,17 @@ fn repository_refresh_scheduler_loop(
             thread::spawn(move || {
                 let key = request.key.clone();
                 let path = request.path.clone();
+                let task_trace = request.trace.clone();
                 let mut failure_senders = request.additional_result_senders.clone();
                 failure_senders.push(request.result_sender.clone());
                 let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_repository_refresh(request, known)
                 }))
                 .unwrap_or_else(|_| {
+                    if let Some(trace) = &task_trace {
+                        trace.worker_finished(false);
+                        trace.finished("aborted");
+                    }
                     for sender in failure_senders {
                         let _ = sender.send((
                             path.clone(),
@@ -1605,9 +1616,15 @@ fn run_repository_refresh(
     known: Option<git::RepositoryRefreshFingerprint>,
 ) -> (String, Option<git::RepositoryRefreshFingerprint>) {
     let started = Instant::now();
-    let probe = request
-        .probe_before_full_refresh
-        .then(|| git::repository_refresh_fingerprint(&request.path));
+    let trace = request.trace.clone().unwrap_or_else(|| {
+        diagnostics::RepositoryTaskTrace::new(&request.path, "snapshot_refresh")
+    });
+    trace.dispatched();
+    let probe = request.probe_before_full_refresh.then(|| {
+        trace.stage("local_probe", || {
+            git::repository_refresh_fingerprint(&request.path)
+        })
+    });
     if let Some(Ok(fingerprint)) = &probe {
         if known.as_ref() == Some(fingerprint) {
             diagnostics::repository_refresh_trace(
@@ -1618,10 +1635,16 @@ fn run_repository_refresh(
                     started.elapsed().as_millis()
                 ),
             );
+            trace.worker_finished(true);
+            trace.finished("unchanged");
             return (request.key, Some(fingerprint.clone()));
         }
     }
-    let result = git::open_repository_core_with_probe(&request.path, probe.and_then(Result::ok));
+    let result = trace.stage("core_snapshot", || {
+        git::open_repository_core_with_probe(&request.path, probe.and_then(Result::ok))
+    });
+    let success = result.is_ok();
+    trace.worker_finished(success);
     diagnostics::repository_refresh_trace(
         "refresh.full",
         &format!(
@@ -1643,6 +1666,13 @@ fn run_repository_refresh(
         let _ = sender.send((request.path.clone(), copied));
     }
     let delivered = request.result_sender.send((request.path, result)).is_ok();
+    trace.finished(if !delivered {
+        "receiver_dropped"
+    } else if success {
+        "success"
+    } else {
+        "error"
+    });
     (request.key, delivered.then_some(fingerprint).flatten())
 }
 
@@ -1672,8 +1702,14 @@ fn apply_repository_refresh_scheduler_command(
                 .collect::<HashSet<_>>();
             scheduled.retain(|key, _| repository_keys.contains(key));
             pending.retain(|request| {
-                request.priority == RepositoryRefreshPriority::Foreground
-                    || repository_keys.contains(&request.key)
+                let keep = request.priority == RepositoryRefreshPriority::Foreground
+                    || repository_keys.contains(&request.key);
+                if !keep {
+                    if let Some(trace) = &request.trace {
+                        trace.finished("cancelled");
+                    }
+                }
+                keep
             });
             let now = Instant::now();
             let inactive_count = repositories
@@ -1760,6 +1796,7 @@ fn enqueue_due_repository_refreshes(
         enqueue_repository_refresh(
             pending,
             RepositoryRefreshRequest {
+                trace: None,
                 path: state.repository.path.clone(),
                 key: state.repository.key.clone(),
                 priority: RepositoryRefreshPriority::Background,
@@ -1771,11 +1808,28 @@ fn enqueue_due_repository_refreshes(
     }
 }
 
+fn attach_refresh_trace(request: &mut RepositoryRefreshRequest) {
+    if request.trace.is_none() {
+        request.trace = Some(diagnostics::RepositoryTaskTrace::new(
+            &request.path,
+            if request.priority == RepositoryRefreshPriority::Foreground {
+                "foreground_refresh"
+            } else {
+                "background_refresh"
+            },
+        ));
+    }
+}
+
 fn enqueue_repository_refresh(
     pending: &mut Vec<RepositoryRefreshRequest>,
-    request: RepositoryRefreshRequest,
+    mut request: RepositoryRefreshRequest,
 ) {
+    attach_refresh_trace(&mut request);
     if let Some(existing) = pending.iter_mut().find(|queued| queued.key == request.key) {
+        if let Some(trace) = &request.trace {
+            trace.finished("coalesced");
+        }
         existing.priority = existing.priority.max(request.priority);
         existing.probe_before_full_refresh &= request.probe_before_full_refresh;
         if !request.probe_before_full_refresh {
@@ -5301,6 +5355,7 @@ impl GitAgentApp {
         self.repo_tasks.insert(repo_task_key.clone(), receiver);
         self.repository_refresh_scheduler
             .request(RepositoryRefreshRequest {
+                trace: None,
                 path,
                 key: repo_task_key,
                 priority,
@@ -5587,6 +5642,8 @@ impl GitAgentApp {
         let known_fingerprint = git::repository_snapshot_refresh_fingerprint(snapshot);
         let known_tag_refs = git::repository_snapshot_tag_refs_fingerprint(snapshot);
         let prune_tags = snapshot.remotes.len() == 1;
+        let task_trace = diagnostics::RepositoryTaskTrace::new(&root, "background_fetch");
+        self.operations.current.background_remote_git_trace = Some(task_trace.clone());
         let (sender, receiver) = mpsc::channel();
         self.operations.current.background_remote_git_task = Some(receiver);
         self.operations.current.background_remote_git_root = Some(root.clone());
@@ -5604,35 +5661,41 @@ impl GitAgentApp {
         let scheduler_key = repo_state_key(&root);
         let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
         thread::spawn(move || {
-            let _span = diagnostics::span(
-                "repository.background_fetch",
-                format!("root={}", root.display()),
-            );
-            let result = exclusive_access
-                .recv()
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Repository refresh scheduler stopped before background fetch began"
-                    )
+            let result = task_trace
+                .stage("scheduler_wait", || {
+                    exclusive_access.recv().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Repository refresh scheduler stopped before background fetch began"
+                        )
+                    })
                 })
                 .and_then(|()| {
                     let _exclusive_guard =
                         RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
-                    git::fetch_with_options(
-                        &root,
-                        git::FetchOptions::background_remote_refresh(prune_tags),
-                    )?;
-                    let current_fingerprint = git::repository_refresh_fingerprint(&root)?;
-                    let current_tag_refs = git::repository_tag_refs_fingerprint(&root)?;
+                    task_trace.stage("git_fetch", || {
+                        git::fetch_with_options(
+                            &root,
+                            git::FetchOptions::background_remote_refresh(prune_tags),
+                        )
+                    })?;
+                    let current_fingerprint = task_trace
+                        .stage("local_probe", || git::repository_refresh_fingerprint(&root))?;
+                    let current_tag_refs = task_trace
+                        .stage("tag_probe", || git::repository_tag_refs_fingerprint(&root))?;
                     if current_fingerprint == known_fingerprint
                         && current_tag_refs == known_tag_refs
                     {
                         Ok(None)
                     } else {
-                        git::open_repository_core(&root).map(Some)
+                        task_trace
+                            .stage("core_snapshot", || git::open_repository_core(&root))
+                            .map(Some)
                     }
                 });
-            let _ = sender.send((root, result));
+            task_trace.worker_finished(result.is_ok());
+            if sender.send((root, result)).is_err() {
+                task_trace.finished("receiver_dropped");
+            }
         });
         ctx.request_repaint();
     }
@@ -8712,6 +8775,8 @@ impl GitAgentApp {
             self.save_commit_message_draft_for_active_repo();
             self.pending_toolbar_single_click = None;
         }
+        let task_trace = diagnostics::RepositoryTaskTrace::new(&root, status_key);
+        self.operations.current.remote_git_trace = Some(task_trace.clone());
         let (sender, receiver) = mpsc::channel();
         self.operations.current.remote_git_task = Some(receiver);
         self.operations.current.remote_git_status_key = Some(status_key);
@@ -8747,23 +8812,23 @@ impl GitAgentApp {
         let exclusive_access = scheduler.acquire_exclusive(scheduler_key.clone());
 
         thread::spawn(move || {
-            let _span = diagnostics::span(
-                "repository.remote",
-                format!("root={} action={status_key}", root.display()),
-            );
-            let result = exclusive_access
-                .recv()
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Repository refresh scheduler stopped before remote Git action began"
-                    )
+            let result = task_trace
+                .stage("scheduler_wait", || {
+                    exclusive_access.recv().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Repository refresh scheduler stopped before remote Git action began"
+                        )
+                    })
                 })
                 .and_then(|()| {
                     let _exclusive_guard =
                         RepositoryExclusiveGuard::new(scheduler.clone(), scheduler_key.clone());
-                    action(&root)
+                    task_trace.stage("git_action", || action(&root))
                 });
-            let _ = sender.send((root, result));
+            task_trace.worker_finished(result.is_ok());
+            if sender.send((root, result)).is_err() {
+                task_trace.finished("receiver_dropped");
+            }
         });
     }
 
@@ -9586,6 +9651,12 @@ impl GitAgentApp {
         if let Some(receiver) = self.operations.current.background_remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(snapshot))) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .background_remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("success"));
                     self.operations.current.background_remote_git_root = None;
                     let plugin_context = snapshot
                         .as_ref()
@@ -9612,6 +9683,12 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((root, Err(error))) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .background_remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("error"));
                     self.operations.current.background_remote_git_root = None;
                     diagnostics::repository_refresh_trace(
                         "remote.error",
@@ -9624,6 +9701,12 @@ impl GitAgentApp {
                     ctx.request_repaint_after(Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .background_remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("disconnected"));
                     self.operations.current.background_remote_git_root = None;
                     diagnostics::repository_refresh_trace(
                         "remote.disconnected",
@@ -9637,6 +9720,12 @@ impl GitAgentApp {
         if let Some(receiver) = self.operations.current.remote_git_task.take() {
             match receiver.try_recv() {
                 Ok((root, Ok(()))) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("success"));
                     if let Some(event) = match self.operations.current.remote_git_status_key {
                         Some("status.fetching") => Some("repository.fetch.completed"),
                         Some("status.pulling") => Some("repository.pull.completed"),
@@ -9696,6 +9785,12 @@ impl GitAgentApp {
                     ctx.request_repaint();
                 }
                 Ok((root, Err(error))) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("error"));
                     self.operations.current.remote_git_status_key = None;
                     self.operations.current.remote_git_root = None;
                     if let Some(partial) =
@@ -9832,6 +9927,12 @@ impl GitAgentApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    let _completion = self
+                        .operations
+                        .current
+                        .remote_git_trace
+                        .take()
+                        .map(|trace| trace.received("disconnected"));
                     let interrupted_root = self.operations.current.remote_git_root.clone();
                     self.operations.current.remote_git_status_key = None;
                     self.operations.current.remote_git_root = None;
@@ -10014,6 +10115,17 @@ impl GitAgentApp {
                 });
 
             for (requested_root, result) in repo_results {
+                let ui_started = Instant::now();
+                let ui_outcome = if result.is_ok() { "handled" } else { "error" };
+                diagnostics::repository_task_event(
+                    "snapshot.ui.received",
+                    &format!(
+                        "pid={} root={} outcome={}",
+                        std::process::id(),
+                        requested_root.display(),
+                        if result.is_ok() { "success" } else { "error" }
+                    ),
+                );
                 let repo_task_key = repo_state_key(&requested_root);
                 let queued_reload = self.queued_repo_reloads.remove(&repo_task_key);
                 let retry_queued = queued_reload.is_none()
@@ -10166,6 +10278,16 @@ impl GitAgentApp {
                         RepositoryRefreshPriority::Foreground,
                     );
                 }
+                diagnostics::repository_task_event(
+                    "snapshot.ui.complete",
+                    &format!(
+                        "pid={} root={} outcome={} stage_ms={}",
+                        std::process::id(),
+                        requested_root.display(),
+                        ui_outcome,
+                        ui_started.elapsed().as_millis()
+                    ),
+                );
                 ctx.request_repaint();
             }
 
@@ -50691,6 +50813,7 @@ mod ui_tests {
         });
         let (sender, receiver) = mpsc::channel();
         scheduler.request(RepositoryRefreshRequest {
+            trace: None,
             path: root.clone(),
             key: key.clone(),
             priority: RepositoryRefreshPriority::Background,
@@ -56945,7 +57068,7 @@ diff --git a/file.txt b/file.txt
             "git::repository_snapshot_tag_refs_fingerprint(snapshot)",
             "git::repository_tag_refs_fingerprint(&root)",
             "git::repository_refresh_fingerprint(&root)",
-            "git::open_repository_core(&root).map(Some)",
+            r#""core_snapshot", || git::open_repository_core(&root)"#,
             "self.operations.current.background_remote_git_task.is_some()",
             "self.active_background_remote_git_busy()",
             "!snapshot.config.auto_refresh",
@@ -57022,6 +57145,7 @@ diff --git a/file.txt b/file.txt
         enqueue_repository_refresh(
             &mut pending,
             RepositoryRefreshRequest {
+                trace: None,
                 path: PathBuf::from("background-repository"),
                 key: "background-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Background,
@@ -57033,6 +57157,7 @@ diff --git a/file.txt b/file.txt
         enqueue_repository_refresh(
             &mut pending,
             RepositoryRefreshRequest {
+                trace: None,
                 path: PathBuf::from("foreground-repository"),
                 key: "foreground-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Foreground,
@@ -57044,6 +57169,7 @@ diff --git a/file.txt b/file.txt
         enqueue_repository_refresh(
             &mut pending,
             RepositoryRefreshRequest {
+                trace: None,
                 path: PathBuf::from("background-repository"),
                 key: "background-repository".to_owned(),
                 priority: RepositoryRefreshPriority::Foreground,
@@ -57081,6 +57207,7 @@ diff --git a/file.txt b/file.txt
         let (scheduler, _) = RepositoryRefreshScheduler::new(egui::Context::default());
         let (first_sender, first_receiver) = mpsc::channel();
         scheduler.request(RepositoryRefreshRequest {
+            trace: None,
             key: repo_state_key(&first),
             path: first.clone(),
             priority: RepositoryRefreshPriority::Background,
@@ -57096,6 +57223,7 @@ diff --git a/file.txt b/file.txt
         let exclusive = scheduler.acquire_exclusive(repo_state_key(&first));
         let (second_sender, second_receiver) = mpsc::channel();
         scheduler.request(RepositoryRefreshRequest {
+            trace: None,
             key: repo_state_key(&second),
             path: second.clone(),
             priority: RepositoryRefreshPriority::Foreground,
@@ -57130,6 +57258,7 @@ diff --git a/file.txt b/file.txt
             enqueue_repository_refresh(
                 &mut pending,
                 RepositoryRefreshRequest {
+                    trace: None,
                     path: PathBuf::from("missing-refresh-repository"),
                     key: "missing".to_owned(),
                     priority: RepositoryRefreshPriority::Foreground,
@@ -57201,6 +57330,7 @@ diff --git a/file.txt b/file.txt
         let (result_sender, _result_receiver) = mpsc::channel::<RepoTaskResult>();
         let repository_key = "repository-after-checkout".to_owned();
         let pending = vec![RepositoryRefreshRequest {
+            trace: None,
             path: PathBuf::from(&repository_key),
             key: repository_key.clone(),
             priority: RepositoryRefreshPriority::Foreground,
@@ -57223,6 +57353,7 @@ diff --git a/file.txt b/file.txt
         );
 
         let background_pending = vec![RepositoryRefreshRequest {
+            trace: None,
             path: PathBuf::from(&repository_key),
             key: repository_key,
             priority: RepositoryRefreshPriority::Background,

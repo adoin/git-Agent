@@ -1,10 +1,11 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,59 @@ impl LogLevel {
 
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_REPOSITORY_TASK_ID: AtomicU64 = AtomicU64::new(1);
+static REPOSITORY_LOG_QUEUE: OnceLock<Option<mpsc::SyncSender<RepositoryLogEvent>>> =
+    OnceLock::new();
+static DROPPED_REPOSITORY_LOG_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+struct RepositoryLogEvent {
+    at: u64,
+    event: String,
+    fields: String,
+}
+
+pub fn repository_task_event(event: &str, fields: impl Into<String>) {
+    let fields = fields.into();
+    let queue = REPOSITORY_LOG_QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<RepositoryLogEvent>(2048);
+        std::thread::Builder::new()
+            .name("repository-log-writer".into())
+            .spawn(move || {
+                for entry in receiver {
+                    write_domain_event_at(
+                        entry.at,
+                        "repository-refresh",
+                        repository_refresh_level(&entry.fields),
+                        &entry.event,
+                        &entry.fields,
+                    );
+                    let dropped = DROPPED_REPOSITORY_LOG_EVENTS.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        write_domain_event(
+                            "repository-refresh",
+                            LogLevel::Warn,
+                            "operation.logs.dropped",
+                            &format!("pid={} count={dropped}", std::process::id()),
+                        );
+                    }
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+    let entry = RepositoryLogEvent {
+        at: epoch_ms(),
+        event: event.to_owned(),
+        fields,
+    };
+    if let Some(queue) = queue {
+        if queue.try_send(entry).is_err() {
+            DROPPED_REPOSITORY_LOG_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        DROPPED_REPOSITORY_LOG_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
 static ACTIVE_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_EXPIRES_MS: AtomicU64 = AtomicU64::new(0);
@@ -253,9 +307,156 @@ pub fn repository_refresh_trace(event: &str, fields: &str) {
     );
 }
 
+/// Always-on task diagnostics, independent of the temporary branch-switch trace window.
+/// Call only at task/phase boundaries, never from paint or per-frame busy checks.
+#[derive(Clone, Debug)]
+pub struct RepositoryTaskTrace {
+    id: u64,
+    root: PathBuf,
+    kind: &'static str,
+    started: Instant,
+    #[cfg(test)]
+    events: Option<std::sync::Arc<Mutex<Vec<String>>>>,
+}
+
+impl RepositoryTaskTrace {
+    pub fn new(root: &Path, kind: &'static str) -> Self {
+        let trace = Self {
+            id: NEXT_REPOSITORY_TASK_ID.fetch_add(1, Ordering::Relaxed),
+            root: root.to_owned(),
+            kind,
+            started: Instant::now(),
+            #[cfg(test)]
+            events: None,
+        };
+        trace.event("operation.queued", "request", "pending", None);
+        trace
+    }
+
+    fn event(&self, event: &str, stage: &str, outcome: &str, stage_ms: Option<u128>) {
+        let mut fields = format!(
+            "pid={} task_id={} root={:?} kind={} stage={} outcome={} total_ms={}",
+            std::process::id(),
+            self.id,
+            self.root,
+            self.kind,
+            stage,
+            outcome,
+            self.started.elapsed().as_millis(),
+        );
+        if let Some(elapsed) = stage_ms {
+            fields.push_str(&format!(" stage_ms={elapsed} slow={}", elapsed >= 5_000));
+        }
+        #[cfg(test)]
+        if let Some(events) = &self.events {
+            events
+                .lock()
+                .unwrap()
+                .push(format!("event={event} {fields}"));
+            return;
+        }
+        repository_task_event(event, fields);
+    }
+
+    pub fn dispatched(&self) {
+        self.event(
+            "operation.dispatched",
+            "scheduler_wait",
+            "success",
+            Some(self.started.elapsed().as_millis()),
+        );
+    }
+
+    pub fn stage<T, E>(
+        &self,
+        stage: &'static str,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.event("operation.phase.start", stage, "pending", None);
+        let mut span = RepositoryTaskPhase {
+            trace: self,
+            stage,
+            started: Instant::now(),
+            outcome: "aborted",
+        };
+        let result = action();
+        span.outcome = if result.is_ok() { "success" } else { "error" };
+        result
+    }
+
+    pub fn worker_finished(&self, success: bool) {
+        self.event(
+            "operation.worker.finished",
+            "worker",
+            if success { "success" } else { "error" },
+            None,
+        );
+    }
+
+    pub fn finished(&self, outcome: &str) {
+        self.event("operation.finished", "task", outcome, None);
+    }
+
+    pub fn received(self, outcome: &'static str) -> RepositoryTaskCompletion {
+        self.event("operation.received", "ui", outcome, None);
+        RepositoryTaskCompletion {
+            trace: self,
+            outcome,
+            started: Instant::now(),
+        }
+    }
+}
+
+struct RepositoryTaskPhase<'a> {
+    trace: &'a RepositoryTaskTrace,
+    stage: &'static str,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl Drop for RepositoryTaskPhase<'_> {
+    fn drop(&mut self) {
+        self.trace.event(
+            "operation.phase.end",
+            self.stage,
+            self.outcome,
+            Some(self.started.elapsed().as_millis()),
+        );
+    }
+}
+
+pub struct RepositoryTaskCompletion {
+    trace: RepositoryTaskTrace,
+    outcome: &'static str,
+    started: Instant,
+}
+
+impl Drop for RepositoryTaskCompletion {
+    fn drop(&mut self) {
+        let outcome = if std::thread::panicking() {
+            "aborted"
+        } else {
+            self.outcome
+        };
+        self.trace.event(
+            "operation.ui.complete",
+            "ui",
+            outcome,
+            Some(self.started.elapsed().as_millis()),
+        );
+        self.trace.finished(outcome);
+    }
+}
+
 fn repository_refresh_level(fields: &str) -> LogLevel {
-    if fields.contains("outcome=error") || fields.contains("outcome=probe-error") {
+    if fields.contains("outcome=error")
+        || fields.contains("outcome=probe-error")
+        || fields.contains("outcome=aborted")
+        || fields.contains("outcome=disconnected")
+    {
         LogLevel::Error
+    } else if fields.contains("slow=true") {
+        LogLevel::Warn
     } else {
         LogLevel::Trace
     }
@@ -282,8 +483,11 @@ fn merge_ai_level(event: &str) -> LogLevel {
 }
 
 fn write_domain_event(stem: &str, level: LogLevel, event: &str, fields: &str) {
+    write_domain_event_at(epoch_ms(), stem, level, event, fields);
+}
+
+fn write_domain_event_at(now: u64, stem: &str, level: LogLevel, event: &str, fields: &str) {
     let _guard = write_lock();
-    let now = epoch_ms();
     append_domain_event(daily_log_path(stem), now, level, event, fields);
     if level == LogLevel::Error {
         append_domain_event(
@@ -394,9 +598,155 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LogLevel, civil_date_from_unix_days, format_domain_event, merge_ai_level,
-        repository_refresh_level,
+        LogLevel, NEXT_REPOSITORY_TASK_ID, RepositoryTaskTrace, civil_date_from_unix_days,
+        format_domain_event, merge_ai_level, repository_refresh_level,
     };
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    fn captured_trace() -> (RepositoryTaskTrace, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            RepositoryTaskTrace {
+                id: NEXT_REPOSITORY_TASK_ID.fetch_add(1, super::Ordering::Relaxed),
+                root: Path::new("/repository with spaces").to_owned(),
+                kind: "background_fetch",
+                started: Instant::now() - Duration::from_secs(8),
+                events: Some(events.clone()),
+            },
+            events,
+        )
+    }
+
+    fn number(event: &str, key: &str) -> u128 {
+        event
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn repository_task_phases_share_identity_and_separate_queue_from_git_time() {
+        let (trace, events) = captured_trace();
+        trace.dispatched();
+        let result: Result<(), ()> = trace.clone().stage("git_fetch", || Ok(()));
+        assert!(result.is_ok());
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| number(event, "task_id") == trace.id as u128)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.contains("root=\"/repository with spaces\""))
+        );
+        assert!(number(&events[0], "stage_ms") >= 8_000);
+        assert!(events[0].contains("slow=true"));
+        let end = events
+            .iter()
+            .find(|event| event.contains("operation.phase.end"))
+            .unwrap();
+        assert!(number(end, "total_ms") >= number(end, "stage_ms") + 8_000);
+        assert!(end.contains("stage=git_fetch outcome=success"));
+    }
+
+    #[test]
+    fn repository_task_errors_panics_and_early_ui_returns_have_terminal_events() {
+        let (trace, events) = captured_trace();
+        let result = trace.stage("git_fetch", || Err::<(), _>("private command diagnostic"));
+        assert!(result.is_err());
+        let panic = std::panic::catch_unwind(|| {
+            trace.stage::<(), ()>("local_probe", || panic!("test panic"))
+        });
+        assert!(panic.is_err());
+        trace.worker_finished(false);
+        fn handle_error(trace: RepositoryTaskTrace) {
+            let _completion = trace.received("error");
+        }
+        handle_error(trace);
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("stage=git_fetch outcome=error"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("stage=local_probe outcome=aborted"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("event=operation.received"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("event=operation.ui.complete"))
+        );
+        assert!(events.last().unwrap().contains("event=operation.finished"));
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.contains("private command diagnostic"))
+        );
+    }
+
+    #[test]
+    fn repository_task_ids_and_slow_or_disconnected_classification_are_distinct() {
+        let (a, _) = captured_trace();
+        let (b, _) = captured_trace();
+        assert_ne!(a.id, b.id);
+        assert_eq!(
+            repository_refresh_level("outcome=success slow=true"),
+            LogLevel::Warn
+        );
+        assert_eq!(
+            repository_refresh_level("outcome=disconnected"),
+            LogLevel::Error
+        );
+        assert_eq!(repository_refresh_level("outcome=aborted"), LogLevel::Error);
+    }
+
+    #[test]
+    fn panicking_ui_completion_is_not_reported_as_success() {
+        let (trace, events) = captured_trace();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _completion = trace.received("success");
+                panic!("simulated UI failure");
+            })
+            .is_err()
+        );
+        let events = events.lock().unwrap();
+        assert!(events.last().unwrap().contains("outcome=aborted"));
+    }
+
+    #[test]
+    fn task_logging_does_not_wait_for_the_disk_writer_lock() {
+        let lock = super::write_lock();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let trace =
+                RepositoryTaskTrace::new(Path::new("/nonblocking-log-test"), "background_fetch");
+            trace.finished("success");
+            let _ = sender.send(());
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(lock);
+        assert!(
+            result.is_ok(),
+            "task logging must not wait for log file I/O"
+        );
+    }
 
     #[test]
     fn unix_day_conversion_generates_stable_daily_log_dates() {

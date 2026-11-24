@@ -5,6 +5,19 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.4-beta.1 — 2026-11-24
+
+### Improved
+
+- Add persistent phase diagnostics for remote operations and repository refreshes, separating queue wait, Git execution, local and tag probes, snapshot loading and UI handling. Independent task identifiers correlate remote-operation results when investigating long-running fetch or refresh indicators.
+- Record slow phases, errors, disconnections, cancellations and coalesced requests without treating overall busy time as remote latency. Fetch intervals and refresh behavior are unchanged.
+
+### Fixed
+
+- When anonymous REST update detection fails, retry through `gh api` if a local authenticated GitHub CLI is available. Reuse its login with bounded background commands, without extracting tokens or opening login prompts.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.2.3 — 2026-11-09
 
 ### Fixed
