@@ -411,6 +411,14 @@ pub fn open_repository_core_with_probe(
     path: impl AsRef<Path>,
     probe: Option<RepositoryRefreshFingerprint>,
 ) -> Result<RepositorySnapshot> {
+    open_repository_core_with_probe_and_tags(path, probe, None)
+}
+
+pub(crate) fn open_repository_core_with_probe_and_tags(
+    path: impl AsRef<Path>,
+    probe: Option<RepositoryRefreshFingerprint>,
+    tags: Option<Vec<Tag>>,
+) -> Result<RepositorySnapshot> {
     let requested_path = path.as_ref().to_path_buf();
     let _total_span = diagnostics::span(
         "snapshot.core",
@@ -492,7 +500,7 @@ pub fn open_repository_core_with_probe(
         .find(|branch| branch.current)
         .and_then(|branch| branch.upstream.clone());
     let stashes = load_stashes(&root).unwrap_or_default();
-    let tags = load_tags(&root).unwrap_or_default();
+    let tags = tags.unwrap_or_else(|| load_tags(&root).unwrap_or_default());
     drop(metadata_span);
     Ok(RepositorySnapshot {
         root,
@@ -653,7 +661,7 @@ pub fn repository_snapshot_tag_refs_fingerprint(
     tag_refs_fingerprint(&snapshot.tags)
 }
 
-fn tag_refs_fingerprint(tags: &[Tag]) -> Vec<(String, String)> {
+pub(crate) fn tag_refs_fingerprint(tags: &[Tag]) -> Vec<(String, String)> {
     let mut refs = tags
         .iter()
         .map(|tag| (tag.name.clone(), tag.target.clone()))
@@ -4598,7 +4606,7 @@ fn load_stashes(root: &Path) -> Result<Vec<StashEntry>> {
     Ok(parse_stashes(&output))
 }
 
-fn load_tags(root: &Path) -> Result<Vec<Tag>> {
+pub(crate) fn load_tags(root: &Path) -> Result<Vec<Tag>> {
     let output = git_output(
         root,
         &[
@@ -5162,6 +5170,30 @@ mod tests {
         let detached = repository_refresh_fingerprint(&root)?;
         git_output(&root, &["checkout", "--detach", "external-tag"])?;
         assert_ne!(detached, repository_refresh_fingerprint(&root)?);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn core_refresh_reuses_supplied_status_and_tag_results() -> Result<()> {
+        let root = init_patch_test_repo("refresh-reuse-status-and-tags")?;
+        git_output(&root, &["tag", "before-probe"])?;
+        let probe = repository_refresh_fingerprint(&root)?;
+        let tags = load_tags(&root)?;
+        let expected_tags = tag_refs_fingerprint(&tags);
+        fs::write(root.join("after-probe.txt"), "changed after probe")?;
+        git_output(&root, &["tag", "after-probe"])?;
+
+        let snapshot = open_repository_core_with_probe_and_tags(
+            &root,
+            Some(probe.clone()),
+            Some(tags),
+        )?;
+        assert_eq!(snapshot.status, probe.status);
+        assert_eq!(snapshot.refresh_worktree_signature, probe.worktree_signature);
+        assert_eq!(tag_refs_fingerprint(&snapshot.tags), expected_tags);
+        assert!(load_tags(&root)?.iter().any(|tag| tag.name == "after-probe"));
+        assert!(!snapshot.tags.iter().any(|tag| tag.name == "after-probe"));
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

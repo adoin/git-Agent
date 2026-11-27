@@ -26,6 +26,13 @@
 <h1>更新日志</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>从 1.4.1 版本开始，在此记录面向用户的改动。 更早版本请查看 <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>。</p>
+<h2>2.2.4-beta.2 — 2026-11-27</h2>
+<h3>性能</h3>
+<ul>
+<li>后台远端获取发现变化后，复用刚取得的本地状态、refs 和配置检查结果构建快照，避免再次执行整套检查。</li>
+<li>复用本轮已读取的标签列表，避免快照加载时重复查询、排序和读取标签信息。保留现有获取、标签清理及自动刷新行为。</li>
+</ul>
+<p>此版本用于发布验证，不进入正式版更新提示。</p>
 <h2>2.2.4-beta.1 — 2026-11-24</h2>
 <h3>改进</h3>
 <ul>
@@ -451,6 +458,13 @@
 <h1>Changelog</h1>
 <p><a href="?lang=en">English</a> · <a href="?lang=zh">简体中文</a></p>
 <p>User-facing changes are recorded here starting with version 1.4.1. Earlier versions are documented in <a href="https://github.com/adoin/git-Agent/releases">GitHub Releases</a>.</p>
+<h2>2.2.4-beta.2 — 2026-11-27</h2>
+<h3>Performance</h3>
+<ul>
+<li>Reuse the freshly collected status, refs and configuration probe when a background fetch detects changes and rebuilds the repository snapshot, avoiding a second full probe.</li>
+<li>Reuse the tag list already read in the same refresh instead of querying, sorting and reading tag metadata again. Existing fetch, tag-pruning and automatic-refresh behavior is preserved.</li>
+</ul>
+<p>This is a prerelease for release validation and is excluded from stable update prompts.</p>
 <h2>2.2.4-beta.1 — 2026-11-24</h2>
 <h3>Improved</h3>
 <ul>

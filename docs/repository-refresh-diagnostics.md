@@ -14,6 +14,8 @@ Background fetch stages:
 3. `git_fetch`: the actual Git fetch call, excluding queueing and later probes.
 4. `local_probe` and `tag_probe`: local post-fetch checks.
 5. `core_snapshot`: a full local reload, only if those checks detect a change.
+   Reuses the status/configuration probe and tag list obtained in steps 4, rather
+   than repeating those reads.
 6. `operation.worker.finished`: the worker is ready to send its result.
 7. `operation.received`: the UI consumed it; the gap from worker completion
    identifies delayed result polling.

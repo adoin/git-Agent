@@ -5,6 +5,15 @@
 User-facing changes are recorded here starting with version 1.4.1.
 Earlier versions are documented in [GitHub Releases](https://github.com/adoin/git-Agent/releases).
 
+## 2.2.4-beta.2 — 2026-11-27
+
+### Performance
+
+- Reuse the freshly collected status, refs and configuration probe when a background fetch detects changes and rebuilds the repository snapshot, avoiding a second full probe.
+- Reuse the tag list already read in the same refresh instead of querying, sorting and reading tag metadata again. Existing fetch, tag-pruning and automatic-refresh behavior is preserved.
+
+This is a prerelease for release validation and is excluded from stable update prompts.
+
 ## 2.2.4-beta.1 — 2026-11-24
 
 ### Improved

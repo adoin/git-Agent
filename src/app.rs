@@ -5680,15 +5680,22 @@ impl GitAgentApp {
                     })?;
                     let current_fingerprint = task_trace
                         .stage("local_probe", || git::repository_refresh_fingerprint(&root))?;
-                    let current_tag_refs = task_trace
-                        .stage("tag_probe", || git::repository_tag_refs_fingerprint(&root))?;
+                    let current_tags =
+                        task_trace.stage("tag_probe", || git::load_tags(&root))?;
+                    let current_tag_refs = git::tag_refs_fingerprint(&current_tags);
                     if current_fingerprint == known_fingerprint
                         && current_tag_refs == known_tag_refs
                     {
                         Ok(None)
                     } else {
                         task_trace
-                            .stage("core_snapshot", || git::open_repository_core(&root))
+                            .stage("core_snapshot", || {
+                                git::open_repository_core_with_probe_and_tags(
+                                    &root,
+                                    Some(current_fingerprint),
+                                    Some(current_tags),
+                                )
+                            })
                             .map(Some)
                     }
                 });
@@ -57066,9 +57073,9 @@ diff --git a/file.txt b/file.txt
             "git::FetchOptions::background_remote_refresh(prune_tags)",
             "let prune_tags = snapshot.remotes.len() == 1",
             "git::repository_snapshot_tag_refs_fingerprint(snapshot)",
-            "git::repository_tag_refs_fingerprint(&root)",
+            "git::tag_refs_fingerprint(&current_tags)",
             "git::repository_refresh_fingerprint(&root)",
-            r#""core_snapshot", || git::open_repository_core(&root)"#,
+            "git::open_repository_core_with_probe_and_tags(",
             "self.operations.current.background_remote_git_task.is_some()",
             "self.active_background_remote_git_busy()",
             "!snapshot.config.auto_refresh",
